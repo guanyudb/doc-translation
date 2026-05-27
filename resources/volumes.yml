@@ -1,0 +1,11 @@
+resources:
+  volumes:
+    doc_translation_volume:
+      catalog_name: ${var.uc_catalog}
+      schema_name:  ${var.uc_schema}
+      name:         ${var.uc_volume_name}
+      volume_type:  MANAGED
+      comment: |
+        Holds raw_documents/ (input), translated_inplace/ (pipeline output),
+        translated_reviewed/ (reviewer-published copies), and golden/<pair>/
+        (certified, immutable). Subdirectories are created lazily by the app.

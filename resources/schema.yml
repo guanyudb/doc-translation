@@ -1,0 +1,8 @@
+resources:
+  schemas:
+    doc_translation_schema:
+      catalog_name: ${var.uc_catalog}
+      name:         ${var.uc_schema}
+      comment: |
+        Doc Translation Review Platform — Delta archive + UC Volume host.
+        Created by the DAB; owned by the deploying workspace user.

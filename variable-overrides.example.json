@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to .databricks/bundle/prod/variable-overrides.json and fill in your values. Path is gitignored. The workspace host comes from your databricks CLI profile (or DATABRICKS_HOST env var), not this file.",
+  "workspace_user_email":    "you@example.com",
+  "uc_catalog":              "your_catalog",
+  "uc_schema":               "doc_translation",
+  "uc_volume_name":          "doc-translation",
+  "pg_schema":               "doc_translation",
+  "lakebase_project":        "your-lakebase-project",
+  "lakebase_branch":         "main",
+  "lakebase_database_slug":  "databricks-postgres",
+  "lakebase_instance":       "",
+  "warehouse_id":            "0123456789abcdef",
+  "app_name":                "doc-translation",
+  "secret_scope":            "doc_translation_config"
+}

@@ -31,7 +31,8 @@ build/
 dist/
 *.egg-info/
 
-# Databricks CLI sync metadata
+# Databricks CLI sync metadata. variable-overrides.json holds per-workspace
+# values + identities → never commit.
 .databricks/
 
 # Stale HTML/Pandoc export of DATABRICKS_COMPONENTS.md (the .md is canonical)

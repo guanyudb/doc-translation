@@ -1,3 +1,11 @@
+# Databricks Apps runtime config.
+#
+# IMPORTANT (deploy guide gotcha #1): `resources/app.yml` only makes the bound
+# values available to the SP. Apps still won't expose them as env vars unless
+# they're declared here with `valueFrom: <resource name>`.
+#
+# Variable substitution (${var.X}) is resolved by `databricks bundle deploy`.
+
 command:
   - "streamlit"
   - "run"
@@ -8,23 +16,32 @@ command:
   - "--browser.gatherUsageStats=false"
 
 env:
-  - name: PGHOST
-    value: 'instance-6b59171b-cee8-4acc-9209-6c848ffbfbfe.database.cloud.databricks.com'
-  - name: PGPORT
-    value: '5432'
-  - name: PGDATABASE
-    value: 'databricks_postgres'
-  - name: PGSSLMODE
-    value: 'require'
+  # ---- Lakebase Postgres connection (mostly auto-injected by binding) ----
+  #
+  # PGHOST, PGPORT, PGDATABASE, PGUSER, PGSSLMODE are injected automatically
+  # by the `postgres:` (or legacy `database:`) resource binding in
+  # resources/app.yml. We don't redeclare them here.
   - name: PGSCHEMA
-    value: 'doc_translation'
+    value: ${var.pg_schema}
+
+  # Lakebase Project mode: project + branch tell server/db.py how to mint
+  # an OAuth JWT via /api/2.0/postgres/credentials. Empty string = use the
+  # legacy Provisioned path (LAKEBASE_INSTANCE).
+  - name: LAKEBASE_PROJECT
+    value: ${var.lakebase_project}
+  - name: LAKEBASE_BRANCH
+    value: ${var.lakebase_branch}
   - name: LAKEBASE_INSTANCE
-    value: 'lakebasepoc'
+    value: ${var.lakebase_instance}
+
+  # ---- UC Volume for documents ----
   - name: VOLUME_ROOT
-    value: '/Volumes/hls_amer_catalog/guanyu_chen/doc-translation'
-  - name: DATABRICKS_WAREHOUSE_ID
-    value: '68d156b1d8b5502b'
+    value: /Volumes/${var.uc_catalog}/${var.uc_schema}/${var.uc_volume_name}
+
+  # ---- Delta long-term archive ----
   - name: DELTA_CATALOG
-    value: 'hls_amer_catalog'
+    value: ${var.uc_catalog}
   - name: DELTA_SCHEMA
-    value: 'guanyu_chen'
+    value: ${var.uc_schema}
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: warehouse

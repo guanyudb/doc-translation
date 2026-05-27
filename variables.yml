@@ -1,0 +1,78 @@
+# Workspace-portable variables. Per-workspace values live in
+# `.databricks/bundle/<target>/variable-overrides.json` (gitignored).
+#
+# Customers should COPY `variable-overrides.example.json` to
+# `.databricks/bundle/prod/variable-overrides.json` and fill in their values.
+
+variables:
+  workspace_user_email:
+    description: |
+      Email of the deploying user. Used for grants and as the postdeploy
+      job's `run_as`. Should match the identity in `databricks auth login`.
+
+  uc_catalog:
+    description: |
+      Unity Catalog to host the doc-translation schema + volume + Delta archive.
+      Must already exist; deploying user needs CREATE SCHEMA + CREATE VOLUME on it.
+
+  uc_schema:
+    description: |
+      Schema name inside `uc_catalog`. DAB creates it if it doesn't exist.
+    default: doc_translation
+
+  pg_schema:
+    description: |
+      Postgres schema name inside the Lakebase database. Usually mirrors
+      `uc_schema` but can differ when multiple deployments share a Lakebase
+      instance (e.g. a 'test' and 'prod' deployment).
+    default: doc_translation
+
+  uc_volume_name:
+    description: |
+      Volume name (managed). Holds raw_documents/, translated_inplace/,
+      translated_reviewed/, golden/. DAB creates it if it doesn't exist.
+    default: doc-translation
+
+  # ---- Lakebase Project (preferred / new workspaces) ----
+  lakebase_project:
+    description: |
+      Lakebase Project name (Autoscaling). Required for new workspaces.
+      Leave empty to fall back to a legacy Provisioned instance.
+    default: ""
+
+  lakebase_branch:
+    description: Lakebase Project branch. Almost always "main".
+    default: main
+
+  lakebase_database_slug:
+    description: |
+      Lakebase Postgres database RESOURCE slug (not the Postgres database
+      name). For `databricks_postgres` the resource slug is usually
+      `databricks-postgres`. Verify with:
+        databricks api get /api/2.0/postgres/projects/<proj>/branches/<branch>/databases
+    default: databricks-postgres
+
+  # ---- Lakebase Provisioned (legacy) ----
+  lakebase_instance:
+    description: |
+      Lakebase Provisioned instance name. Set if you're on a legacy workspace
+      that still has a Provisioned instance and `lakebase_project` is empty.
+    default: ""
+
+  # ---- SQL warehouse for the Delta mirror ----
+  warehouse_id:
+    description: |
+      SQL warehouse ID for syncing audit + publication state to Delta at
+      promotion time. Any serverless 2X-Small warehouse is fine.
+
+  # ---- App naming ----
+  app_name:
+    description: Databricks App name. Becomes the public URL prefix.
+    default: doc-translation
+
+  # ---- Secrets ----
+  secret_scope:
+    description: |
+      Databricks secret scope name for any non-binding config values.
+      Created by `deploy.sh` if it doesn't exist.
+    default: doc_translation_config

@@ -1,0 +1,44 @@
+# One-shot postdeploy job. Idempotent — safe to re-run.
+#
+# Runs AS THE DEPLOYING USER (their identity owns the Lakebase database +
+# the UC schema/volume, so GRANT statements work).
+#
+# Steps:
+#   1. Mint a Lakebase OAuth JWT for the deployer (NOT a PAT — see deploy
+#      guide gotcha #3).
+#   2. `psql` against the Lakebase database to:
+#      - run `store.ensure_schema()` (idempotent)
+#      - GRANT USAGE + CREATE on schema `public` to the App SP
+#        (deploy guide gotcha #4)
+#      - GRANT table-level + sequence perms to the App SP
+#   3. Use `delta_sync.ensure_delta_schema()` against the configured SQL
+#      warehouse to create the Delta mirror tables.
+#   4. Pre-create the Volume subdirectories the app expects.
+
+resources:
+  jobs:
+    doc_translation_postdeploy_setup:
+      name: doc-translation · postdeploy setup
+
+      tasks:
+        - task_key: postdeploy
+          notebook_task:
+            notebook_path: ../../setup/postdeploy.py
+            source:        WORKSPACE
+            base_parameters:
+              uc_catalog:             ${var.uc_catalog}
+              uc_schema:              ${var.uc_schema}
+              uc_volume_name:         ${var.uc_volume_name}
+              pg_schema:              ${var.pg_schema}
+              lakebase_project:       ${var.lakebase_project}
+              lakebase_branch:        ${var.lakebase_branch}
+              lakebase_database_slug: ${var.lakebase_database_slug}
+              lakebase_instance:      ${var.lakebase_instance}
+              warehouse_id:           ${var.warehouse_id}
+              app_name:               ${var.app_name}
+
+      run_as:
+        user_name: ${var.workspace_user_email}
+
+      max_concurrent_runs: 1
+      timeout_seconds:     1200

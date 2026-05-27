@@ -1,0 +1,40 @@
+# Databricks Asset Bundle — Doc Translation Review Platform
+#
+# Deploys: a Streamlit Databricks App + a Lakebase-bound review database +
+# a UC Volume for files + a postdeploy job that runs schema migrations and
+# GRANTs the App service principal what it needs.
+#
+# Targets are workspace-portable; per-workspace values live in
+# `.databricks/bundle/<target>/variable-overrides.json` (gitignored).
+#
+# We intentionally DO NOT use `mode: development` — that silently prefixes
+# schema + volume names which contradicts customer expectations
+# (see the deploy guide gotcha #6).
+bundle:
+  name: doc-translation
+
+include:
+  - variables.yml
+  - resources/*.yml
+  - resources/**/*.yml
+
+sync:
+  paths: [.]
+  exclude:
+    - .venv
+    - "**/__pycache__"
+    - .git
+    - .claude
+    - .databricks
+    - DATABRICKS_COMPONENTS.html
+    - "DATABRICKS_COMPONENTS_files/**"
+
+targets:
+  # Default target — customer fills in variable-overrides.json with their values.
+  # NOTE: workspace.host can't reference ${var.X} (auth resolves before var
+  # substitution). Use `--profile <name>` on the deploy command, or set
+  # DATABRICKS_HOST in the environment.
+  prod:
+    default: true
+    presets:
+      name_prefix: ""

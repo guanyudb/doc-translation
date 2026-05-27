@@ -179,21 +179,106 @@ The translation orchestration lives outside the app, as Databricks notebooks und
 
 ---
 
-## Deploying
+## Deploying to your own workspace (Databricks Asset Bundle)
+
+This branch is set up as a portable Databricks Asset Bundle (DAB). One
+`./deploy.sh` from a clean clone, after a one-time config file edit.
+
+### Prerequisites
+
+Your target workspace needs:
+
+1. **Unity Catalog access** — a catalog where you can `CREATE SCHEMA` and `CREATE VOLUME`
+2. **Lakebase** — either:
+   - A **Lakebase Project** (Autoscaling) — preferred, the new way. Get the project name + branch.
+   - …or a legacy **Provisioned** instance. Get the instance name.
+3. **A SQL warehouse** for the Delta archive. Any serverless 2X-Small works.
+4. **Foundation Model API** with access to `databricks-claude-sonnet-4-6` (or another Claude model you specify in the inner translation notebook).
+5. **Databricks CLI** v0.220+ authenticated to the target workspace.
+
+### One-time setup
 
 ```bash
-# Sync local working copy to the Workspace path
+# 1. Clone + check out this branch
+git clone git@github.com:guanyudb/doc-translation.git
+cd doc-translation
+git checkout customer-deployable
+
+# 2. Copy the variable-overrides template and fill in YOUR values
+mkdir -p .databricks/bundle/prod
+cp variable-overrides.example.json .databricks/bundle/prod/variable-overrides.json
+# Edit .databricks/bundle/prod/variable-overrides.json:
+#   - workspace_host:          https://<your-workspace>.cloud.databricks.com
+#   - workspace_user_email:    your-email@org.com
+#   - uc_catalog:              <catalog you can create schemas in>
+#   - lakebase_project:        <your Lakebase Project name>     [Project mode]
+#   - lakebase_database_slug:  databricks-postgres              [usually]
+#   - lakebase_instance:       ""                               [empty if using Project]
+#   - warehouse_id:            <your SQL warehouse ID>
+```
+
+If you're on a **legacy Provisioned** Lakebase instance instead of a Project:
+- Set `lakebase_instance` to your instance name; leave `lakebase_project` empty.
+- In `resources/app.yml`, comment out the `postgres:` binding block and uncomment the `database:` block underneath it.
+
+### Deploy
+
+```bash
+./deploy.sh
+```
+
+This runs the 5-step deploy:
+
+1. Seed the secret scope (idempotent — no-op if it exists)
+2. `bundle deploy` — creates the UC schema + volume + app + postdeploy job, syncs code to the workspace
+3. `bundle run` the **postdeploy job** — runs Lakebase DDL, grants the app SP `USAGE + CREATE on public` and table/sequence perms on `doc_translation`, creates the Delta mirror tables, pre-creates Volume subdirectories
+4. `bundle run` the **app** — pushes the source and starts the runtime
+
+The app URL prints at the end. First boot takes ~30 seconds.
+
+### Translation pipeline (separate)
+
+The DAB deploys the **reviewer app**. The **translation pipeline** is a Lakeflow job that wraps two notebooks (`Auto-Translate Watcher` + `DOCX Inplace Translation`). Those notebooks live outside the bundle today; they need to be:
+1. Imported to the workspace under `/Users/<you>/Translation PoC/`
+2. Wired into a Lakeflow Job with a file-arrival trigger on `raw_documents/`
+3. Configured to write to the same `translated_inplace/` Volume folder
+
+A future iteration of this bundle will include the pipeline notebooks + job spec under `resources/jobs/translation_pipeline.yml`. For now they're a manual step — see [`docs/pipeline_design.md`](docs/pipeline_design.md).
+
+### Re-deploys
+
+`./deploy.sh` is idempotent. Run it again after code changes; it picks up the diff. Schema migrations in the postdeploy job use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ADD COLUMN IF NOT EXISTS` so re-running is safe.
+
+### Tearing down
+
+```bash
+databricks bundle destroy -t prod
+```
+
+This removes the app, the postdeploy job, the UC schema + volume (with all files), and any audit/golden artifacts inside. **Make absolutely sure** before running — the Delta tables have a 7-year retention setting but `bundle destroy` overrides that.
+
+### Troubleshooting cross-references
+
+If something goes wrong, the most likely causes and their fixes are documented in [`~/.claude/memory/dab_apps_workspace_deploy_guide.md`](../../.claude/memory/dab_apps_workspace_deploy_guide.md). Highlights:
+
+- Postgres auth rejected as "not a valid JWT" → using a PAT instead of OAuth JWT (gotcha #3)
+- App boots but Lakebase queries refused → SP missing `CREATE` on schema `public` (gotcha #4)
+- First `bundle deploy` 404s on secret → secret scope must be pre-seeded (gotcha #5)
+- App boots but env vars are missing → `valueFrom` binding NOT declared in `app.yaml` (gotcha #1)
+
+### Legacy: deploying just the app (no bundle)
+
+For a quick code-only deploy when the workspace is already configured:
+
+```bash
 databricks sync . /Workspace/Users/<you>/databricks_apps/doc-translation \
   --full --exclude __pycache__ --exclude .gitignore --exclude .venv \
   --profile <profile>
 
-# Trigger a deployment
 databricks apps deploy doc-translation \
   --source-code-path /Workspace/Users/<you>/databricks_apps/doc-translation \
   --no-wait --profile <profile>
 ```
-
-App URL after deploy: `https://doc-translation-<random>.aws.databricksapps.com`
 
 ---
 

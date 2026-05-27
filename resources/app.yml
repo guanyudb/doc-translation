@@ -1,0 +1,46 @@
+# Databricks App definition + resource bindings.
+#
+# Resource bindings auto-create env vars for the App service principal:
+#   * postgres binding → PGHOST, PGDATABASE, PGUSER, PGPORT, PGSSLMODE
+#   * sql_warehouse binding → DATABRICKS_WAREHOUSE_ID (when also declared with
+#     valueFrom in app.yaml — per deploy-guide gotcha #1).
+#
+# NOTE on the postgres binding:
+# Lakebase Project uses `postgres:` (new); legacy Provisioned uses `database:`.
+# This bundle uses `postgres:` and assumes the customer is on a Lakebase
+# Project. If they're on a legacy Provisioned instance, comment out the
+# `postgres:` block and uncomment `database:` below.
+
+resources:
+  apps:
+    doc_translation_app:
+      name:        ${var.app_name}
+      description: Compliance-grade reviewer + auto-translation pipeline for clinical DOCX
+      source_code_path: ${workspace.file_path}
+
+      resources:
+        # ---- Lakebase Project (preferred) -----------------------------------
+        - name: postgres
+          postgres:
+            branch:     projects/${var.lakebase_project}/branches/${var.lakebase_branch}
+            database:   projects/${var.lakebase_project}/branches/${var.lakebase_branch}/databases/${var.lakebase_database_slug}
+            permission: CAN_CONNECT_AND_CREATE
+
+        # ---- Lakebase Provisioned (legacy) ----------------------------------
+        # If you're on a legacy workspace with a Provisioned instance and no
+        # Project, comment out the `postgres:` block above and uncomment this
+        # block instead. Note: the Databricks Terraform provider has
+        # intermittent crashes on the `database:` binding inside an `apps:`
+        # resource (provider v1.111.0); if you hit it, upgrade the CLI or
+        # bind the database via `databricks apps` CLI separately.
+        # - name: postgres
+        #   database:
+        #     instance_name: ${var.lakebase_instance}
+        #     database_name: databricks_postgres
+        #     permission:    CAN_CONNECT
+
+        # ---- SQL warehouse for Delta sync -----------------------------------
+        - name: warehouse
+          sql_warehouse:
+            id:         ${var.warehouse_id}
+            permission: CAN_USE
