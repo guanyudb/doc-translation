@@ -1,0 +1,30 @@
+command:
+  - "streamlit"
+  - "run"
+  - "app.py"
+  - "--server.port=8000"
+  - "--server.address=0.0.0.0"
+  - "--server.headless=true"
+  - "--browser.gatherUsageStats=false"
+
+env:
+  - name: PGHOST
+    value: 'instance-6b59171b-cee8-4acc-9209-6c848ffbfbfe.database.cloud.databricks.com'
+  - name: PGPORT
+    value: '5432'
+  - name: PGDATABASE
+    value: 'databricks_postgres'
+  - name: PGSSLMODE
+    value: 'require'
+  - name: PGSCHEMA
+    value: 'doc_translation'
+  - name: LAKEBASE_INSTANCE
+    value: 'lakebasepoc'
+  - name: VOLUME_ROOT
+    value: '/Volumes/hls_amer_catalog/guanyu_chen/doc-translation'
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: '68d156b1d8b5502b'
+  - name: DELTA_CATALOG
+    value: 'hls_amer_catalog'
+  - name: DELTA_SCHEMA
+    value: 'guanyu_chen'

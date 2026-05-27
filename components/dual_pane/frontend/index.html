@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Dual Pane Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #fbfaf6;
+    --bg-soft:   #f4f1e9;
+    --bg-card:   #ffffff;
+    --rule:      #e2dccc;
+    --rule-soft: #ece7da;
+
+    --ink:       #1a1d22;
+    --ink-2:     #3f4651;
+    --ink-mute:  #7f7768;
+    --ink-soft:  #a59c8a;
+
+    --accent:        #0f766e;
+    --accent-strong: #0b5650;
+    --accent-soft:   #ccfbf1;
+
+    --success: #15803d;
+    --warn:    #b45309;
+    --danger:  #9d174d;
+    --info:    #1d4ed8;
+
+    --serif-display: 'Fraunces', 'Source Serif 4', Georgia, serif;
+    --serif-body:    'Source Serif 4', 'Iowan Old Style', Georgia, serif;
+    --sans:          'IBM Plex Sans', system-ui, sans-serif;
+    --mono:          'IBM Plex Mono', ui-monospace, monospace;
+  }
+
+  html, body { margin: 0; padding: 0; height: 100%; box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    color: var(--ink);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  *, *:before, *:after { box-sizing: inherit; }
+
+  .wrap { display: flex; height: 100%; gap: 0; background: var(--bg); }
+  .pane {
+    flex: 1; min-width: 0; display: flex; flex-direction: column;
+    border-right: 1px solid var(--rule); background: var(--bg-card);
+  }
+  .pane:last-child { border-right: none; }
+
+  .pane-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 18px; border-bottom: 1px solid var(--rule);
+    background: var(--bg-card); position: sticky; top: 0; z-index: 5;
+  }
+  .pane-head .label {
+    font-family: var(--sans);
+    font-size: 9px; font-weight: 600; letter-spacing: 0.18em;
+    text-transform: uppercase; color: var(--ink-mute);
+  }
+  .lang-chip {
+    margin-left: 10px; padding: 2px 7px;
+    font-family: var(--sans);
+    font-size: 9px; font-weight: 600; letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: var(--accent-soft); color: var(--accent-strong);
+    border-radius: 2px;
+  }
+  .pane:nth-child(2) .lang-chip {
+    background: rgba(29,78,216,0.08); color: var(--info);
+  }
+  .page-pos {
+    font-family: var(--mono);
+    font-size: 10px; color: var(--ink-mute);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .pane-body {
+    flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+    padding: 16px 26px 16px 18px;
+    position: relative; scroll-behavior: smooth;
+  }
+  .pane-body::-webkit-scrollbar { width: 8px; }
+  .pane-body::-webkit-scrollbar-thumb {
+    background: var(--rule); border-radius: 4px;
+    border: 2px solid transparent; background-clip: content-box;
+  }
+  .pane-body::-webkit-scrollbar-thumb:hover { background: var(--ink-soft); }
+
+  .docx {
+    font-family: var(--serif-body);
+    font-size: 13.5px; line-height: 1.6; color: var(--ink);
+    max-width: 100%; padding-bottom: 60px;
+    font-feature-settings: 'kern', 'liga', 'onum';
+  }
+  .docx > *:first-child { margin-top: 0; }
+  .docx h1, .docx h2, .docx h3, .docx h4 {
+    font-family: var(--serif-display);
+    font-weight: 600; letter-spacing: -0.012em; color: var(--ink);
+    margin-top: 1.3em; margin-bottom: 0.35em;
+    line-height: 1.2;
+  }
+  .docx h1 { font-size: 1.55em; font-weight: 600; }
+  .docx h2 { font-size: 1.28em; }
+  .docx h3 { font-size: 1.12em; }
+  .docx h4 { font-size: 1.02em; }
+  .docx p, .docx li { margin: 0.45em 0; }
+  .docx a { color: var(--info); text-decoration-color: rgba(29,78,216,0.3); text-underline-offset: 2px; }
+  .docx a:hover { text-decoration-color: var(--info); }
+  .docx .table-scroll {
+    overflow-x: auto; max-width: 100%; margin: 1em 0;
+    border: 1px solid var(--rule); border-radius: 3px;
+  }
+  .docx table {
+    border-collapse: collapse; width: 100%; font-size: 12px;
+    font-family: var(--sans);
+  }
+  .docx td, .docx th {
+    border: 1px solid var(--rule); padding: 6px 9px;
+    text-align: left; vertical-align: top;
+    word-break: break-word;
+  }
+  .docx th {
+    background: var(--bg-soft); color: var(--ink);
+    font-weight: 600; font-size: 11px;
+    letter-spacing: 0.02em;
+  }
+
+  /* Paragraph row + status indicator */
+  .docx [data-pidx] {
+    position: relative; padding: 3px 8px 3px 24px;
+    border-radius: 3px; cursor: pointer;
+    transition: background-color 60ms ease;
+    scroll-margin-top: 60px;
+  }
+  .docx [data-pidx]:hover { background: var(--bg-soft); }
+  .docx [data-pidx].pair-hover { background: rgba(180,83,9,0.06); }
+  .docx [data-pidx].active {
+    background: var(--accent-soft) !important;
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  .docx [data-pidx]::before {
+    content: ''; position: absolute;
+    left: 8px; top: 0.85em; transform: translateY(-50%);
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--ink-soft);
+    box-shadow: 0 0 0 0 transparent;
+    transition: box-shadow 80ms, background 80ms;
+  }
+  .docx [data-pidx][data-status="certified"]::before { background: var(--success); }
+  .docx [data-pidx][data-status="flagged"]::before   { background: var(--danger); }
+  .docx [data-pidx][data-commented="1"]::before {
+    box-shadow: 0 0 0 2px rgba(29,78,216,0.4);
+  }
+
+  /* Edited paragraphs: subtle teal underline + corner pill */
+  .docx [data-pidx][data-edited="1"] {
+    background: rgba(15,118,110,0.05);
+    box-shadow: inset 2px 0 0 var(--accent-strong);
+  }
+  .docx [data-pidx][data-edited="1"]::after {
+    content: 'edited';
+    position: absolute; top: 2px; right: 4px;
+    font-family: var(--sans);
+    font-size: 8px; font-weight: 600; letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent-strong);
+    background: var(--accent-soft);
+    padding: 1px 5px; border-radius: 2px;
+    pointer-events: none;
+  }
+
+  .page-divider {
+    display: flex; align-items: center; gap: 12px;
+    margin: 26px 0 8px 0;
+    font-family: var(--sans);
+    font-size: 9px; font-weight: 600;
+    color: var(--ink-soft);
+    letter-spacing: 0.18em; text-transform: uppercase;
+  }
+  .page-divider::before, .page-divider::after {
+    content: ''; flex: 1; height: 1px; background: var(--rule);
+  }
+
+  /* Minimap */
+  .minimap {
+    position: absolute; top: 0; right: 0; bottom: 0; width: 5px;
+    background: var(--rule-soft);
+  }
+  .minimap .seg {
+    position: absolute; left: 0; right: 0;
+    cursor: pointer; transition: filter 80ms;
+  }
+  .minimap .seg:hover { filter: brightness(0.85); }
+  .minimap .pending   { background: var(--ink-soft); opacity: 0.4; }
+  .minimap .certified { background: var(--success); }
+  .minimap .flagged   { background: var(--danger); }
+  .minimap .commented { background: var(--info); opacity: 0.7; }
+  .minimap .active-marker {
+    position: absolute; left: -2px; right: -2px;
+    height: 2px; background: var(--ink); pointer-events: none;
+  }
+
+  /* Empty state */
+  .empty {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--ink-soft); font-size: 14px;
+    font-family: var(--serif-display); font-style: italic;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="pane">
+    <header class="pane-head">
+      <div>
+        <span class="label">Original</span>
+        <span class="lang-chip" id="orig-lang">EN</span>
+      </div>
+      <div class="page-pos" id="orig-pos"></div>
+    </header>
+    <div class="pane-body" id="orig-body">
+      <div class="docx" id="orig-doc"></div>
+      <div class="minimap" id="orig-mini"></div>
+    </div>
+  </section>
+  <section class="pane">
+    <header class="pane-head">
+      <div>
+        <span class="label">Translated</span>
+        <span class="lang-chip" id="tran-lang">TR</span>
+      </div>
+      <div class="page-pos" id="tran-pos"></div>
+    </header>
+    <div class="pane-body" id="tran-body">
+      <div class="docx" id="tran-doc"></div>
+      <div class="minimap" id="tran-mini"></div>
+    </div>
+  </section>
+</div>
+
+<script>
+// ---------- Streamlit Custom Component bridge ----------
+(function () {
+  const send = (value) => {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      value: JSON.parse(JSON.stringify(value)),
+      dataType: "json",
+    }, "*");
+  };
+  const setHeight = (h) => {
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setFrameHeight",
+      height: h,
+    }, "*");
+  };
+
+  let state = {
+    args: null,
+    activeIdx: null,
+    hoverIdx: null,
+    lastOrigHtml: null,
+    lastTranHtml: null,
+  };
+
+  function annotate(rootId, paragraphs, feedback) {
+    const root = document.getElementById(rootId);
+    if (!root) return;
+
+    // Insert page dividers before first paragraph of each new page.
+    let lastPage = 1;
+    const items = root.querySelectorAll('[data-pidx]');
+    items.forEach(el => {
+      const idx  = parseInt(el.getAttribute('data-pidx'), 10);
+      const page = parseInt(el.getAttribute('data-page') || '1', 10);
+      if (page > lastPage) {
+        const prev = el.previousElementSibling;
+        if (!prev || !prev.classList || !prev.classList.contains('page-divider')) {
+          const div = document.createElement('div');
+          div.className = 'page-divider';
+          div.textContent = 'Page ' + page;
+          el.parentNode.insertBefore(div, el);
+        }
+        lastPage = page;
+      }
+      const fb = feedback[idx];
+      el.setAttribute('data-status', fb && fb.status ? fb.status : 'pending');
+      el.setAttribute('data-commented', fb && fb.comment ? '1' : '0');
+    });
+  }
+
+  function renderMinimap(miniId, total, feedback, paneBody) {
+    const mini = document.getElementById(miniId);
+    if (!mini) return;
+    mini.innerHTML = '';
+    if (total === 0) return;
+
+    for (let i = 0; i < total; i++) {
+      const fb = feedback[i];
+      const status = fb && fb.status ? fb.status : 'pending';
+      const commented = fb && fb.comment ? true : false;
+      const seg = document.createElement('div');
+      seg.className = 'seg ' + (status === 'pending' && commented ? 'commented' : status);
+      seg.style.top    = (i / total * 100) + '%';
+      seg.style.height = Math.max(100 / total, 0.5) + '%';
+      seg.title = 'para ' + i + ' · ' + status + (commented ? ' · commented' : '');
+      seg.addEventListener('click', () => setActive(i));
+      mini.appendChild(seg);
+    }
+  }
+
+  function paneOf(rootId) {
+    return document.getElementById(rootId);
+  }
+
+  function scrollPaneTo(rootId, idx) {
+    const root = paneOf(rootId);
+    if (!root) return;
+    const el = root.querySelector(`[data-pidx="${idx}"]`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  function updateActiveStyles() {
+    document.querySelectorAll('[data-pidx].active').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('[data-pidx].pair-hover').forEach(el => el.classList.remove('pair-hover'));
+    if (state.activeIdx !== null) {
+      document.querySelectorAll(`[data-pidx="${state.activeIdx}"]`).forEach(el => el.classList.add('active'));
+    }
+    if (state.hoverIdx !== null && state.hoverIdx !== state.activeIdx) {
+      document.querySelectorAll(`[data-pidx="${state.hoverIdx}"]`).forEach(el => el.classList.add('pair-hover'));
+    }
+    updatePagePositions();
+  }
+
+  function updatePagePositions() {
+    const args = state.args;
+    if (!args) return;
+    const idx = state.activeIdx;
+    const orig = args.orig_paragraphs && idx !== null ? args.orig_paragraphs[idx] : null;
+    const tran = args.tran_paragraphs && idx !== null ? args.tran_paragraphs[idx] : null;
+    const origPosEl = document.getElementById('orig-pos');
+    const tranPosEl = document.getElementById('tran-pos');
+    const totalOrig = args.orig_paragraphs ? args.orig_paragraphs[args.orig_paragraphs.length - 1]?.page : 0;
+    const totalTran = args.tran_paragraphs ? args.tran_paragraphs[args.tran_paragraphs.length - 1]?.page : 0;
+    if (origPosEl) origPosEl.textContent = orig ? `p. ${orig.page} / ${totalOrig}` : '';
+    if (tranPosEl) tranPosEl.textContent = tran ? `p. ${tran.page} / ${totalTran}` : '';
+  }
+
+  function setActive(idx) {
+    state.activeIdx = idx;
+    updateActiveStyles();
+    scrollPaneTo('orig-body', idx);
+    scrollPaneTo('tran-body', idx);
+    send({ type: 'active', idx: idx, ts: Date.now() });
+  }
+
+  function wireEvents() {
+    document.querySelectorAll('.docx').forEach(root => {
+      if (root._wired) return;
+      root._wired = true;
+      root.addEventListener('click', (e) => {
+        const t = e.target.closest('[data-pidx]');
+        if (!t) return;
+        setActive(parseInt(t.getAttribute('data-pidx'), 10));
+      });
+      root.addEventListener('mouseover', (e) => {
+        const t = e.target.closest('[data-pidx]');
+        if (!t) return;
+        state.hoverIdx = parseInt(t.getAttribute('data-pidx'), 10);
+        updateActiveStyles();
+      });
+      root.addEventListener('mouseleave', () => {
+        state.hoverIdx = null;
+        updateActiveStyles();
+      });
+    });
+  }
+
+  function wrapWideTables(rootId) {
+    // Wrap each <table> in a horizontally-scrollable container so wide
+    // tables don't force the whole pane to scroll.
+    const root = document.getElementById(rootId);
+    if (!root) return;
+    root.querySelectorAll('table').forEach(tbl => {
+      if (tbl.parentElement && tbl.parentElement.classList.contains('table-scroll')) return;
+      const wrap = document.createElement('div');
+      wrap.className = 'table-scroll';
+      tbl.parentNode.insertBefore(wrap, tbl);
+      wrap.appendChild(tbl);
+    });
+  }
+
+  function getViewportHeight() {
+    // Streamlit components are sandboxed iframes — most viewport queries fail.
+    // Try every legal access in order before giving up.
+    let h = 0;
+    try { h = window.parent.innerHeight; } catch (e) {}
+    if (!h) try { h = window.parent.document.documentElement.clientHeight; } catch (e) {}
+    if (!h) try { h = window.top.innerHeight; } catch (e) {}
+    if (!h && window.screen && window.screen.availHeight) h = window.screen.availHeight - 120;
+    return h;
+  }
+
+  function autoHeight(args) {
+    let h = args.height || 880;
+    const vh = getViewportHeight();
+    if (vh && Number.isFinite(vh) && vh > 500) {
+      h = Math.max(560, Math.min(1100, vh - 200));
+    }
+    setHeight(h);
+  }
+
+  function render(args) {
+    state.args = args;
+    state.activeIdx = (args.active_idx === null || args.active_idx === undefined) ? state.activeIdx : args.active_idx;
+
+    const origHtml = args.orig_html || '';
+    const tranHtml = args.tran_html || '';
+
+    // Only rebuild innerHTML when the source HTML actually changed. This
+    // preserves the contenteditable cursor across stray re-renders.
+    const origChanged = origHtml !== state.lastOrigHtml;
+    const tranChanged = tranHtml !== state.lastTranHtml;
+
+    if (origChanged) {
+      const orig = document.getElementById('orig-doc');
+      orig._wired = false;
+      orig.innerHTML = origHtml;
+      state.lastOrigHtml = origHtml;
+      wrapWideTables('orig-doc');
+    }
+
+    if (tranChanged) {
+      const tran = document.getElementById('tran-doc');
+      tran._wired = false;
+      tran.innerHTML = tranHtml;
+      state.lastTranHtml = tranHtml;
+      wrapWideTables('tran-doc');
+    }
+
+    document.getElementById('orig-lang').textContent = (args.source_lang || 'EN').toUpperCase();
+    document.getElementById('tran-lang').textContent = (args.target_lang || 'TR').toUpperCase();
+
+    annotate('orig-doc', args.orig_paragraphs || [], args.feedback || {});
+    annotate('tran-doc', args.tran_paragraphs || [], args.feedback || {});
+
+    const totalOrig = (args.orig_paragraphs || []).length;
+    const totalTran = (args.tran_paragraphs || []).length;
+    renderMinimap('orig-mini', totalOrig, args.feedback || {});
+    renderMinimap('tran-mini', totalTran, args.feedback || {});
+
+    wireEvents();
+    updateActiveStyles();
+    if (state.activeIdx !== null) {
+      scrollPaneTo('orig-body', state.activeIdx);
+      scrollPaneTo('tran-body', state.activeIdx);
+    }
+
+    autoHeight(args);
+  }
+
+  // Re-fit on viewport resize
+  window.addEventListener('resize', () => { if (state.args) autoHeight(state.args); });
+
+  // ---- Streamlit message protocol ----
+  function onMessage(event) {
+    const data = event.data;
+    if (!data || data.type !== 'streamlit:render') return;
+    render(data.args || {});
+  }
+
+  window.addEventListener('message', onMessage);
+  window.parent.postMessage({ isStreamlitMessage: true, type: 'streamlit:componentReady', apiVersion: 1 }, '*');
+})();
+</script>
+</body>
+</html>

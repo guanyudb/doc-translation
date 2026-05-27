@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.DS_Store
+.cursor/
+.idea/
+.vscode/
+*.swp
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Databricks CLI sync metadata
+.databricks/
+
+# Stale HTML/Pandoc export of DATABRICKS_COMPONENTS.md (the .md is canonical)
+DATABRICKS_COMPONENTS.html
+DATABRICKS_COMPONENTS_files/
+docs/pipeline_design_files/
+
+# Logs
+*.log

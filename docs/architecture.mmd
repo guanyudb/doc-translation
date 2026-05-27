@@ -1,0 +1,178 @@
+%%{
+  init: {
+    "theme": "base",
+    "themeVariables": {
+      "background":        "#fafaf8",
+      "primaryColor":      "#e8e0d0",
+      "primaryTextColor":  "#1a1a1a",
+      "primaryBorderColor":"#b0a090",
+      "lineColor":         "#5a5a6a",
+      "secondaryColor":    "#d4e8e4",
+      "tertiaryColor":     "#c8d4e8",
+      "edgeLabelBackground":"#fafaf8",
+      "fontFamily":        "Inter, Segoe UI, Arial, sans-serif",
+      "fontSize":          "13px"
+    },
+    "flowchart": {
+      "curve": "basis",
+      "padding": 24,
+      "nodeSpacing": 40,
+      "rankSpacing": 60,
+      "useMaxWidth": false
+    }
+  }
+}%%
+
+flowchart LR
+
+  %% ─────────────────────────────────────────────
+  %% INGESTION
+  %% ─────────────────────────────────────────────
+  subgraph INGEST["  Ingestion  "]
+    direction TB
+    SUBMITTER(["Submitter"])
+    RAW["raw_documents/"]
+    AUTOLOADER["Auto Loader"]
+    TRANSJOB["Lakeflow Job<br/>OOXML in-place translation"]
+    FMAPI(["Foundation Model API<br/>(Gemini)"])
+  end
+
+  %% ─────────────────────────────────────────────
+  %% UNITY CATALOG VOLUMES
+  %% ─────────────────────────────────────────────
+  subgraph UC_VOLS["  Unity Catalog Volumes  "]
+    direction TB
+    VOL_RAW[("raw_documents/")]
+    VOL_TRANS[("translated_inplace/")]
+    VOL_REV[("translated_reviewed/")]
+    VOL_GOLD[("golden/&lt;pair_id&gt;<br/>Locked · SHA-256 verified")]
+  end
+
+  %% ─────────────────────────────────────────────
+  %% LAKEBASE POSTGRES
+  %% ─────────────────────────────────────────────
+  subgraph LAKEBASE["  Lakebase Postgres — hot OLTP  "]
+    direction TB
+    LB_PAIRS["review_pairs<br/>(lifecycle_state)"]
+    LB_FEEDBACK["review_feedback<br/>(edited_text)"]
+    LB_EDITHIST["review_edit_history"]
+    LB_PUBLOG["review_publish_log"]
+    LB_AUDIT["audit_events<br/>INSERT-only · 7-yr retention"]
+    LB_GOLDPUB["golden_publications"]
+  end
+
+  %% ─────────────────────────────────────────────
+  %% DELTA LAKEHOUSE
+  %% ─────────────────────────────────────────────
+  subgraph DELTA["  Delta Lakehouse — long-term archive  "]
+    direction TB
+    DL_AUDIT["audit_events<br/>(mirror)"]
+    DL_GOLDPUB["golden_publications<br/>(mirror)"]
+    DL_SILVER["silver_review_snapshots"]
+  end
+
+  %% ─────────────────────────────────────────────
+  %% COMPUTE / APP
+  %% ─────────────────────────────────────────────
+  subgraph COMPUTE["  Compute  "]
+    direction TB
+    APP["Databricks App<br/>Streamlit Reviewer UI"]
+  end
+
+  %% ─────────────────────────────────────────────
+  %% CONSUMERS
+  %% ─────────────────────────────────────────────
+  subgraph CONSUMERS["  Consumers  "]
+    direction TB
+    REVIEWER(["Reviewer<br/>(SSO)"])
+    BI(["BI / AI Dashboards"])
+    AUDITOR(["Compliance Auditor"])
+  end
+
+  %% ─────────────────────────────────────────────
+  %% SOLID ARROWS — synchronous / app writes
+  %% ─────────────────────────────────────────────
+  SUBMITTER -->|"drop .docx"| RAW
+  RAW --> AUTOLOADER --> TRANSJOB
+  TRANSJOB <-->|"translate paragraphs"| FMAPI
+  TRANSJOB -->|"write translated DOCX"| VOL_TRANS
+  TRANSJOB -->|"create review_pair row"| LB_PAIRS
+
+  REVIEWER -->|"login (SSO)"| APP
+  APP -->|"read source + translated"| VOL_TRANS
+  APP -->|"read reviewed copies"| VOL_REV
+  APP -->|"paragraph state"| LB_FEEDBACK
+  APP -->|"edit history"| LB_EDITHIST
+  APP -->|"publish log"| LB_PUBLOG
+  APP -->|"append event"| LB_AUDIT
+  APP -->|"write reviewed DOCX"| VOL_REV
+
+  APP -->|"on promote: write golden DOCX"| VOL_GOLD
+  APP -->|"on promote: write record"| LB_GOLDPUB
+
+  %% ─────────────────────────────────────────────
+  %% DASHED ARROWS — sync at promotion time
+  %% ─────────────────────────────────────────────
+  LB_AUDIT -.->|"sync at promotion"| DL_AUDIT
+  LB_GOLDPUB -.->|"sync at promotion"| DL_GOLDPUB
+  LB_FEEDBACK -.->|"sync at promotion"| DL_SILVER
+
+  %% ─────────────────────────────────────────────
+  %% SOLID ARROWS — downstream consumers
+  %% ─────────────────────────────────────────────
+  DL_AUDIT --> BI
+  DL_GOLDPUB --> BI
+  DL_SILVER --> BI
+  DL_AUDIT --> AUDITOR
+  DL_GOLDPUB --> AUDITOR
+  VOL_GOLD -->|"file-of-record"| AUDITOR
+
+  %% ─────────────────────────────────────────────
+  %% NODE STYLES
+  %% ─────────────────────────────────────────────
+
+  %% Actors — warm sand
+  style SUBMITTER fill:#f5ede0,stroke:#c8a878,color:#3a2a10,rx:20
+  style REVIEWER  fill:#f5ede0,stroke:#c8a878,color:#3a2a10,rx:20
+  style BI        fill:#f5ede0,stroke:#c8a878,color:#3a2a10,rx:20
+  style AUDITOR   fill:#f5ede0,stroke:#c8a878,color:#3a2a10,rx:20
+
+  %% Ingestion compute — slate
+  style RAW        fill:#dce4f0,stroke:#8090b8,color:#1a1a2e
+  style AUTOLOADER fill:#dce4f0,stroke:#8090b8,color:#1a1a2e
+  style TRANSJOB   fill:#dce4f0,stroke:#8090b8,color:#1a1a2e
+  style FMAPI      fill:#e8e0f0,stroke:#9080b0,color:#2a1a3e
+
+  %% UC Volumes — warm parchment / cream
+  style VOL_RAW   fill:#f2ead8,stroke:#b0a070,color:#2a2010
+  style VOL_TRANS fill:#f2ead8,stroke:#b0a070,color:#2a2010
+  style VOL_REV   fill:#f2ead8,stroke:#b0a070,color:#2a2010
+
+  %% Golden zone — oxidized green with accent border
+  style VOL_GOLD  fill:#d8eddc,stroke:#3a7a4a,stroke-width:3px,color:#1a3a20
+
+  %% Lakebase nodes — deep teal
+  style LB_PAIRS    fill:#d0e8e4,stroke:#2a7a70,color:#0a2a28
+  style LB_FEEDBACK fill:#d0e8e4,stroke:#2a7a70,color:#0a2a28
+  style LB_EDITHIST fill:#d0e8e4,stroke:#2a7a70,color:#0a2a28
+  style LB_PUBLOG   fill:#d0e8e4,stroke:#2a7a70,color:#0a2a28
+  style LB_AUDIT    fill:#b8dcd8,stroke:#1a6a60,stroke-width:2px,color:#0a2a28
+  style LB_GOLDPUB  fill:#d0e8e4,stroke:#2a7a70,color:#0a2a28
+
+  %% Delta nodes — slate blue
+  style DL_AUDIT   fill:#d8e0f0,stroke:#4a5a90,color:#1a1a3a
+  style DL_GOLDPUB fill:#d8e0f0,stroke:#4a5a90,color:#1a1a3a
+  style DL_SILVER  fill:#d8e0f0,stroke:#4a5a90,color:#1a1a3a
+
+  %% App — accent orange-teal
+  style APP fill:#e4eee8,stroke:#3a7060,stroke-width:2px,color:#0a2820
+
+  %% ─────────────────────────────────────────────
+  %% SUBGRAPH STYLES
+  %% ─────────────────────────────────────────────
+  classDef ingestGroup  fill:#f0ecdf,stroke:#b8a878,stroke-width:1.5px,color:#1a1a1a
+  classDef volGroup     fill:#f5efe0,stroke:#c0a868,stroke-width:1.5px,color:#1a1a1a
+  classDef lakebaseGroup fill:#e0f0ee,stroke:#2a8070,stroke-width:2px,color:#0a2828
+  classDef deltaGroup   fill:#e4eaf8,stroke:#4a5a98,stroke-width:1.5px,color:#1a1a3a
+  classDef computeGroup fill:#e8f2ec,stroke:#3a7860,stroke-width:1.5px,color:#0a2820
+  classDef consumerGroup fill:#f5ede0,stroke:#b8a070,stroke-width:1.5px,color:#1a1a1a

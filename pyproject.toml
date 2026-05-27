@@ -1,0 +1,12 @@
+[project]
+name = "doc-translation-app"
+version = "0.1.0"
+description = "Side-by-side DOCX translation review with paragraph-level certify/comment"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.40",
+    "psycopg[binary,pool]>=3.2",
+    "databricks-sdk>=0.40",
+    "mammoth>=1.8",
+    "lxml>=5.3",
+]
