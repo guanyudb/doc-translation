@@ -253,14 +253,23 @@ Or always run `./deploy.sh` for iteration — it's idempotent and handles all 4 
 
 If you ever change `variable-overrides.json` values (e.g., point at a different Lakebase Project), re-run `./deploy.sh` so the seeded secrets are updated.
 
-### Translation pipeline (separate)
+### Translation pipeline
 
-The DAB deploys the **reviewer app**. The **translation pipeline** is a Lakeflow job that wraps two notebooks (`Auto-Translate Watcher` + `DOCX Inplace Translation`). Those notebooks live outside the bundle today; they need to be:
-1. Imported to the workspace under `/Users/<you>/Translation PoC/`
-2. Wired into a Lakeflow Job with a file-arrival trigger on `raw_documents/`
-3. Configured to write to the same `translated_inplace/` Volume folder
+The bundle deploys **both** the reviewer app AND the auto-translation pipeline.
 
-A future iteration of this bundle will include the pipeline notebooks + job spec under `resources/jobs/translation_pipeline.yml`. For now they're a manual step — see [`docs/pipeline_design.md`](docs/pipeline_design.md).
+After `./deploy.sh`, you'll have a Lakeflow job called `doc-translation · auto-translate pipeline` with:
+- **A file-arrival trigger** watching `/Volumes/<your-catalog>/<your-schema>/<your-volume>/raw_documents/`. Fires 60s after the last upload (debounce, so a batch upload kicks one run not N).
+- **Two notebooks** that ship with the bundle:
+  - `setup/auto_translate_watcher.py` — scans for unpaired files, writes `bronze_documents` audit rows, invokes the translator once per file
+  - `setup/docx_inplace_translation.py` — translates paragraph-by-paragraph via the configured Foundation Model API endpoint, in-place at the OOXML level (preserves layout, charts, headers/footers, SmartArt)
+
+To kick a translation: just upload a `.docx` to `raw_documents/`. The job fires automatically; the translated file appears in `translated_inplace/`; the reviewer app's sidebar picks up the new pair.
+
+Configuration knobs (set in `variable-overrides.json`):
+- `translation_model_endpoint` (default `databricks-claude-sonnet-4-6`)
+- `translation_target_language` (default `English`)
+- `translation_max_workers` (default `8`)
+- `translation_max_pages` (default `0` = whole document)
 
 ### Re-deploys
 

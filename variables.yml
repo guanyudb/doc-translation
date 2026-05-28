@@ -65,6 +65,30 @@ variables:
       SQL warehouse ID for syncing audit + publication state to Delta at
       promotion time. Any serverless 2X-Small warehouse is fine.
 
+  # ---- Translation pipeline ----
+  translation_model_endpoint:
+    description: |
+      Foundation Model API endpoint to translate paragraph text. Must be a
+      Claude-family endpoint that supports chat completion. Check available
+      endpoints in your workspace under Serving.
+    default: databricks-claude-sonnet-4-6
+
+  translation_target_language:
+    description: |
+      Target language (full English name; the inner notebook builds a
+      `<base>_translated_<slug>.docx` filename from this).
+    default: English
+
+  translation_max_workers:
+    description: Concurrent translation calls per file.
+    default: "8"
+
+  translation_max_pages:
+    description: |
+      Cap body translation to first N pages of each DOCX (0 = no limit).
+      Headers, footers, footnotes, charts are always translated in full.
+    default: "0"
+
   # ---- App naming ----
   app_name:
     description: Databricks App name. Becomes the public URL prefix.
