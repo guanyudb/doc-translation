@@ -39,6 +39,10 @@
 # COMMAND ----------
 
 # MAGIC %pip install lxml langdetect --quiet
+# MAGIC # Some workspace serverless notebook environments ship an older
+# MAGIC # databricks-sdk that lacks `serving_endpoints.get_open_ai_client()`
+# MAGIC # (deploy guide gotcha #14). Pin a known-good version.
+# MAGIC %pip install --quiet --upgrade "databricks-sdk>=0.30.0"
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
