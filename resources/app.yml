@@ -44,3 +44,44 @@ resources:
           sql_warehouse:
             id:         ${var.warehouse_id}
             permission: CAN_USE
+
+        # ---- Secret-backed env vars ------------------------------------------
+        # DAB doesn't substitute ${var.X} inside user files like app.yaml, so
+        # workspace-specific config has to come through this binding pathway.
+        # The secret VALUES are seeded by `deploy.sh` (step 2) from the
+        # values in `.databricks/bundle/<target>/variable-overrides.json`.
+        - name: pg_schema
+          secret:
+            scope:      ${var.secret_scope}
+            key:        pg_schema
+            permission: READ
+        - name: lakebase_project
+          secret:
+            scope:      ${var.secret_scope}
+            key:        lakebase_project
+            permission: READ
+        - name: lakebase_branch
+          secret:
+            scope:      ${var.secret_scope}
+            key:        lakebase_branch
+            permission: READ
+        - name: lakebase_instance
+          secret:
+            scope:      ${var.secret_scope}
+            key:        lakebase_instance
+            permission: READ
+        - name: volume_root
+          secret:
+            scope:      ${var.secret_scope}
+            key:        volume_root
+            permission: READ
+        - name: delta_catalog
+          secret:
+            scope:      ${var.secret_scope}
+            key:        delta_catalog
+            permission: READ
+        - name: delta_schema
+          secret:
+            scope:      ${var.secret_scope}
+            key:        delta_schema
+            permission: READ

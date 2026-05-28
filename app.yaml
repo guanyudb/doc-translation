@@ -1,10 +1,14 @@
 # Databricks Apps runtime config.
 #
-# IMPORTANT (deploy guide gotcha #1): `resources/app.yml` only makes the bound
-# values available to the SP. Apps still won't expose them as env vars unless
-# they're declared here with `valueFrom: <resource name>`.
+# IMPORTANT (deploy guide gotcha #1): `resources/app.yml` only makes bindings
+# AVAILABLE to the SP. Apps still won't expose them as env vars unless they're
+# declared here with `valueFrom: <resource name>`.
 #
-# Variable substitution (${var.X}) is resolved by `databricks bundle deploy`.
+# This file is COMMITTED VERBATIM — DAB does NOT substitute ${var.X} inside
+# user-content files like app.yaml. Workspace-specific values therefore can't
+# live in `value:`; they have to come from resource bindings. We use secrets
+# seeded by `deploy.sh` (step 2) for plain config values, and direct bindings
+# for the Postgres + SQL warehouse.
 
 command:
   - "streamlit"
@@ -16,32 +20,29 @@ command:
   - "--browser.gatherUsageStats=false"
 
 env:
-  # ---- Lakebase Postgres connection (mostly auto-injected by binding) ----
+  # ---- Lakebase Postgres connection (mostly auto-injected) ----
   #
   # PGHOST, PGPORT, PGDATABASE, PGUSER, PGSSLMODE are injected automatically
   # by the `postgres:` (or legacy `database:`) resource binding in
   # resources/app.yml. We don't redeclare them here.
   - name: PGSCHEMA
-    value: ${var.pg_schema}
+    valueFrom: pg_schema
 
-  # Lakebase Project mode: project + branch tell server/db.py how to mint
-  # an OAuth JWT via /api/2.0/postgres/credentials. Empty string = use the
-  # legacy Provisioned path (LAKEBASE_INSTANCE).
   - name: LAKEBASE_PROJECT
-    value: ${var.lakebase_project}
+    valueFrom: lakebase_project
   - name: LAKEBASE_BRANCH
-    value: ${var.lakebase_branch}
+    valueFrom: lakebase_branch
   - name: LAKEBASE_INSTANCE
-    value: ${var.lakebase_instance}
+    valueFrom: lakebase_instance
 
   # ---- UC Volume for documents ----
   - name: VOLUME_ROOT
-    value: /Volumes/${var.uc_catalog}/${var.uc_schema}/${var.uc_volume_name}
+    valueFrom: volume_root
 
   # ---- Delta long-term archive ----
   - name: DELTA_CATALOG
-    value: ${var.uc_catalog}
+    valueFrom: delta_catalog
   - name: DELTA_SCHEMA
-    value: ${var.uc_schema}
+    valueFrom: delta_schema
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: warehouse

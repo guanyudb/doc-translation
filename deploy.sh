@@ -41,14 +41,46 @@ fi
 
 SCOPE=$(python3 -c "import json,sys; print(json.load(open('$OVERRIDES')).get('secret_scope','doc_translation_config'))")
 
-# Step 2 — seed secret scope (idempotent). We don't actually need any
-# secrets today (everything comes from bundle vars + bindings), but creating
-# the scope is cheap and gives us a place to hang future secrets without a
-# redeploy. The `--scope-backend-type DATABRICKS` ensures we don't
-# accidentally use a KV-backed scope the SP can't read.
-echo "==> step 2: seed secret scope ($SCOPE)"
+# Step 2 — seed secret scope + per-config secrets (idempotent).
+#
+# Why secrets at all: DAB doesn't substitute ${var.X} inside user files like
+# app.yaml. The canonical workaround is to put workspace-specific config
+# values in a secret scope and bind them as resources, then reference via
+# `valueFrom:` in app.yaml. Cheap, well-supported, audit-friendly.
+echo "==> step 2: seed secret scope ($SCOPE) + per-config secrets"
 databricks secrets create-scope "$SCOPE" $EXTRA_FLAGS 2>/dev/null \
     || echo "    (scope already exists — ok)"
+
+# Read values from the variable-overrides file, compute derived values,
+# and put them as secrets. Defaults match variables.yml.
+PYREAD='import json,os,sys
+d=json.load(open(os.environ["OVR"]))
+uc=d.get("uc_catalog","")
+sc=d.get("uc_schema","doc_translation")
+vn=d.get("uc_volume_name","doc-translation")
+print(d.get("pg_schema","doc_translation"))
+print(d.get("lakebase_project",""))
+print(d.get("lakebase_branch","main"))
+print(d.get("lakebase_instance",""))
+print(f"/Volumes/{uc}/{sc}/{vn}")
+print(uc)
+print(sc)'
+read -r PG_SCHEMA LB_PROJECT LB_BRANCH LB_INSTANCE VOL_ROOT DELTA_CAT DELTA_SCH < <(
+    OVR="$OVERRIDES" python3 -c "$PYREAD" | xargs
+)
+for kv in \
+    "pg_schema=$PG_SCHEMA" \
+    "lakebase_project=$LB_PROJECT" \
+    "lakebase_branch=$LB_BRANCH" \
+    "lakebase_instance=$LB_INSTANCE" \
+    "volume_root=$VOL_ROOT" \
+    "delta_catalog=$DELTA_CAT" \
+    "delta_schema=$DELTA_SCH"; do
+    k="${kv%%=*}"
+    v="${kv#*=}"
+    databricks secrets put-secret "$SCOPE" "$k" --string-value "$v" $EXTRA_FLAGS
+    echo "    put $SCOPE/$k = $v"
+done
 
 # Step 3 — bundle deploy (resources + sync code to workspace)
 echo "==> step 3: bundle deploy"

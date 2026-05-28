@@ -28,10 +28,16 @@ PGDATABASE = os.environ.get("PGDATABASE", "databricks_postgres")
 PGSSLMODE  = os.environ.get("PGSSLMODE", "require")
 PGSCHEMA   = os.environ.get("PGSCHEMA", "doc_translation")
 
-# Lakebase mode — Project takes precedence if both are somehow set.
-LAKEBASE_PROJECT  = os.environ.get("LAKEBASE_PROJECT")
-LAKEBASE_BRANCH   = os.environ.get("LAKEBASE_BRANCH", "main")
-LAKEBASE_INSTANCE = os.environ.get("LAKEBASE_INSTANCE")  # Provisioned fallback
+# Lakebase mode — Project takes precedence if both are somehow set. Empty
+# strings (which secrets-backed env vars produce when the customer left a
+# field blank) are normalized to None.
+def _maybe(name: str) -> str | None:
+    v = (os.environ.get(name) or "").strip()
+    return v or None
+
+LAKEBASE_PROJECT  = _maybe("LAKEBASE_PROJECT")
+LAKEBASE_BRANCH   = _maybe("LAKEBASE_BRANCH") or "main"
+LAKEBASE_INSTANCE = _maybe("LAKEBASE_INSTANCE")  # Provisioned fallback
 
 if not LAKEBASE_PROJECT and not LAKEBASE_INSTANCE:
     raise RuntimeError(
