@@ -225,36 +225,37 @@ If you're on a **legacy Provisioned** Lakebase instance instead of a Project:
 - Set `lakebase_instance` to your instance name; leave `lakebase_project` empty.
 - In `resources/app.yml`, comment out the `postgres:` binding block and uncomment the `database:` block underneath it.
 
-### Deploy (CLI — recommended)
+### Deploy (CLI — one command)
 
 ```bash
 ./deploy.sh
 ```
 
-This runs the 5-step deploy in order:
+This runs the 3-step deploy in order:
 
-1. Seed the secret scope (idempotent — no-op if it exists)
-2. `bundle deploy` — creates the UC schema + volume + app resource + postdeploy job, syncs code to the workspace
-3. `bundle run postdeploy_setup` — runs Lakebase DDL, GRANTs the App SP `USAGE + CREATE on public` and table/sequence perms, creates the Delta mirror tables, pre-creates Volume subdirectories
-4. `bundle run doc_translation_app` — pushes the source from the bundle's workspace files into the App runtime and starts it
+1. `bundle deploy` — creates the UC schema + volume + secret scope + app resource (with bindings) + postdeploy job, syncs code to the workspace
+2. `bundle run postdeploy_setup` — **seeds the secret values from your variable-overrides.json**, runs Lakebase DDL, GRANTs the App SP `USAGE + CREATE on public` and table/sequence perms, creates the Delta mirror tables, pre-creates Volume subdirectories
+3. `bundle run doc_translation_app` — pushes the source from the bundle's workspace files into the App runtime and starts it
 
 The app URL prints at the end. First boot takes ~30 seconds.
 
-### Deploy (Workspace UI — manual 3 clicks)
+### Deploy (Workspace UI — 3 button clicks)
 
-⚠️ **The "Deploy bundle" button alone is not enough.** It runs `bundle deploy` (step 2 above), which creates the App resource but doesn't push the source code or run the postdeploy job. You'll see "deployed successfully" but the App will be empty + not running.
+Same flow, no CLI:
 
-If you want to use the UI instead of the CLI, after clicking **Deploy bundle**, also:
+1. **Deploy bundle** button → creates resources + uploads source. App is created but not yet running.
+2. Open Workflows → `doc-translation · postdeploy setup` → **Run now**. Seeds the secret values + Lakebase DDL/grants. Wait for it to finish (~1 min).
+3. Open Apps → your app → **Deploy** button (App-level, not Bundle-level). Pushes the source and starts the runtime.
 
-1. **Run the postdeploy job**: open Workflows → `doc-translation · postdeploy setup` → **Run now**. Wait for it to finish (~1 min).
-2. **Deploy the App source + start**: open Apps → your app → **Deploy** button (App-level, not Bundle-level). This pushes the source code from `/Workspace/.../.bundle/<bundle>/<target>/files/` into the App runtime and starts it.
-
-Or, equivalently from CLI:
+Equivalent CLI per step:
 
 ```bash
-databricks bundle run -t prod doc_translation_postdeploy_setup --profile <profile>
-databricks bundle run -t prod doc_translation_app             --profile <profile>
+databricks bundle deploy -t prod                                  --profile <profile>
+databricks bundle run    -t prod doc_translation_postdeploy_setup --profile <profile>
+databricks bundle run    -t prod doc_translation_app              --profile <profile>
 ```
+
+> Secret seeding lives inside the postdeploy job (not `deploy.sh`) so the UI flow above works end-to-end without any CLI. The postdeploy notebook reads its own bundle-variable parameters and puts them as secret values, which the App's `valueFrom:` bindings then resolve at boot time.
 
 ### Translation pipeline (separate)
 

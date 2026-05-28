@@ -39,60 +39,21 @@ if [[ ! -f "$OVERRIDES" ]]; then
     exit 1
 fi
 
-SCOPE=$(python3 -c "import json,sys; print(json.load(open('$OVERRIDES')).get('secret_scope','doc_translation_config'))")
-
-# Step 2 — seed secret scope + per-config secrets (idempotent).
-#
-# Why secrets at all: DAB doesn't substitute ${var.X} inside user files like
-# app.yaml. The canonical workaround is to put workspace-specific config
-# values in a secret scope and bind them as resources, then reference via
-# `valueFrom:` in app.yaml. Cheap, well-supported, audit-friendly.
-echo "==> step 2: seed secret scope ($SCOPE) + per-config secrets"
-databricks secrets create-scope "$SCOPE" $EXTRA_FLAGS 2>/dev/null \
-    || echo "    (scope already exists — ok)"
-
-# Read values from the variable-overrides file, compute derived values,
-# and put them as secrets. Defaults match variables.yml.
-PYREAD='import json,os,sys
-d=json.load(open(os.environ["OVR"]))
-uc=d.get("uc_catalog","")
-sc=d.get("uc_schema","doc_translation")
-vn=d.get("uc_volume_name","doc-translation")
-print(d.get("pg_schema","doc_translation"))
-print(d.get("lakebase_project",""))
-print(d.get("lakebase_branch","main"))
-print(d.get("lakebase_instance",""))
-print(f"/Volumes/{uc}/{sc}/{vn}")
-print(uc)
-print(sc)'
-read -r PG_SCHEMA LB_PROJECT LB_BRANCH LB_INSTANCE VOL_ROOT DELTA_CAT DELTA_SCH < <(
-    OVR="$OVERRIDES" python3 -c "$PYREAD" | xargs
-)
-for kv in \
-    "pg_schema=$PG_SCHEMA" \
-    "lakebase_project=$LB_PROJECT" \
-    "lakebase_branch=$LB_BRANCH" \
-    "lakebase_instance=$LB_INSTANCE" \
-    "volume_root=$VOL_ROOT" \
-    "delta_catalog=$DELTA_CAT" \
-    "delta_schema=$DELTA_SCH"; do
-    k="${kv%%=*}"
-    v="${kv#*=}"
-    databricks secrets put-secret "$SCOPE" "$k" --string-value "$v" $EXTRA_FLAGS
-    echo "    put $SCOPE/$k = $v"
-done
-
-# Step 3 — bundle deploy (resources + sync code to workspace)
-echo "==> step 3: bundle deploy"
+# Step 1 — bundle deploy (creates UC schema/volume, secret scope, app
+# resource with bindings, postdeploy job; uploads source files).
+echo "==> step 1: bundle deploy"
 databricks bundle deploy -t "$TARGET" --auto-approve $EXTRA_FLAGS
 
-# Step 4 — postdeploy: DDL + GRANTs + Volume dirs
-echo "==> step 4: postdeploy_setup (DDL + GRANTs + Volume dirs)"
+# Step 2 — postdeploy job: seeds the secret VALUES (from bundle vars),
+# runs Lakebase DDL + GRANTs, creates Delta mirror tables, pre-creates
+# Volume subdirs. Secrets MUST be seeded before step 3 so the app's
+# secret bindings resolve at boot.
+echo "==> step 2: postdeploy_setup (secrets + DDL + GRANTs + Volume dirs)"
 databricks bundle run -t "$TARGET" doc_translation_postdeploy_setup $EXTRA_FLAGS
 
-# Step 5 — App source push + start. `bundle run` on an `apps.<name>` resource
+# Step 3 — App source push + start. `bundle run` on an `apps.<name>` resource
 # does both the `apps deploy` and the start (deploy guide gotcha #8).
-echo "==> step 5: deploy + start app"
+echo "==> step 3: deploy + start app"
 databricks bundle run -t "$TARGET" doc_translation_app $EXTRA_FLAGS
 
 echo "==> done. App URL is in the output above."

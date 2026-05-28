@@ -42,6 +42,7 @@ dbutils.widgets.text("lakebase_database_slug", "databricks-postgres", "lakebase_
 dbutils.widgets.text("lakebase_instance",      "", "lakebase_instance (Provisioned fallback)")
 dbutils.widgets.text("warehouse_id",           "", "warehouse_id")
 dbutils.widgets.text("app_name",               "doc-translation", "app_name")
+dbutils.widgets.text("secret_scope",           "doc_translation_config", "secret_scope")
 
 uc_catalog        = dbutils.widgets.get("uc_catalog").strip()
 uc_schema         = dbutils.widgets.get("uc_schema").strip()
@@ -53,6 +54,7 @@ lakebase_db_slug  = dbutils.widgets.get("lakebase_database_slug").strip()
 lakebase_instance = dbutils.widgets.get("lakebase_instance").strip()
 warehouse_id      = dbutils.widgets.get("warehouse_id").strip()
 app_name          = dbutils.widgets.get("app_name").strip()
+secret_scope      = dbutils.widgets.get("secret_scope").strip() or "doc_translation_config"
 
 for k, v in [("uc_catalog", uc_catalog), ("warehouse_id", warehouse_id), ("app_name", app_name)]:
     if not v:
@@ -67,12 +69,53 @@ print(f"app_name={app_name}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Resolve the App service principal UUID
+# MAGIC ## Seed the secret scope with the App's runtime config
+# MAGIC
+# MAGIC DAB doesn't substitute `${var.X}` inside user files like `app.yaml`,
+# MAGIC so workspace-specific config flows from variable-overrides.json →
+# MAGIC bundle vars → this notebook's parameters → secret values → secret
+# MAGIC bindings in `resources/app.yml` → `valueFrom:` in `app.yaml` → env
+# MAGIC vars at app boot time.
+# MAGIC
+# MAGIC Seeded here (not in deploy.sh) so the UI "Deploy bundle" flow works
+# MAGIC end-to-end without requiring CLI: as long as the secret scope exists
+# MAGIC (created as a bundle resource) and the app hasn't been started yet,
+# MAGIC seeding here before triggering the app's `bundle run` is sufficient.
 
 # COMMAND ----------
 
 from databricks.sdk import WorkspaceClient
 w = WorkspaceClient()
+
+vol_root = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume_name}"
+
+app_config_secrets = {
+    "pg_schema":         pg_schema,
+    "lakebase_project":  lakebase_project,
+    "lakebase_branch":   lakebase_branch,
+    "lakebase_instance": lakebase_instance,
+    "volume_root":       vol_root,
+    "delta_catalog":     uc_catalog,
+    "delta_schema":      uc_schema,
+}
+
+# Make sure the scope exists (DAB creates it; fall back to creating it
+# here if the user hasn't included resources/secrets.yml for some reason).
+try:
+    w.secrets.create_scope(scope=secret_scope)
+except Exception as e:
+    if "already exists" not in str(e).lower():
+        print(f"  scope create note: {e}")
+
+for k, v in app_config_secrets.items():
+    w.secrets.put_secret(scope=secret_scope, key=k, string_value=v or "")
+    print(f"  put {secret_scope}/{k} = {v!r}")
+print(f"\nseeded {len(app_config_secrets)} secret(s) into scope {secret_scope!r}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Resolve the App service principal UUID
 
 # Apps's SP is created automatically and accessible via the apps API.
 app = w.apps.get(name=app_name)

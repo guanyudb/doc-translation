@@ -36,6 +36,7 @@ resources:
               lakebase_instance:      ${var.lakebase_instance}
               warehouse_id:           ${var.warehouse_id}
               app_name:               ${var.app_name}
+              secret_scope:           ${var.secret_scope}
 
       run_as:
         user_name: ${var.workspace_user_email}
