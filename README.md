@@ -204,37 +204,57 @@ git clone git@github.com:guanyudb/doc-translation.git
 cd doc-translation
 git checkout customer-deployable
 
-# 2. Copy the variable-overrides template and fill in YOUR values
+# 2. Create the variable-overrides file. Its presence is what enables the
+#    "Deploy bundle" button in the Workspace UI AND what `./deploy.sh` reads.
 mkdir -p .databricks/bundle/prod
 cp variable-overrides.example.json .databricks/bundle/prod/variable-overrides.json
 # Edit .databricks/bundle/prod/variable-overrides.json:
-#   - workspace_host:          https://<your-workspace>.cloud.databricks.com
-#   - workspace_user_email:    your-email@org.com
-#   - uc_catalog:              <catalog you can create schemas in>
-#   - lakebase_project:        <your Lakebase Project name>     [Project mode]
-#   - lakebase_database_slug:  databricks-postgres              [usually]
-#   - lakebase_instance:       ""                               [empty if using Project]
+#   - workspace_user_email:    your-email@org.com  (deploying user + Lakebase admin)
+#   - uc_catalog:              <catalog you can CREATE SCHEMA on>
+#   - lakebase_project:        <your Lakebase Project name>      [Project mode]
+#   - lakebase_branch:         production                        [or main — check your Project]
+#   - lakebase_database_slug:  databricks-postgres               [usually]
+#   - lakebase_instance:       ""                                [empty if using Project]
 #   - warehouse_id:            <your SQL warehouse ID>
+#   - pg_schema:               doc_translation                   [Postgres schema name]
 ```
+
+> **The workspace host comes from your Databricks CLI profile**, not this file. Bundle variables can't be referenced from `workspace.host` (auth resolves before variable substitution). Either run with `--profile <name>` or set `DATABRICKS_HOST` in your environment.
 
 If you're on a **legacy Provisioned** Lakebase instance instead of a Project:
 - Set `lakebase_instance` to your instance name; leave `lakebase_project` empty.
 - In `resources/app.yml`, comment out the `postgres:` binding block and uncomment the `database:` block underneath it.
 
-### Deploy
+### Deploy (CLI — recommended)
 
 ```bash
 ./deploy.sh
 ```
 
-This runs the 5-step deploy:
+This runs the 5-step deploy in order:
 
 1. Seed the secret scope (idempotent — no-op if it exists)
-2. `bundle deploy` — creates the UC schema + volume + app + postdeploy job, syncs code to the workspace
-3. `bundle run` the **postdeploy job** — runs Lakebase DDL, grants the app SP `USAGE + CREATE on public` and table/sequence perms on `doc_translation`, creates the Delta mirror tables, pre-creates Volume subdirectories
-4. `bundle run` the **app** — pushes the source and starts the runtime
+2. `bundle deploy` — creates the UC schema + volume + app resource + postdeploy job, syncs code to the workspace
+3. `bundle run postdeploy_setup` — runs Lakebase DDL, GRANTs the App SP `USAGE + CREATE on public` and table/sequence perms, creates the Delta mirror tables, pre-creates Volume subdirectories
+4. `bundle run doc_translation_app` — pushes the source from the bundle's workspace files into the App runtime and starts it
 
 The app URL prints at the end. First boot takes ~30 seconds.
+
+### Deploy (Workspace UI — manual 3 clicks)
+
+⚠️ **The "Deploy bundle" button alone is not enough.** It runs `bundle deploy` (step 2 above), which creates the App resource but doesn't push the source code or run the postdeploy job. You'll see "deployed successfully" but the App will be empty + not running.
+
+If you want to use the UI instead of the CLI, after clicking **Deploy bundle**, also:
+
+1. **Run the postdeploy job**: open Workflows → `doc-translation · postdeploy setup` → **Run now**. Wait for it to finish (~1 min).
+2. **Deploy the App source + start**: open Apps → your app → **Deploy** button (App-level, not Bundle-level). This pushes the source code from `/Workspace/.../.bundle/<bundle>/<target>/files/` into the App runtime and starts it.
+
+Or, equivalently from CLI:
+
+```bash
+databricks bundle run -t prod doc_translation_postdeploy_setup --profile <profile>
+databricks bundle run -t prod doc_translation_app             --profile <profile>
+```
 
 ### Translation pipeline (separate)
 
