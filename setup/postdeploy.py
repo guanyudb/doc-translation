@@ -93,11 +93,18 @@ if lakebase_project:
     endpoint = f"projects/{lakebase_project}/branches/{lakebase_branch}/endpoints/primary"
     resp = w.api_client.do("POST", "/api/2.0/postgres/credentials", body={"endpoint": endpoint})
     pg_token = resp["token"]
-    # Discover host from the Project's endpoint metadata
-    epresp = w.api_client.do(
-        "GET", f"/api/2.0/postgres/{endpoint}",
-    )
-    pg_host = epresp.get("host") or epresp.get("endpoint_url") or epresp.get("hostname")
+    # Discover host. The endpoint metadata returns it nested under
+    # status.hosts.host (the read/write endpoint). The pooled variant is
+    # status.hosts.read_write_pooled_host — fine to use that too for
+    # postdeploy DDL but the direct host is simpler.
+    epresp = w.api_client.do("GET", f"/api/2.0/postgres/{endpoint}")
+    hosts = (epresp.get("status") or {}).get("hosts") or {}
+    pg_host = hosts.get("host") or hosts.get("read_write_pooled_host")
+    if not pg_host:
+        raise SystemExit(
+            f"could not resolve Lakebase host from endpoint metadata.\n"
+            f"GET /api/2.0/postgres/{endpoint} returned: {epresp}"
+        )
     pg_db   = "databricks_postgres"  # Lakebase Projects default
 else:
     # Legacy Provisioned mode
