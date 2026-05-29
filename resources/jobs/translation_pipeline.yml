@@ -37,9 +37,25 @@ resources:
               translator_notebook_path: ${workspace.file_path}/setup/docx_inplace_translation
               bronze_catalog:           ${var.uc_catalog}
               bronze_schema:            ${var.uc_schema}
+          # Pin a modern serverless env so the databricks-sdk is recent enough
+          # to expose `serving_endpoints.get_open_ai_client()`. Env v1 (default
+          # on some workspaces) ships an SDK that pre-dates that helper. The
+          # child notebook spawned by dbutils.notebook.run inherits this env.
+          environment_key: docx_translation_env
           timeout_seconds: 14400
           max_retries: 1
           min_retry_interval_millis: 60000
+
+      environments:
+        - environment_key: docx_translation_env
+          spec:
+            client: "3"
+            dependencies:
+              - "lxml"
+              - "langdetect"
+              - "databricks-sdk>=0.30.0"
+              - "openai"
+              - "pandas"
 
       trigger:
         pause_status: UNPAUSED
