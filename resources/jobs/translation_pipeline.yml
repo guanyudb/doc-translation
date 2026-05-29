@@ -49,7 +49,9 @@ resources:
       environments:
         - environment_key: docx_translation_env
           spec:
-            client: "3"
+            # v5 confirmed working in fe-vm-hls-amer; v1 (e2FE default) has
+            # too-old databricks-sdk and lacks serving_endpoints.get_open_ai_client().
+            client: "5"
             dependencies:
               - "lxml"
               - "langdetect"
