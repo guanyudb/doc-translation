@@ -51,20 +51,25 @@ echo "==> step 1: seed secret scope + per-config secrets ($SCOPE)"
 databricks secrets create-scope "$SCOPE" $EXTRA_FLAGS 2>/dev/null \
     || echo "    (scope already exists — ok)"
 
-PYREAD='import json,os,sys
-d=json.load(open(os.environ["OVR"]))
-uc=d.get("uc_catalog","")
-sc=d.get("uc_schema","doc_translation")
-vn=d.get("uc_volume_name","doc-translation")
-print(d.get("pg_schema","doc_translation"))
-print(d.get("lakebase_project",""))
-print(d.get("lakebase_branch","main"))
-print(d.get("lakebase_instance",""))
-print(f"/Volumes/{uc}/{sc}/{vn}")
-print(uc)
-print(sc)'
-read -r PG_SCHEMA LB_PROJECT LB_BRANCH LB_INSTANCE VOL_ROOT DELTA_CAT DELTA_SCH < <(
-    OVR="$OVERRIDES" python3 -c "$PYREAD" | xargs
+PYREAD='import json, os
+d = json.load(open(os.environ["OVR"]))
+uc = d.get("uc_catalog","")
+sc = d.get("uc_schema","doc_translation")
+vn = d.get("uc_volume_name","doc-translation")
+vals = [
+    d.get("pg_schema","doc_translation"),
+    d.get("lakebase_project",""),
+    d.get("lakebase_branch","main"),
+    d.get("lakebase_instance",""),
+    f"/Volumes/{uc}/{sc}/{vn}",
+    uc,
+    sc,
+]
+# Tab-separated single line so `read -r IFS=$"\t"` preserves empty fields
+# (xargs collapses empty lines and silently shifts subsequent values).
+print("\t".join(vals))'
+IFS=$'\t' read -r PG_SCHEMA LB_PROJECT LB_BRANCH LB_INSTANCE VOL_ROOT DELTA_CAT DELTA_SCH < <(
+    OVR="$OVERRIDES" python3 -c "$PYREAD"
 )
 # Empty string is a valid secret value (e.g., lakebase_instance="" when in
 # Project mode). The CLI rejects empty `--string-value`, so we use a space
