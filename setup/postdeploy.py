@@ -332,16 +332,21 @@ _exec(f"""
     ) USING DELTA PARTITIONED BY (pair_id)
 """)
 
-# Grant the App SP read/write on the Delta tables.
+# Grant the App SP read/write on the Delta tables AND on the UC Volume.
+# Volume names with hyphens need backtick quoting in SQL.
+volume_fqn = f"{uc_catalog}.{uc_schema}.`{uc_volume_name}`"
 for stmt in [
     f"GRANT USE CATALOG ON CATALOG {uc_catalog} TO `{sp_uuid}`",
     f"GRANT USE SCHEMA ON SCHEMA {DELTA_FQN} TO `{sp_uuid}`",
     f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.audit_events TO `{sp_uuid}`",
     f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.golden_publications TO `{sp_uuid}`",
     f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.silver_review_snapshots TO `{sp_uuid}`",
+    # The App reads .docx from raw_documents/ + translated_inplace/ and writes
+    # to translated_reviewed/ + golden/. Both READ + WRITE are needed.
+    f"GRANT READ VOLUME, WRITE VOLUME ON VOLUME {volume_fqn} TO `{sp_uuid}`",
 ]:
     _exec(stmt)
-print("ok: Delta mirror tables + grants applied")
+print("ok: Delta mirror tables + Volume grants applied to App SP")
 
 # COMMAND ----------
 

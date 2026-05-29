@@ -71,19 +71,27 @@ def _normalize_pair_id(s: str | None) -> str | None:
 # ----------------------------------------------------------------------------
 @st.cache_data(ttl=30, show_spinner=False)
 def list_volume_cached():
-    """Returns (pairs, unpaired_originals) — single Volume scan per cache TTL.
-    On transient Files-API failure we cache an empty result for the TTL window;
-    callers (the main flow) bust the cache and retry once if the selected pair
-    is missing — see the resolve block below."""
+    """Returns (pairs, unpaired_originals, errors) where errors is a list of
+    (path, exception) tuples for any directory the SP couldn't list. We don't
+    silently swallow listing failures any more — empty sidebars hid real
+    permission problems for too long. The sidebar surfaces these as a
+    warning so the cause is obvious."""
+    errors = []
     try:
         originals = volume.list_docx(config.RAW_DIR)
-    except Exception:
+    except Exception as e:
         originals = []
+        errors.append((config.RAW_DIR, e))
     try:
         translated = volume.list_docx(config.TRANSLATED_DIR)
-    except Exception:
+    except Exception as e:
         translated = []
-    return volume.auto_pair(originals, translated), volume.unpaired_originals(originals, translated)
+        errors.append((config.TRANSLATED_DIR, e))
+    return (
+        volume.auto_pair(originals, translated),
+        volume.unpaired_originals(originals, translated),
+        errors,
+    )
 
 
 @st.cache_data(ttl=600, show_spinner="Rendering documents…")
@@ -121,10 +129,19 @@ with st.sidebar:
     ).strip().lower()
 
     try:
-        pairs, unpaired = list_volume_cached()
+        pairs, unpaired, list_errors = list_volume_cached()
     except Exception as e:
         st.error(f"Could not list pairs: {e}")
-        pairs, unpaired = [], []
+        pairs, unpaired, list_errors = [], [], []
+
+    if list_errors:
+        st.warning(
+            "Couldn't read some Volume paths. The App SP likely lacks "
+            "`READ VOLUME` — re-run the postdeploy job."
+        )
+        with st.expander("Details", expanded=False):
+            for path, e in list_errors:
+                st.code(f"{path}\n  {type(e).__name__}: {e}", language=None)
 
     db_progress = {p["pair_id"]: p for p in store.list_pairs_with_progress()}
 
@@ -289,7 +306,7 @@ else:
     if vol_match is None:
         list_volume_cached.clear()
         try:
-            pairs, unpaired = list_volume_cached()
+            pairs, unpaired, _ = list_volume_cached()
         except Exception:
             pass
         vol_match = next((x for x in pairs if x["pair_id"] == pair_id), None)
