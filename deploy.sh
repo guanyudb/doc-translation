@@ -51,42 +51,37 @@ echo "==> step 1: seed secret scope + per-config secrets ($SCOPE)"
 databricks secrets create-scope "$SCOPE" $EXTRA_FLAGS 2>/dev/null \
     || echo "    (scope already exists — ok)"
 
+# POSIX-safe key=value parsing. Earlier attempts used `IFS=$'\t' read ...`
+# but ANSI-C quoting isn't available in dash (which the Databricks Web
+# Terminal's compute env uses as /bin/sh). Here Python emits one
+# `key=value` line per secret; bash splits on the FIRST `=` using
+# parameter expansion — works in any POSIX shell.
 PYREAD='import json, os
 d = json.load(open(os.environ["OVR"]))
 uc = d.get("uc_catalog","")
 sc = d.get("uc_schema","doc_translation")
 vn = d.get("uc_volume_name","doc-translation")
-vals = [
-    d.get("pg_schema","doc_translation"),
-    d.get("lakebase_project",""),
-    d.get("lakebase_branch","main"),
-    d.get("lakebase_instance",""),
-    f"/Volumes/{uc}/{sc}/{vn}",
-    uc,
-    sc,
+pairs = [
+    ("pg_schema",         d.get("pg_schema","doc_translation")),
+    ("lakebase_project",  d.get("lakebase_project","")),
+    ("lakebase_branch",   d.get("lakebase_branch","main")),
+    ("lakebase_instance", d.get("lakebase_instance","")),
+    ("volume_root",       f"/Volumes/{uc}/{sc}/{vn}"),
+    ("delta_catalog",     uc),
+    ("delta_schema",      sc),
 ]
-# Tab-separated single line so `read -r IFS=$"\t"` preserves empty fields
-# (xargs collapses empty lines and silently shifts subsequent values).
-print("\t".join(vals))'
-IFS=$'\t' read -r PG_SCHEMA LB_PROJECT LB_BRANCH LB_INSTANCE VOL_ROOT DELTA_CAT DELTA_SCH < <(
-    OVR="$OVERRIDES" python3 -c "$PYREAD"
-)
-# Empty string is a valid secret value (e.g., lakebase_instance="" when in
-# Project mode). The CLI rejects empty `--string-value`, so we use a space
-# and have the app's config.py treat both empty and whitespace as None.
-for kv in \
-    "pg_schema=$PG_SCHEMA" \
-    "lakebase_project=$LB_PROJECT" \
-    "lakebase_branch=$LB_BRANCH" \
-    "lakebase_instance=$LB_INSTANCE" \
-    "volume_root=$VOL_ROOT" \
-    "delta_catalog=$DELTA_CAT" \
-    "delta_schema=$DELTA_SCH"; do
-    k="${kv%%=*}"
-    v="${kv#*=}"
-    [ -z "$v" ] && v=" "
-    databricks secrets put-secret "$SCOPE" "$k" --string-value "$v" $EXTRA_FLAGS
-    echo "    put $SCOPE/$k = ${v:- (empty)}"
+for k, v in pairs:
+    print(f"{k}={v}")'
+
+# Empty string is a valid secret value (e.g., lakebase_instance="" in Project
+# mode). The CLI rejects empty `--string-value`, so substitute a single space;
+# the app config.py treats both empty and whitespace-only as None.
+OVR="$OVERRIDES" python3 -c "$PYREAD" | while IFS= read -r LINE; do
+    KEY="${LINE%%=*}"
+    VALUE="${LINE#*=}"
+    [ -z "$VALUE" ] && VALUE=" "
+    databricks secrets put-secret "$SCOPE" "$KEY" --string-value "$VALUE" $EXTRA_FLAGS
+    echo "    put $SCOPE/$KEY = ${VALUE:- (empty)}"
 done
 
 # Step 2 — bundle deploy (creates UC schema/volume, app + bindings, postdeploy job)
