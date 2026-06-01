@@ -384,6 +384,45 @@ for sub in ("raw_documents", "translated_inplace", "translated_reviewed", "golde
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Attach the file-arrival trigger to the translation pipeline
+# MAGIC
+# MAGIC The bundle creates the pipeline job WITHOUT the trigger — Apps' Jobs
+# MAGIC API validates the file-arrival URL against an existing Volume +
+# MAGIC subdirectory at create time, which races with the bundle's own
+# MAGIC volume creation. We add the trigger here, after the subdirs exist.
+# MAGIC Idempotent: re-running this just resets the trigger.
+
+# COMMAND ----------
+
+from databricks.sdk.service.jobs import (
+    TriggerSettings, FileArrivalTriggerConfiguration, PauseStatus, JobSettings,
+)
+
+pipeline_jobs = [j for j in w.jobs.list()
+                 if j.settings and j.settings.name == "doc-translation · auto-translate pipeline"]
+if not pipeline_jobs:
+    print("WARNING: pipeline job not found — was bundle deploy run?")
+else:
+    pj = pipeline_jobs[0]
+    trigger_url = f"{vol_root}/raw_documents/"
+    w.jobs.update(
+        job_id=pj.job_id,
+        new_settings=JobSettings(
+            trigger=TriggerSettings(
+                pause_status=PauseStatus.UNPAUSED,
+                file_arrival=FileArrivalTriggerConfiguration(
+                    url=trigger_url,
+                    min_time_between_triggers_seconds=60,
+                    wait_after_last_change_seconds=60,
+                ),
+            ),
+        ),
+    )
+    print(f"ok: attached file-arrival trigger to job {pj.job_id} watching {trigger_url}")
+
+# COMMAND ----------
+
 print(f"\npostdeploy complete · app SP {sp_uuid} · catalog {uc_catalog} · schema {uc_schema}")
 
 # COMMAND ----------
