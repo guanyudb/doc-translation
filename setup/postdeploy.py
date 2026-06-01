@@ -69,13 +69,14 @@ print(f"app_name={app_name}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Resolve the App service principal UUID
+# MAGIC ## Resolve the App service principal UUID + (re-)seed config secrets
 # MAGIC
-# MAGIC Note: secret values are seeded by `deploy.sh` (step 1) BEFORE `bundle
-# MAGIC deploy`, because Apps validates secret resource bindings eagerly at
-# MAGIC app update time. By the time this notebook runs, the secrets already
-# MAGIC exist; we just need to do the Lakebase DDL + GRANTs and create the
-# MAGIC Delta tables + Volume dirs.
+# MAGIC Secret values are seeded by `deploy.sh` step 1 BEFORE `bundle deploy`
+# MAGIC (Apps validates secret resource bindings eagerly at app create/update
+# MAGIC time, so the keys must exist). But re-seeding here belt-and-braces:
+# MAGIC if `deploy.sh` ever produces wrong values (shell-quoting bugs, etc.),
+# MAGIC re-running just the postdeploy job repairs them. Python `put_secret`
+# MAGIC has no shell-quoting hazards.
 
 # COMMAND ----------
 
@@ -88,6 +89,23 @@ sp_uuid = app.service_principal_client_id
 if not sp_uuid:
     raise SystemExit(f"could not resolve service_principal_client_id for app {app_name!r}")
 print(f"app SP UUID: {sp_uuid}")
+
+# Re-seed each config secret idempotently. Empty values are valid (e.g.
+# lakebase_instance="" when in Project mode); the App's config.py treats
+# them as None.
+vol_root_value = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume_name}"
+app_config_secrets = {
+    "pg_schema":         pg_schema,
+    "lakebase_project":  lakebase_project,
+    "lakebase_branch":   lakebase_branch,
+    "lakebase_instance": lakebase_instance,
+    "volume_root":       vol_root_value,
+    "delta_catalog":     uc_catalog,
+    "delta_schema":      uc_schema,
+}
+for k, v in app_config_secrets.items():
+    w.secrets.put_secret(scope=secret_scope, key=k, string_value=(v or ""))
+    print(f"  re-seeded {secret_scope}/{k} = {v!r}")
 
 # COMMAND ----------
 
