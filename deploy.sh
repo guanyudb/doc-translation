@@ -84,9 +84,12 @@ OVR="$OVERRIDES" python3 -c "$PYREAD" | while IFS= read -r LINE; do
     echo "    put $SCOPE/$KEY = ${VALUE:- (empty)}"
 done
 
-# Step 2 — bundle deploy (creates UC schema/volume, app + bindings, postdeploy job)
+# Step 2 — bundle deploy (creates UC schema/volume, app + bindings, postdeploy job).
+# --force-lock overrides any stale deploy lock left by a previous run that
+# crashed before releasing. Safe here because deploy.sh is the canonical
+# orchestrator for this bundle (no concurrent multi-user deploys assumed).
 echo "==> step 2: bundle deploy"
-databricks bundle deploy -t "$TARGET" --auto-approve $EXTRA_FLAGS
+databricks bundle deploy -t "$TARGET" --auto-approve --force-lock $EXTRA_FLAGS
 
 # Step 3 — postdeploy job: Lakebase DDL + GRANTs + Delta tables + Volume dirs
 echo "==> step 3: postdeploy_setup"
