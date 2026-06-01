@@ -134,13 +134,13 @@ Combined via weighted geometric mean so any single red flag drags the score down
 
 | Layer | What | Where |
 |---|---|---|
-| Storage (files) | Original / translated / reviewed / golden `.docx` | Unity Catalog Volume `hls_amer_catalog.guanyu_chen.doc-translation` |
-| Storage (state) | Live review state — pairs, feedback, edits, audit, glossary, confidence | Lakebase Postgres `lakebasepoc`, schema `doc_translation` |
-| Storage (archive) | Long-term audit + publication archive | Delta tables in `hls_amer_catalog.guanyu_chen` |
-| Translation | In-place OOXML translation per paragraph | FMAPI `databricks-claude-sonnet-4-6` |
-| Orchestration | File-arrival → translation pipeline | Lakeflow Job `doc-translation-pipeline` |
+| Storage (files) | Original / translated / reviewed / golden `.docx` | UC Volume `<uc_catalog>.<uc_schema>.<uc_volume_name>` (from your `variable-overrides.json`) |
+| Storage (state) | Live review state — pairs, feedback, edits, audit, glossary, confidence | Lakebase Postgres (Project or Provisioned), schema `<pg_schema>` |
+| Storage (archive) | Long-term audit + publication archive | Delta tables in `<uc_catalog>.<uc_schema>` |
+| Translation | In-place OOXML translation per paragraph | FMAPI endpoint (default `databricks-claude-sonnet-4-6`, configurable via `translation_model_endpoint`) |
+| Orchestration | File-arrival → translation pipeline | Lakeflow Job `doc-translation · auto-translate pipeline` (bundle-managed) |
 | Review UI | Side-by-side pane viewer, paragraph rail, certify/edit/publish/promote | Streamlit on Databricks Apps |
-| Auth | Reviewer identity via `X-Forwarded-Email`, SP for system actions | Databricks Apps SSO + Service Principal |
+| Auth | Reviewer identity via `X-Forwarded-Email`, App SP for system actions | Databricks Apps SSO + Service Principal |
 
 ---
 
@@ -148,15 +148,31 @@ Combined via weighted geometric mean so any single red flag drags the score down
 
 ```
 doc-translation-app/
+├── databricks.yml                  # DAB bundle root
+├── variables.yml                   # Bundle variable definitions
+├── variable-overrides.example.json # Template customer fills in per workspace
+├── deploy.sh                       # 4-step deploy wrapper (seed → deploy → postdeploy → app)
 ├── app.py                          # Streamlit entrypoint
-├── app.yaml                        # Databricks Apps runtime config
+├── app.yaml                        # Databricks Apps runtime config (valueFrom bindings)
 ├── requirements.txt                # streamlit, psycopg[binary,pool], databricks-sdk, mammoth, lxml, pymupdf
 ├── pyproject.toml
+├── resources/                      # DAB-managed resources
+│   ├── app.yml                     # App definition + postgres/sql_warehouse/secret bindings
+│   ├── schema.yml                  # UC schema
+│   ├── volumes.yml                 # UC managed volume
+│   ├── secrets.yml                 # Secret scope (values seeded by deploy.sh + postdeploy)
+│   └── jobs/
+│       ├── postdeploy_setup.yml    # One-shot job: DDL + GRANTs + Delta tables + secret seed
+│       └── translation_pipeline.yml # File-arrival-triggered translation job
+├── setup/                          # Notebooks bundled into the workspace
+│   ├── postdeploy.py               # Postdeploy notebook (idempotent)
+│   ├── auto_translate_watcher.py   # Watcher: scans raw_documents/, calls translator per file
+│   └── docx_inplace_translation.py # Per-file translator (FMAPI + lxml in-place OOXML edit)
 ├── server/
 │   ├── auth.py                     # Reviewer from X-Forwarded-Email
-│   ├── config.py                   # env + WorkspaceClient singleton
+│   ├── config.py                   # env + WorkspaceClient singleton (Project + Provisioned)
 │   ├── confidence.py               # Heuristic per-paragraph scoring (no LLM)
-│   ├── db.py                       # Lakebase psycopg pool with OAuthConnection
+│   ├── db.py                       # Lakebase psycopg pool, lazy-init proxy
 │   ├── delta_sync.py               # Lakebase → Delta mirror at promotion
 │   ├── docx_render.py              # DOCX → HTML via sentinel markers + lxml
 │   ├── glossary.py                 # Mine review_edit_history for correction patterns
@@ -172,10 +188,6 @@ doc-translation-app/
     ├── architecture.svg            # Architecture diagram (SVG)
     └── pipeline_design.md          # Phase 1+ design doc
 ```
-
-The translation orchestration lives outside the app, as Databricks notebooks under `/Users/guanyu.chen@databricks.com/Translation PoC/`:
-- `DOCX Inplace Translation` — the per-file translator (FMAPI + lxml in-place edit)
-- `Auto-Translate Watcher` — the orchestration wrapper that scans `raw_documents/`, skips already-translated, writes `bronze_documents` rows, invokes the translator per file
 
 ---
 
@@ -275,22 +287,47 @@ Configuration knobs (set in `variable-overrides.json`):
 
 `./deploy.sh` is idempotent. Run it again after code changes; it picks up the diff. Schema migrations in the postdeploy job use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ADD COLUMN IF NOT EXISTS` so re-running is safe.
 
+**Self-healing pattern:** the postdeploy job re-seeds all secret values from its own bundle-variable parameters (no shell-quoting hazards, unlike `deploy.sh`'s step 1). So if `deploy.sh` ever produces wrong secret values (a past bug shifted fields when `lakebase_instance=""`), re-running just the postdeploy job from the UI fixes them — no CLI required.
+
 ### Tearing down
 
+`bundle destroy` works when the local terraform state matches the remote — which it doesn't if someone else (or another machine) ran `bundle deploy` since you last did. If you hit `Error: lineage mismatch in state files`, fall back to deleting resources directly:
+
 ```bash
-databricks bundle destroy -t prod
+# Drop Delta tables first (postdeploy created them, bundle doesn't track them,
+# and the schema delete below fails if it's non-empty).
+for t in audit_events bronze_documents golden_publications silver_review_snapshots; do
+  databricks api post /api/2.0/sql/statements --profile <profile> \
+    --json "{\"statement\":\"DROP TABLE IF EXISTS <catalog>.<schema>.${t}\",\"warehouse_id\":\"<warehouse>\",\"wait_timeout\":\"30s\"}"
+done
+
+# Now delete the actual resources
+databricks apps delete    doc-translation                                            --profile <profile>
+databricks jobs delete    <pipeline-job-id>                                          --profile <profile>
+databricks jobs delete    <postdeploy-job-id>                                        --profile <profile>
+databricks volumes delete <catalog>.<schema>.<volume>                                --profile <profile>
+databricks schemas delete <catalog>.<schema>                                         --profile <profile>
+databricks secrets delete-scope doc_translation_config                               --profile <profile>
+databricks workspace delete /Workspace/Users/<you>/.bundle/doc-translation --recursive --profile <profile>
 ```
 
-This removes the app, the postdeploy job, the UC schema + volume (with all files), and any audit/golden artifacts inside. **Make absolutely sure** before running — the Delta tables have a 7-year retention setting but `bundle destroy` overrides that.
+The Lakebase Project itself stays (other things may use it); to also drop the Postgres schema inside it, run `DROP SCHEMA <pg_schema> CASCADE` against the project's primary endpoint.
 
 ### Troubleshooting cross-references
 
-If something goes wrong, the most likely causes and their fixes are documented in [`~/.claude/memory/dab_apps_workspace_deploy_guide.md`](../../.claude/memory/dab_apps_workspace_deploy_guide.md). Highlights:
+The hardest-to-find issues during initial customer deploys, in the order we hit them:
 
-- Postgres auth rejected as "not a valid JWT" → using a PAT instead of OAuth JWT (gotcha #3)
-- App boots but Lakebase queries refused → SP missing `CREATE` on schema `public` (gotcha #4)
-- First `bundle deploy` 404s on secret → secret scope must be pre-seeded (gotcha #5)
-- App boots but env vars are missing → `valueFrom` binding NOT declared in `app.yaml` (gotcha #1)
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Invalid secret resource pg_schema: Secret … does not exist` (bundle deploy 404) | Apps validates secret bindings eagerly at app create/update — secrets must exist before the bundle deploy | `deploy.sh` step 1 seeds secrets first; CLI is required for the very first deploy |
+| App boots, sidebar empty, log says `failed to resolve host 'None'` or `${var.lakebase_project}` literal | DAB does NOT substitute `${var.X}` inside `app.yaml` — values must come via `valueFrom:` to secret bindings | All env vars use `valueFrom:`; `deploy.sh` + postdeploy seed the secret values |
+| `Endpoint 'projects/<proj>/branches/<br>/endpoints/primary' not found` | Lakebase Project's default branch is `production` (not `main`) on new Projects | Set `lakebase_branch: production` in `variable-overrides.json` |
+| Inner translator crashes with `AttributeError: 'ServingEndpointsAPI' object has no attribute 'get_open_ai_client'` | Workspace default serverless env is v1 with an old `databricks-sdk` | `resources/jobs/translation_pipeline.yml` pins `client: "5"` so the watcher + inner notebook get a modern SDK |
+| Sidebar warning "Couldn't read some Volume paths" + listing 404s with malformed path | Secret values shifted by one slot due to a shell-quoting bug | Re-run the postdeploy job — it re-seeds secrets defensively |
+| App SP can't list Volume even though grants look right | `USE CATALOG`/`USE SCHEMA` granted but `READ VOLUME` missing | postdeploy job now grants `READ VOLUME, WRITE VOLUME` explicitly |
+| `pool has already been opened/closed and cannot be reused` | psycopg-pool 3.2+ is strict; multi-session Apps races on the module-level pool | `server/db.py` proxies a lazy-built pool that rebuilds on `closed` |
+
+More general DAB+Apps gotchas live in [`~/.claude/memory/dab_apps_workspace_deploy_guide.md`](../../.claude/memory/dab_apps_workspace_deploy_guide.md).
 
 ### Legacy: deploying just the app (no bundle)
 
