@@ -24,12 +24,12 @@ resources:
             notebook_path: ../../setup/auto_translate_watcher.py
             source: WORKSPACE
             base_parameters:
-              # Reference the volume resource's `volume_path` (provider-computed)
-              # so Terraform sees the dependency and creates the volume BEFORE
-              # validating this job. Bundle vars alone aren't a dependency edge
-              # — Apps' file-arrival API 400s if the volume doesn't exist yet.
-              raw_dir:                  ${resources.volumes.doc_translation_volume.volume_path}/raw_documents
-              translated_dir:           ${resources.volumes.doc_translation_volume.volume_path}/translated_inplace
+              # DAB volume schema doesn't expose `volume_path` — only the raw
+              # catalog API fields. Reference `.name` to create the Terraform
+              # dependency edge (so the volume is created before the job is
+              # validated) and build the path from bundle vars.
+              raw_dir:                  /Volumes/${var.uc_catalog}/${var.uc_schema}/${resources.volumes.doc_translation_volume.name}/raw_documents
+              translated_dir:           /Volumes/${var.uc_catalog}/${var.uc_schema}/${resources.volumes.doc_translation_volume.name}/translated_inplace
               target_language:          ${var.translation_target_language}
               model_endpoint:           ${var.translation_model_endpoint}
               max_workers:              ${var.translation_max_workers}
@@ -66,10 +66,11 @@ resources:
       trigger:
         pause_status: UNPAUSED
         file_arrival:
-          # Same: reference the volume resource so this validates only after
-          # the volume exists. Trailing slash matters — file-arrival URLs
-          # expect a directory path.
-          url: ${resources.volumes.doc_translation_volume.volume_path}/raw_documents/
+          # Same pattern: reference `.name` to make this an explicit Terraform
+          # dependency on the volume resource. The Apps file-arrival URL is
+          # built from bundle vars + the resource reference. Trailing slash
+          # matters — file-arrival URLs expect a directory path.
+          url: /Volumes/${var.uc_catalog}/${var.uc_schema}/${resources.volumes.doc_translation_volume.name}/raw_documents/
           min_time_between_triggers_seconds: 60
           wait_after_last_change_seconds:    60
 
