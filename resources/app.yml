@@ -48,8 +48,11 @@ resources:
         # ---- Secret-backed env vars ------------------------------------------
         # DAB doesn't substitute ${var.X} inside user files like app.yaml, so
         # workspace-specific config has to come through this binding pathway.
-        # The secret VALUES are seeded by `deploy.sh` (step 2) from the
-        # values in `.databricks/bundle/<target>/variable-overrides.json`.
+        # The secret SCOPE itself is created by `deploy.sh` step 1 (not by
+        # the bundle — Terraform's databricks_secret_scope resource isn't
+        # idempotent and conflicts on re-deploys when the scope already
+        # exists). The secret VALUES are seeded by `deploy.sh` step 1 from
+        # the values in `.databricks/bundle/<target>/variable-overrides.json`.
         - name: pg_schema
           secret:
             scope:      ${var.secret_scope}
