@@ -5,11 +5,11 @@ pipeline end-to-end without relying on any customer or proprietary content.
 
 ## Files
 
-| File | Structure it mimics | Public template source |
-|---|---|---|
-| `ja_clinical/01_protocol_synopsis_ja.docx` | Clinical Trial Protocol Synopsis | ICH E6 (R2) — Good Clinical Practice, §6 |
-| `ja_clinical/02_ae_summary_ja.docx`        | Periodic Safety Update Report (PSUR) | ICH E2C (R2) — Periodic Benefit-Risk Evaluation Report |
-| `ja_clinical/03_ctd_efficacy_ja.docx`      | CTD Module 2.7.3 Clinical Efficacy Summary | ICH M4E (R2) — Common Technical Document |
+| File | Structure it mimics | Length | Public template source |
+|---|---|---|---|
+| `ja_clinical/01_protocol_synopsis_ja.docx` | Clinical Trial Protocol Synopsis     | ~14 pages, 224 paragraphs, 4 tables (128 cells), 2 figures | ICH E6 (R2) — Good Clinical Practice, §6 |
+| `ja_clinical/02_ae_summary_ja.docx`        | Periodic Safety Update Report (PSUR) | ~11 pages, 202 paragraphs, 4 tables (156 cells), 2 figures | ICH E2C (R2) — Periodic Benefit-Risk Evaluation Report |
+| `ja_clinical/03_ctd_efficacy_ja.docx`      | CTD Module 2.7.3 Clinical Efficacy Summary | ~13 pages, 139 paragraphs, 3 tables (99 cells), 3 figures | ICH M4E (R2) — Common Technical Document |
 
 All three ICH guidelines are public at https://database.ich.org and are
 reproduced in Japan via PMDA at https://www.pmda.go.jp/int-activities/int-harmony/ich/.
