@@ -38,7 +38,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install lxml langdetect --quiet
+# MAGIC %pip install lxml langdetect pyahocorasick --quiet
 # MAGIC # Some workspace serverless notebook environments ship an older
 # MAGIC # databricks-sdk that lacks `serving_endpoints.get_open_ai_client()`
 # MAGIC # (deploy guide gotcha #14). Pin a known-good version.
@@ -55,6 +55,8 @@ dbutils.widgets.text("max_workers", "8", "Concurrent translation workers per fil
 dbutils.widgets.text("max_pages", "0", "Limit body to first N pages (0 = no limit)")
 dbutils.widgets.dropdown("skip_if_already_target", "true", ["true", "false"],
                         "Skip paragraphs already in target language")
+dbutils.widgets.text("glossary_delta_table", "",
+                     "FQN of translation_glossary Delta mirror (empty = disabled)")
 
 input_path = dbutils.widgets.get("input_path").strip()
 output_dir = dbutils.widgets.get("output_dir").strip().rstrip("/")
@@ -63,6 +65,7 @@ model_endpoint = dbutils.widgets.get("model_endpoint").strip()
 max_workers = int(dbutils.widgets.get("max_workers"))
 max_pages = int(dbutils.widgets.get("max_pages"))
 skip_if_already_target = dbutils.widgets.get("skip_if_already_target").lower() == "true"
+glossary_delta_table = dbutils.widgets.get("glossary_delta_table").strip()
 
 print(f"Input:     {input_path}")
 print(f"Output:    {output_dir}")
@@ -71,6 +74,7 @@ print(f"Model:     {model_endpoint}")
 print(f"Workers:   {max_workers}")
 print(f"Max pages: {'no limit' if max_pages <= 0 else max_pages}")
 print(f"Skip already-target: {skip_if_already_target}")
+print(f"Glossary table: {glossary_delta_table or '(disabled)'}")
 
 # COMMAND ----------
 
@@ -259,6 +263,38 @@ def is_already_target_language(text: str) -> bool:
 
 print(f"Target language code: {target_lang_code!r}  |  script family: {target_script_family!r}")
 
+# Reverse map: ISO code → full English name, for reporting the detected source.
+CODE_TO_LANG_NAME = {v: k.title() for k, v in LANG_NAME_TO_CODE.items()}
+
+
+def detect_document_language(sample_texts: list[str]) -> tuple[str, str]:
+    """Detect the dominant SOURCE language of a document from a sample of its
+    paragraphs. Returns (iso_code, full_name). Falls back to ('und', 'Unknown')
+    when detection is inconclusive.
+
+    We concatenate the longest non-target paragraphs (up to a budget) and run
+    langdetect once — document-level detection is far more stable than
+    per-paragraph, and one detection is enough to tag the document + pick the
+    glossary source language."""
+    budget, acc = 4000, []
+    for t in sorted((s.strip() for s in sample_texts if s and s.strip()),
+                    key=len, reverse=True):
+        acc.append(t)
+        if sum(len(x) for x in acc) >= budget:
+            break
+    blob = "\n".join(acc).strip()
+    if len(blob) < LANGDETECT_MIN_CHARS:
+        return "und", "Unknown"
+    try:
+        ranked = detect_langs(blob)
+        if not ranked:
+            return "und", "Unknown"
+        code = ranked[0].lang
+        return code, CODE_TO_LANG_NAME.get(code, code)
+    except LangDetectException:
+        return "und", "Unknown"
+
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -351,11 +387,117 @@ TRANSLATE_SYSTEM = (
     "7. Do not add or remove leading/trailing whitespace beyond what the source has."
 )
 
+# ---- Glossary prompt injection (Aho-Corasick, retrieval-based) --------------
+#
+# We read the translation_glossary Delta mirror once at startup and build a
+# single Aho-Corasick automaton keyed on `model_phrase` (the source-language
+# term). For each paragraph segment we scan the SOURCE text and inject only the
+# glossary entries whose term actually appears — so the per-call prompt cost is
+# a function of what's in *this* segment, not the size of the whole glossary.
+# This is why the design scales to large enterprise glossaries: matching is
+# O(segment length + matches), independent of total entry count.
+
+MAX_GLOSSARY_INJECT = 20   # cap matched entries injected into any one segment
+
+_glossary_automaton = None
+_glossary_entry_count = 0
+
+
+def _build_glossary_automaton():
+    """Load approved glossary entries for this target language from the Delta
+    mirror and build an Aho-Corasick automaton over their source-language
+    phrases. Returns (automaton_or_None, entry_count). Never raises — glossary
+    is a quality boost, never a hard dependency of translation."""
+    if not glossary_delta_table:
+        return None, 0
+    try:
+        import ahocorasick
+    except ImportError:
+        print("  [glossary] pyahocorasick not installed — skipping injection")
+        return None, 0
+    try:
+        rows = (
+            spark.read.table(glossary_delta_table)
+            .where("approved = true AND target_lang = '%s'" % target_lang_code)
+            .select("model_phrase", "correction")
+            .collect()
+        )
+    except Exception as ex:
+        print(f"  [glossary] could not read {glossary_delta_table}: {ex}")
+        return None, 0
+
+    A = ahocorasick.Automaton()
+    n = 0
+    for r in rows:
+        phrase = (r["model_phrase"] or "").strip()
+        corr = (r["correction"] or "").strip()
+        # Only phrases with real content; the automaton matches substrings, so
+        # 1-char keys would fire far too often. Require >= 2 chars.
+        if len(phrase) >= 2 and corr:
+            A.add_word(phrase, (phrase, corr))
+            n += 1
+    if n == 0:
+        return None, 0
+    A.make_automaton()
+    return A, n
+
+
+def glossary_matches(text: str) -> list[tuple[str, str]]:
+    """Return (source_phrase, required_target_term) pairs whose source phrase
+    occurs in `text`. Longest matches first, deduped, capped. Empty if the
+    automaton is disabled or nothing matches.
+
+    A shorter phrase that is a substring of a longer matched phrase is dropped
+    (e.g. drop "医師"/physician when "治験責任医師"/principal-investigator also
+    matched) so the injected rules don't fight each other. The default LLM
+    translation still handles the shorter term correctly where it stands alone."""
+    if _glossary_automaton is None or not text:
+        return []
+    hits: dict[str, str] = {}
+    for _end, (phrase, corr) in _glossary_automaton.iter(text):
+        hits[phrase] = corr
+    if not hits:
+        return []
+    ordered = sorted(hits.items(), key=lambda kv: -len(kv[0]))
+    kept: list[tuple[str, str]] = []
+    for phrase, corr in ordered:
+        if any(phrase in longer for longer, _ in kept):
+            continue
+        kept.append((phrase, corr))
+    return kept[:MAX_GLOSSARY_INJECT]
+
+
+def _system_prompt_for(text: str) -> str:
+    """Base system prompt + any glossary rules relevant to this segment."""
+    base = TRANSLATE_SYSTEM.format(lang=target_language)
+    matches = glossary_matches(text)
+    if not matches:
+        return base
+    lines = "\n".join(f'- "{src}" → "{tgt}"' for src, tgt in matches)
+    return (
+        base
+        + "\n\nGLOSSARY — when the source contains the following terms, use the "
+          "specified translation verbatim (these are approved, required "
+          "terminology; they override your default word choice):\n"
+        + lines
+    )
+
+
+# Build the automaton once, at import time. Safe to call with the feature off
+# (returns None) — llm_translate then behaves exactly as before.
+_glossary_automaton, _glossary_entry_count = _build_glossary_automaton()
+if _glossary_entry_count:
+    print(f"  [glossary] injection enabled — {_glossary_entry_count} entries "
+          f"loaded for target '{target_lang_code}'")
+else:
+    print("  [glossary] injection inactive (no table, no matches, or lib missing)")
+
+
 _translation_cache: dict[str, str] = {}
 
 
 def llm_translate(text: str) -> str:
-    """Translate a single string. Cached by (lang, text).
+    """Translate a single string. Cached by (lang, glossary, text).
     Short-circuits when `skip_if_already_target` is on and the text is
     confidently already in the target language."""
     global _skipped_already_target
@@ -368,7 +510,14 @@ def llm_translate(text: str) -> str:
     # for "LLM emitting bad chars" when the bad chars came from the source file.
     text_for_llm = sanitize_for_xml(text)
 
-    cache_key = hashlib.md5(f"{target_language}|{text_for_llm}".encode("utf-8")).hexdigest()
+    # Glossary matches are deterministic for a given text, so folding them into
+    # the cache key keeps caching correct while letting identical boilerplate
+    # (which matches the same terms) still share one API call.
+    matches = glossary_matches(text_for_llm)
+    gloss_key = "|".join(f"{s}>{t}" for s, t in matches)
+    cache_key = hashlib.md5(
+        f"{target_language}|{gloss_key}|{text_for_llm}".encode("utf-8")
+    ).hexdigest()
     if cache_key in _translation_cache:
         return _translation_cache[cache_key]
 
@@ -381,7 +530,7 @@ def llm_translate(text: str) -> str:
         resp = _oai.chat.completions.create(
             model=model_endpoint,
             messages=[
-                {"role": "system", "content": TRANSLATE_SYSTEM.format(lang=target_language)},
+                {"role": "system", "content": _system_prompt_for(text_for_llm)},
                 {"role": "user", "content": text_for_llm},
             ],
             temperature=0.0,
@@ -762,17 +911,29 @@ for src in files:
 
     n_changed = len(df)
     n_unique = df["original"].nunique() if n_changed else 0
+
+    # Auto-detect the document's source language from the original spans we
+    # just translated. Output is descriptive only — translation itself is
+    # language-agnostic (anything not already in the target gets translated).
+    src_code, src_name_full = detect_document_language(
+        df["original"].tolist() if n_changed else []
+    )
     print(
-        f"   changed={n_changed}  unique={n_unique}  "
+        f"   source={src_name_full} ({src_code})  "
+        f"changed={n_changed}  unique={n_unique}  "
         f"skipped_already_{target_lang_code}={skipped_in_file}  →  {dst}"
     )
 
     df["src_path"] = src
     df["dst_path"] = dst
+    df["source_language"] = src_code
     per_file_dfs.append(df)
     summary_rows.append({
         "src": src,
         "dst": dst,
+        "source_language_code": src_code,
+        "source_language": src_name_full,
+        "target_language": target_language,
         "changed": n_changed,
         "unique_changed": n_unique,
         "skipped_already_target": skipped_in_file,
@@ -782,6 +943,12 @@ for src in files:
 summary_df = pd.DataFrame(summary_rows)
 print("\n=== Summary ===")
 display(summary_df)
+
+# Expose the detected source language(s) for the caller (watcher records it in
+# bronze_documents). When a batch is single-file (the file-arrival path), this
+# is exactly one language.
+detected_source_codes = sorted({r["source_language_code"] for r in summary_rows})
+detected_source_names = sorted({r["source_language"] for r in summary_rows})
 
 # COMMAND ----------
 
@@ -895,3 +1062,27 @@ if (_xml_strip_stats["source_chars_stripped"] == 0
 # MAGIC 5. **Hyperlinks:** the URL is preserved; the visible link text is translated and folded
 # MAGIC    into the first run of the paragraph. If you need run-level fidelity inside hyperlinks,
 # MAGIC    that's a follow-up enhancement (sentinel-tagged run-aware translation).
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Return a result payload to the caller
+# MAGIC
+# MAGIC The watcher reads `source_language_code` to record the auto-detected
+# MAGIC source language in `bronze_documents`. JSON so the caller can parse it
+# MAGIC with `json.loads(dbutils.notebook.run(...))`.
+
+# COMMAND ----------
+
+import json as _json
+
+_exit_payload = {
+    "files": len(files),
+    "source_language_codes": detected_source_codes,
+    "source_language_names": detected_source_names,
+    "source_language_code": detected_source_codes[0] if len(detected_source_codes) == 1 else "mixed",
+    "target_language": target_language,
+    "target_language_code": target_lang_code,
+    "glossary_entries_loaded": _glossary_entry_count,
+}
+dbutils.notebook.exit(_json.dumps(_exit_payload))

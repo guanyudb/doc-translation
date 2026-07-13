@@ -45,6 +45,8 @@ dbutils.widgets.text("translator_notebook_path",
     "Inner translation notebook")
 dbutils.widgets.text("bronze_catalog", "hls_amer_catalog", "Catalog for bronze_documents")
 dbutils.widgets.text("bronze_schema",  "guanyu_chen",      "Schema for bronze_documents")
+dbutils.widgets.text("glossary_delta_table", "",
+    "FQN of the translation_glossary Delta mirror (empty = glossary injection off)")
 
 raw_dir            = dbutils.widgets.get("raw_dir").rstrip("/")
 translated_dir     = dbutils.widgets.get("translated_dir").rstrip("/")
@@ -55,6 +57,7 @@ max_pages          = dbutils.widgets.get("max_pages").strip()
 translator_nb_path = dbutils.widgets.get("translator_notebook_path").strip()
 bronze_catalog     = dbutils.widgets.get("bronze_catalog").strip()
 bronze_schema      = dbutils.widgets.get("bronze_schema").strip()
+glossary_delta_table = dbutils.widgets.get("glossary_delta_table").strip()
 
 lang_slug = re.sub(r"[^a-z0-9]+", "_", target_language.lower()).strip("_") or "translated"
 bronze_fqn = f"{bronze_catalog}.{bronze_schema}.bronze_documents"
@@ -74,6 +77,11 @@ print(f"bronze table    : {bronze_fqn}")
 # COMMAND ----------
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {bronze_catalog}.{bronze_schema}")
+# Migration for tables created before source_language existed.
+try:
+    spark.sql(f"ALTER TABLE {bronze_fqn} ADD COLUMNS (source_language STRING)")
+except Exception:
+    pass  # column already present, or table doesn't exist yet (created below)
 spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {bronze_fqn} (
         document_id              STRING,
@@ -90,7 +98,8 @@ spark.sql(f"""
         translation_error        STRING,
         translator_run_id        STRING,
         model_endpoint           STRING,
-        target_language          STRING
+        target_language          STRING,
+        source_language          STRING
     )
     USING DELTA
     COMMENT 'Every .docx landing in raw_documents/; orchestration audit + translation status'
@@ -231,19 +240,33 @@ for f in unpaired:
                 "max_workers":            max_workers,
                 "max_pages":              max_pages,
                 "skip_if_already_target": "true",
+                "glossary_delta_table":   glossary_delta_table,
             },
         )
         out_path = f["expected_output"]
+        # The inner notebook returns a JSON payload with the auto-detected
+        # source language. Parse it defensively — older notebook versions or a
+        # non-JSON exit shouldn't fail the run.
+        src_lang = None
+        try:
+            import json as _json
+            payload = _json.loads(str(inner_result))
+            src_lang = payload.get("source_language_code")
+        except Exception:
+            pass
+        src_lang_sql = f"'{src_lang}'" if src_lang else "CAST(NULL AS STRING)"
         spark.sql(f"""
             UPDATE {bronze_fqn}
             SET translation_status      = 'TRANSLATED',
                 translation_ended_at    = current_timestamp(),
                 translation_output_path = '{out_path}',
-                translator_run_id       = '{str(inner_result)[:64]}'
+                translator_run_id       = '{str(inner_result)[:64]}',
+                source_language         = {src_lang_sql}
             WHERE document_id = '{doc_id}'
         """)
-        print(f"  ✓ → {out_path}")
-        results.append({"doc": name, "status": "TRANSLATED", "output": out_path})
+        print(f"  ✓ → {out_path}  (source={src_lang or 'unknown'})")
+        results.append({"doc": name, "status": "TRANSLATED", "output": out_path,
+                        "source_language": src_lang})
     except Exception as e:
         err = str(e).replace("'", "''")[:1000]
         spark.sql(f"""

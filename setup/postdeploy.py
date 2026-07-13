@@ -43,6 +43,8 @@ dbutils.widgets.text("lakebase_instance",      "", "lakebase_instance (Provision
 dbutils.widgets.text("warehouse_id",           "", "warehouse_id")
 dbutils.widgets.text("app_name",               "doc-translation", "app_name")
 dbutils.widgets.text("secret_scope",           "doc_translation_config", "secret_scope")
+dbutils.widgets.dropdown("enable_seed_glossary", "false", ["true", "false"],
+                         "Load the shipped clinical seed glossary")
 
 uc_catalog        = dbutils.widgets.get("uc_catalog").strip()
 uc_schema         = dbutils.widgets.get("uc_schema").strip()
@@ -55,6 +57,7 @@ lakebase_instance = dbutils.widgets.get("lakebase_instance").strip()
 warehouse_id      = dbutils.widgets.get("warehouse_id").strip()
 app_name          = dbutils.widgets.get("app_name").strip()
 secret_scope      = dbutils.widgets.get("secret_scope").strip() or "doc_translation_config"
+enable_seed_glossary = dbutils.widgets.get("enable_seed_glossary").lower() == "true"
 
 for k, v in [("uc_catalog", uc_catalog), ("warehouse_id", warehouse_id), ("app_name", app_name)]:
     if not v:
@@ -265,8 +268,11 @@ CREATE TABLE IF NOT EXISTS {pg_schema}.translation_glossary (
     last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     approved            BOOLEAN NOT NULL DEFAULT TRUE,
+    source              TEXT NOT NULL DEFAULT 'tenant',
     UNIQUE (source_lang, target_lang, model_phrase, correction)
 );
+ALTER TABLE {pg_schema}.translation_glossary
+    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tenant';
 """
 
 GRANTS_SQL = f"""
@@ -287,6 +293,68 @@ with psycopg.connect(conninfo, password=pg_token) as conn:
         cur.execute(GRANTS_SQL)
     conn.commit()
 print("ok: Lakebase schema + grants applied")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Optional: load the shipped clinical seed glossary
+# MAGIC
+# MAGIC Controlled by the `enable_seed_glossary` parameter (default off). Loads
+# MAGIC public ICH/GCP-standard JA→EN clinical terminology from
+# MAGIC `setup/seed_glossary/*.csv` as `source='seed'` rows. Idempotent: the
+# MAGIC UNIQUE constraint makes re-runs a no-op. Customer-mined `tenant` entries
+# MAGIC and `customer` imports are never overwritten (ON CONFLICT keeps `source`).
+
+# COMMAND ----------
+
+if enable_seed_glossary:
+    import csv, glob
+
+    seed_dir = os.path.join(os.path.dirname(os.getcwd()), "setup", "seed_glossary")
+    # Notebook CWD varies; resolve the seed dir relative to this file's repo.
+    candidates = [
+        seed_dir,
+        os.path.join(os.getcwd(), "setup", "seed_glossary"),
+        os.path.join(os.getcwd(), "seed_glossary"),
+    ]
+    seed_files: list[str] = []
+    for c in candidates:
+        seed_files = sorted(glob.glob(os.path.join(c, "*.csv")))
+        if seed_files:
+            break
+
+    total = 0
+    if not seed_files:
+        print("WARNING: enable_seed_glossary=true but no seed CSVs found; skipping")
+    else:
+        with psycopg.connect(conninfo, password=pg_token) as conn:
+            with conn.cursor() as cur:
+                for path in seed_files:
+                    with open(path, encoding="utf-8-sig", newline="") as fh:
+                        rows = [r for r in csv.DictReader(fh)]
+                    batch = []
+                    for r in rows:
+                        sl = (r.get("source_lang") or "").strip().lower()
+                        tl = (r.get("target_lang") or "").strip().lower()
+                        mp = (r.get("model_phrase") or r.get("source_phrase") or "").strip()
+                        co = (r.get("correction") or r.get("target_phrase") or "").strip()
+                        if sl and tl and mp and co:
+                            batch.append((sl, tl, mp, co))
+                    if batch:
+                        cur.executemany(f"""
+                            INSERT INTO {pg_schema}.translation_glossary
+                                (source_lang, target_lang, model_phrase, correction,
+                                 occurrences, distinct_reviewers, approved, source)
+                            VALUES (%s, %s, %s, %s, 1, 1, TRUE, 'seed')
+                            ON CONFLICT (source_lang, target_lang, model_phrase, correction)
+                            DO NOTHING
+                        """, batch)
+                        total += len(batch)
+                        print(f"  {os.path.basename(path)}: {len(batch)} entries")
+            conn.commit()
+        print(f"ok: seed glossary loaded ({total} entries offered; duplicates ignored)")
+else:
+    print("seed glossary disabled (enable_seed_glossary=false)")
 
 # COMMAND ----------
 
@@ -349,6 +417,17 @@ _exec(f"""
         reviewer STRING, updated_at TIMESTAMP, ingested_at TIMESTAMP
     ) USING DELTA PARTITIONED BY (pair_id)
 """)
+# Read mirror of translation_glossary — the translation pipeline reads this at
+# startup to build its prompt-injection automaton (it can't reach Lakebase).
+_exec(f"""
+    CREATE TABLE IF NOT EXISTS {DELTA_FQN}.translation_glossary (
+        entry_id BIGINT, source_lang STRING, target_lang STRING,
+        model_phrase STRING, correction STRING,
+        occurrences INT, distinct_reviewers INT,
+        last_seen_at TIMESTAMP, created_at TIMESTAMP,
+        approved BOOLEAN, source STRING, ingested_at TIMESTAMP
+    ) USING DELTA
+""")
 
 # Grant the App SP read/write on the Delta tables AND on the UC Volume.
 # Volume names with hyphens need backtick quoting in SQL.
@@ -359,6 +438,7 @@ for stmt in [
     f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.audit_events TO `{sp_uuid}`",
     f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.golden_publications TO `{sp_uuid}`",
     f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.silver_review_snapshots TO `{sp_uuid}`",
+    f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.translation_glossary TO `{sp_uuid}`",
     # The App reads .docx from raw_documents/ + translated_inplace/ and writes
     # to translated_reviewed/ + golden/. Both READ + WRITE are needed.
     f"GRANT READ VOLUME, WRITE VOLUME ON VOLUME {volume_fqn} TO `{sp_uuid}`",
@@ -369,12 +449,77 @@ print("ok: Delta mirror tables + Volume grants applied to App SP")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Initial glossary → Delta mirror
+# MAGIC
+# MAGIC Full-refresh the Delta copy from Lakebase so the translation pipeline
+# MAGIC has terminology available on its very first run (before any promotion
+# MAGIC has triggered `delta_sync`). Reads directly from Lakebase here (we hold
+# MAGIC a psycopg connection) and INSERT OVERWRITEs the Delta table.
+
+# COMMAND ----------
+
+with psycopg.connect(conninfo, password=pg_token) as conn:
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT entry_id, source_lang, target_lang, model_phrase, correction,
+                   occurrences, distinct_reviewers, last_seen_at, created_at,
+                   approved, source
+            FROM {pg_schema}.translation_glossary
+        """)
+        g_cols = [d.name for d in cur.description]
+        g_rows = [dict(zip(g_cols, r)) for r in cur.fetchall()]
+
+if not g_rows:
+    _exec(f"DELETE FROM {DELTA_FQN}.translation_glossary")
+    print("glossary mirror: 0 rows (empty)")
+else:
+    def _lit(v):
+        if v is None:
+            return "NULL"
+        if isinstance(v, bool):
+            return "TRUE" if v else "FALSE"
+        if isinstance(v, (int, float)):
+            return repr(v)
+        # datetime → ISO literal; everything else → escaped string
+        import datetime as _dt
+        if isinstance(v, _dt.datetime):
+            return f"TIMESTAMP '{v.isoformat()}'"
+        return "'" + str(v).replace("'", "''") + "'"
+
+    CH = 500
+    for i in range(0, len(g_rows), CH):
+        chunk = g_rows[i : i + CH]
+        vals = ",".join(
+            "(" + ",".join([
+                _lit(e["entry_id"]), _lit(e["source_lang"]), _lit(e["target_lang"]),
+                _lit(e["model_phrase"]), _lit(e["correction"]),
+                _lit(e["occurrences"]), _lit(e["distinct_reviewers"]),
+                _lit(e["last_seen_at"]), _lit(e["created_at"]),
+                _lit(e["approved"]), _lit(e.get("source") or "tenant"),
+                "current_timestamp()",
+            ]) + ")"
+            for e in chunk
+        )
+        verb = "INSERT OVERWRITE" if i == 0 else "INSERT INTO"
+        _exec(f"""
+            {verb} {DELTA_FQN}.translation_glossary
+            (entry_id, source_lang, target_lang, model_phrase, correction,
+             occurrences, distinct_reviewers, last_seen_at, created_at,
+             approved, source, ingested_at)
+            VALUES {vals}
+        """)
+    print(f"glossary mirror: {len(g_rows)} rows synced to Delta")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Pre-create Volume subdirectories
 
 # COMMAND ----------
 
 vol_root = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume_name}"
-for sub in ("raw_documents", "translated_inplace", "translated_reviewed", "golden"):
+for sub in ("raw_documents", "translated_inplace", "translated_reviewed", "golden",
+            "glossary_imports"):
     p = f"{vol_root}/{sub}"
     try:
         w.files.create_directory(p)

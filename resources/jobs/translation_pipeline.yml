@@ -37,6 +37,10 @@ resources:
               translator_notebook_path: ${workspace.file_path}/setup/docx_inplace_translation
               bronze_catalog:           ${var.uc_catalog}
               bronze_schema:            ${var.uc_schema}
+              # Delta mirror of the glossary; the inner notebook reads it to
+              # build the Aho-Corasick prompt-injection automaton. Empty-string
+              # here would disable injection.
+              glossary_delta_table:     ${var.uc_catalog}.${var.uc_schema}.translation_glossary
           # Pin a modern serverless env so the databricks-sdk is recent enough
           # to expose `serving_endpoints.get_open_ai_client()`. Env v1 (default
           # on some workspaces) ships an SDK that pre-dates that helper. The
@@ -55,6 +59,7 @@ resources:
             dependencies:
               - "lxml"
               - "langdetect"
+              - "pyahocorasick"
               - "databricks-sdk>=0.30.0"
               - "openai"
               - "pandas"

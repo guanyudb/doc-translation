@@ -1,0 +1,120 @@
+source_lang,target_lang,model_phrase,correction
+ja,en,治験,clinical trial
+ja,en,治験実施計画書,clinical trial protocol
+ja,en,治験責任医師,principal investigator
+ja,en,治験分担医師,subinvestigator
+ja,en,治験調整医師,coordinating investigator
+ja,en,治験審査委員会,institutional review board
+ja,en,治験薬,investigational product
+ja,en,被験者,subject
+ja,en,被験薬,investigational drug
+ja,en,対照薬,comparator
+ja,en,実薬対照,active control
+ja,en,無作為化,randomization
+ja,en,二重盲検,double-blind
+ja,en,単盲検,single-blind
+ja,en,非盲検,open-label
+ja,en,盲検化,blinding
+ja,en,層別化,stratification
+ja,en,同意説明文書,informed consent form
+ja,en,文書同意,written informed consent
+ja,en,選択基準,inclusion criteria
+ja,en,除外基準,exclusion criteria
+ja,en,主要評価項目,primary endpoint
+ja,en,副次評価項目,secondary endpoint
+ja,en,探索的評価項目,exploratory endpoint
+ja,en,無増悪生存期間,progression-free survival
+ja,en,全生存期間,overall survival
+ja,en,客観的奏効率,objective response rate
+ja,en,奏効期間,duration of response
+ja,en,病勢制御率,disease control rate
+ja,en,完全奏効,complete response
+ja,en,部分奏効,partial response
+ja,en,安定,stable disease
+ja,en,進行,progressive disease
+ja,en,有害事象,adverse event
+ja,en,重篤な有害事象,serious adverse event
+ja,en,副作用,adverse drug reaction
+ja,en,予期しない副作用,unexpected adverse drug reaction
+ja,en,因果関係,causality
+ja,en,重症度,severity
+ja,en,転帰,outcome
+ja,en,用法・用量,dosage and administration
+ja,en,用量制限毒性,dose-limiting toxicity
+ja,en,最大耐用量,maximum tolerated dose
+ja,en,薬物動態,pharmacokinetics
+ja,en,薬力学,pharmacodynamics
+ja,en,最高血漿中濃度,maximum plasma concentration
+ja,en,血漿中濃度曲線下面積,area under the plasma concentration-time curve
+ja,en,消失半減期,elimination half-life
+ja,en,定常状態,steady state
+ja,en,バイオアベイラビリティ,bioavailability
+ja,en,忍容性,tolerability
+ja,en,安全性,safety
+ja,en,有効性,efficacy
+ja,en,実施医療機関,study site
+ja,en,医薬品医療機器総合機構,Pharmaceuticals and Medical Devices Agency
+ja,en,厚生労働省,Ministry of Health Labour and Welfare
+ja,en,製造販売承認,marketing authorization
+ja,en,製造販売後調査,post-marketing surveillance
+ja,en,添付文書,package insert
+ja,en,医薬品の臨床試験の実施の基準,Good Clinical Practice
+ja,en,症例報告書,case report form
+ja,en,原資料,source documents
+ja,en,モニタリング,monitoring
+ja,en,監査,audit
+ja,en,データモニタリング委員会,data monitoring committee
+ja,en,独立データモニタリング委員会,independent data monitoring committee
+ja,en,中間解析,interim analysis
+ja,en,最大の解析対象集団,full analysis set
+ja,en,治験実施計画書に適合した対象集団,per-protocol set
+ja,en,安全性解析対象集団,safety analysis set
+ja,en,ハザード比,hazard ratio
+ja,en,信頼区間,confidence interval
+ja,en,有意水準,significance level
+ja,en,検出力,statistical power
+ja,en,症例数設計,sample size calculation
+ja,en,共変量,covariate
+ja,en,層別因子,stratification factor
+ja,en,部分集団解析,subgroup analysis
+ja,en,感度解析,sensitivity analysis
+ja,en,欠測データ,missing data
+ja,en,打切り,censoring
+ja,en,併用療法,concomitant therapy
+ja,en,前治療,prior therapy
+ja,en,休薬,dose interruption
+ja,en,減量,dose reduction
+ja,en,投与中止,treatment discontinuation
+ja,en,同意撤回,withdrawal of consent
+ja,en,追跡調査,follow-up
+ja,en,ベースライン,baseline
+ja,en,観察期間,observation period
+ja,en,投与期間,treatment period
+ja,en,スクリーニング,screening
+ja,en,登録,enrollment
+ja,en,割付,allocation
+ja,en,固形がん,solid tumor
+ja,en,固形がんの治療効果判定基準,Response Evaluation Criteria in Solid Tumours
+ja,en,有害事象共通用語規準,Common Terminology Criteria for Adverse Events
+ja,en,器官別大分類,system organ class
+ja,en,基本語,preferred term
+ja,en,消化管出血,gastrointestinal hemorrhage
+ja,en,好中球減少症,neutropenia
+ja,en,発熱性好中球減少症,febrile neutropenia
+ja,en,肝機能異常,hepatic function abnormal
+ja,en,末梢神経障害,peripheral neuropathy
+ja,en,悪心,nausea
+ja,en,嘔吐,vomiting
+ja,en,下痢,diarrhea
+ja,en,倦怠感,malaise
+ja,en,食欲減退,decreased appetite
+ja,en,発疹,rash
+ja,en,そう痒症,pruritus
+ja,en,パフォーマンスステータス,performance status
+ja,en,生活の質,quality of life
+ja,en,患者報告アウトカム,patient-reported outcome
+ja,en,腫瘍縮小,tumor shrinkage
+ja,en,循環腫瘍DNA,circulating tumor DNA
+ja,en,バイオマーカー,biomarker
+ja,en,効果予測因子,predictive factor
+ja,en,予後因子,prognostic factor

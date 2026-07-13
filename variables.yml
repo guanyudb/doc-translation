@@ -75,9 +75,18 @@ variables:
 
   translation_target_language:
     description: |
-      Target language (full English name; the inner notebook builds a
-      `<base>_translated_<slug>.docx` filename from this).
+      Default target language (full English name; the inner notebook builds a
+      `<base>_translated_<slug>.docx` filename from this). Source language is
+      auto-detected per document, so only the target needs to be set. Can be
+      overridden per-run from the Jobs UI without redeploying.
     default: English
+
+  enable_seed_glossary:
+    description: |
+      When "true", postdeploy loads the shipped public clinical seed glossary
+      (setup/seed_glossary/*.csv) as source='seed' entries. Off by default so
+      deployments start with an empty glossary unless the customer opts in.
+    default: "false"
 
   translation_max_workers:
     description: Concurrent translation calls per file.

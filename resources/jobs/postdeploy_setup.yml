@@ -37,6 +37,7 @@ resources:
               warehouse_id:           ${var.warehouse_id}
               app_name:               ${var.app_name}
               secret_scope:           ${var.secret_scope}
+              enable_seed_glossary:   ${var.enable_seed_glossary}
 
       run_as:
         user_name: ${var.workspace_user_email}

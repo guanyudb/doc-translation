@@ -19,6 +19,12 @@ Schema (single-tenant, lives next to the Volume):
     {CATALOG}.{SCHEMA}.audit_events             — append, one row per event
     {CATALOG}.{SCHEMA}.golden_publications      — one row per promotion (pair_id PK)
     {CATALOG}.{SCHEMA}.silver_review_snapshots  — one row per paragraph per snapshot
+    {CATALOG}.{SCHEMA}.translation_glossary     — full refresh per sync (small table)
+
+The glossary mirror exists for a different reason than the other three: the
+translation job (Lakeflow, runs as the deploying user) reads it at startup to
+build its prompt-injection automaton. Lakebase is the write side; Delta is the
+read side the pipeline can reach with plain spark.read.table.
 """
 from __future__ import annotations
 import json
@@ -202,6 +208,25 @@ def ensure_delta_schema() -> None:
         COMMENT 'Snapshot of per-paragraph review state at promotion time'
     """)
 
+    _execute(f"""
+        CREATE TABLE IF NOT EXISTS {DELTA_FQN}.translation_glossary (
+            entry_id            BIGINT,
+            source_lang         STRING,
+            target_lang         STRING,
+            model_phrase        STRING,
+            correction          STRING,
+            occurrences         INT,
+            distinct_reviewers  INT,
+            last_seen_at        TIMESTAMP,
+            created_at          TIMESTAMP,
+            approved            BOOLEAN,
+            source              STRING,
+            ingested_at         TIMESTAMP
+        )
+        USING DELTA
+        COMMENT 'Read mirror of Lakebase translation_glossary; the translation job reads this at startup for prompt injection'
+    """)
+
 
 # ---------------------------------------------------------------------------
 # Sync
@@ -330,6 +355,54 @@ def sync_pair_to_delta(pair_id: str, *, publication_id: int | None = None) -> di
         "catalog": DELTA_CATALOG,
         "schema":  DELTA_SCHEMA,
     }
+
+
+def sync_glossary_to_delta() -> dict:
+    """Full-refresh mirror of translation_glossary into Delta.
+
+    Unlike the per-pair MERGE flows above, the glossary is mirrored whole:
+    it's small (hundreds to low-thousands of rows), rows can be un-approved
+    or deleted on the Lakebase side, and a full INSERT OVERWRITE is the only
+    way to guarantee the Delta copy converges to exactly the Lakebase truth.
+
+    Call after mining, approval toggles, or CSV imports. Idempotent."""
+    if not enabled():
+        return {"skipped": True, "reason": "no warehouse configured"}
+
+    ensure_delta_schema()
+
+    from . import glossary as glossary_mod
+    entries = glossary_mod.list_glossary(approved_only=False, limit=100_000)
+
+    if not entries:
+        _execute(f"DELETE FROM {DELTA_FQN}.translation_glossary")
+        return {"skipped": False, "rows": 0}
+
+    CHUNK = 500
+    for i in range(0, len(entries), CHUNK):
+        chunk = entries[i : i + CHUNK]
+        rows_sql = []
+        for e in chunk:
+            rows_sql.append(
+                "("
+                f"{_esc(e['entry_id'])}, {_esc(e['source_lang'])}, {_esc(e['target_lang'])}, "
+                f"{_esc(e['model_phrase'])}, {_esc(e['correction'])}, "
+                f"{_esc(e['occurrences'])}, {_esc(e['distinct_reviewers'])}, "
+                f"{_esc(e['last_seen_at'])}, {_esc(e['created_at'])}, "
+                f"{_esc(e['approved'])}, {_esc(e.get('source') or 'tenant')}, "
+                "current_timestamp()"
+                ")"
+            )
+        verb = "INSERT OVERWRITE" if i == 0 else "INSERT INTO"
+        _execute(f"""
+            {verb} {DELTA_FQN}.translation_glossary
+            (entry_id, source_lang, target_lang, model_phrase, correction,
+             occurrences, distinct_reviewers, last_seen_at, created_at,
+             approved, source, ingested_at)
+            VALUES {','.join(rows_sql)}
+        """, timeout_s=120.0)
+
+    return {"skipped": False, "rows": len(entries)}
 
 
 def query_delta_count(table: str) -> int:

@@ -192,8 +192,15 @@ def ensure_schema() -> None:
                 ON {s}.paragraph_confidence (pair_id, confidence)
             """)
 
-            # ---- translation_glossary: mined (model_phrase → correction) patterns
-            #      that we can use to nudge future translations (Phase 1b).
+            # ---- translation_glossary: terminology entries used to steer future
+            #      translations (Phase 1b/1c). Two kinds, distinguished by `source`:
+            #        * 'tenant'          — mined from review_edit_history. model_phrase
+            #                              and correction are both TARGET-language text
+            #                              (what the model wrote → what reviewers wrote).
+            #        * 'seed'/'customer' — bilingual pairs. model_phrase is SOURCE-language
+            #                              text, correction is the required target term.
+            #                              Loaded from the optional shipped seed file or
+            #                              a customer's own CSV import.
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {s}.translation_glossary (
                     entry_id            BIGSERIAL PRIMARY KEY,
@@ -206,8 +213,14 @@ def ensure_schema() -> None:
                     last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
                     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
                     approved            BOOLEAN NOT NULL DEFAULT TRUE,
+                    source              TEXT NOT NULL DEFAULT 'tenant',
                     UNIQUE (source_lang, target_lang, model_phrase, correction)
                 )
+            """)
+            # Migration for deployments created before the `source` column existed.
+            cur.execute(f"""
+                ALTER TABLE {s}.translation_glossary
+                ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tenant'
             """)
             cur.execute(f"""
                 CREATE INDEX IF NOT EXISTS translation_glossary_lookup_idx
