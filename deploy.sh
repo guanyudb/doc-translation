@@ -41,6 +41,19 @@ fi
 
 SCOPE=$(python3 -c "import json,sys; print(json.load(open('$OVERRIDES')).get('secret_scope','doc_translation_config'))")
 
+# Step 0 — build the React frontend into static/ (unless already built).
+# The Apps runtime has no Node, so the SPA must be prebuilt and shipped as
+# static/. Skips the build if static/index.html is newer than the frontend
+# sources (cheap re-deploys); pass FORCE_BUILD=1 to always rebuild.
+if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
+    if [[ ! -f static/index.html || "${FORCE_BUILD:-0}" == "1" ]]; then
+        echo "==> step 0: build React frontend"
+        ./build.sh
+    else
+        echo "==> step 0: static/ present — skipping frontend build (FORCE_BUILD=1 to rebuild)"
+    fi
+fi
+
 # Step 1 — seed secrets BEFORE bundle deploy.
 #
 # Apps' secret resource bindings are validated EAGERLY at app create/update

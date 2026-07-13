@@ -6,9 +6,9 @@ clinical/regulated `.docx` documents on Databricks.
 A submitter drops a Japanese (or any source-language) `.docx` into a Unity
 Catalog Volume. A file-arrival-triggered Lakeflow job translates it in-place
 at the OOXML level with Foundation Model API. Reviewers certify it
-paragraph-by-paragraph in a Streamlit app. Once 100% certified, the document
-is atomically promoted to a "golden" Volume location, locked read-only, and
-mirrored to Delta for long-term archive.
+paragraph-by-paragraph in a React app (FastAPI backend). Once 100% certified,
+the document is atomically promoted to a "golden" Volume location, locked
+read-only, and mirrored to Delta for long-term archive.
 
 Every action is audited. Every certified document is content-addressed.
 Once locked, writes are refused with an explicit `PairLockedError` (which is
@@ -112,7 +112,14 @@ The platform learns from reviewer behavior in two cheap, no-LLM ways:
 
 Combined via weighted geometric mean so any single red flag drags the score down. Surfaced as a colored pill on each paragraph and as `N hi-conf` / `N lo-conf` chips in the header progress strip.
 
-**Glossary mining** — `translation_glossary` table is populated by scanning `review_edit_history` for repeated (model output → reviewer correction) patterns across documents and reviewers. Surfaced in a sidebar drawer. Phase 1c (deferred) will inject the top-N entries into the FMAPI system prompt at translation time so the same correction doesn't have to be made twice.
+**Glossary mining + injection (the feedback loop)** — the `translation_glossary` table holds terminology entries of three kinds, distinguished by a `source` column:
+- `tenant` — mined by scanning `review_edit_history` for repeated (model output → reviewer correction) patterns across documents and reviewers.
+- `seed` — optional public clinical terminology shipped with the app (`setup/seed_glossary/*.csv`, ~115 ICH/GCP JA→EN terms). Loaded at postdeploy when `enable_seed_glossary=true`.
+- `customer` — bilingual pairs the customer imports via CSV (Glossary tab → Import, or drop a CSV in the `glossary_imports/` Volume folder).
+
+Approved entries are mirrored to a Delta table and read by the translation pipeline at startup, which builds an **Aho-Corasick automaton** over the source-language phrases. For each paragraph the pipeline injects only the glossary entries whose term actually appears in that paragraph into the FMAPI system prompt — so per-call prompt cost is a function of the segment, not the total glossary size, and the design scales to large enterprise glossaries. The result: a correction made once by a reviewer is applied automatically to every future translation of that term.
+
+**Language handling** — the source language is auto-detected per document (`langdetect`) and recorded in `bronze_documents.source_language`; the target language is a selectable setting (`translation_target_language` bundle var, overridable per-run from the Jobs UI). No language pair is hard-coded.
 
 **Confidence is a triage signal, not a quality guarantee.** The reviewer remains the source of truth — the score just helps them prioritize.
 
@@ -139,7 +146,7 @@ Combined via weighted geometric mean so any single red flag drags the score down
 | Storage (archive) | Long-term audit + publication archive | Delta tables in `<uc_catalog>.<uc_schema>` |
 | Translation | In-place OOXML translation per paragraph | FMAPI endpoint (default `databricks-claude-sonnet-4-6`, configurable via `translation_model_endpoint`) |
 | Orchestration | File-arrival → translation pipeline | Lakeflow Job `doc-translation · auto-translate pipeline` (bundle-managed) |
-| Review UI | Side-by-side pane viewer, paragraph rail, certify/edit/publish/promote | Streamlit on Databricks Apps |
+| Review UI | Two-region layout (side-by-side DOCX HTML preview + paragraph action rail), certify/edit/publish/promote, glossary admin, audit | React SPA (Vite + TS + Tailwind) served by FastAPI on Databricks Apps |
 | Auth | Reviewer identity via `X-Forwarded-Email`, App SP for system actions | Databricks Apps SSO + Service Principal |
 
 ---
@@ -151,38 +158,48 @@ doc-translation-app/
 ├── databricks.yml                  # DAB bundle root
 ├── variables.yml                   # Bundle variable definitions
 ├── variable-overrides.example.json # Template customer fills in per workspace
-├── deploy.sh                       # 4-step deploy wrapper (seed → deploy → postdeploy → app)
-├── app.py                          # Streamlit entrypoint
-├── app.yaml                        # Databricks Apps runtime config (valueFrom bindings)
-├── requirements.txt                # streamlit, psycopg[binary,pool], databricks-sdk, mammoth, lxml, pymupdf
+├── deploy.sh                       # deploy wrapper (build → seed → deploy → postdeploy → app)
+├── build.sh                        # builds the React frontend → static/ (run before deploy)
+├── server_api.py                   # FastAPI backend: JSON review API + serves the SPA
+├── app.yaml                        # Databricks Apps runtime config (uvicorn server_api:app)
+├── requirements.txt                # fastapi, uvicorn, psycopg[binary,pool], databricks-sdk, mammoth, lxml
 ├── pyproject.toml
+├── frontend/                       # React SPA source (Vite + TS + Tailwind); NOT deployed
+│   ├── package.json
+│   ├── vite.config.ts              # builds to ../static/
+│   └── src/
+│       ├── App.tsx                 # tab shell: Review / Glossary / Audit
+│       ├── api.ts                  # typed client for /api/*
+│       └── components/
+│           ├── review/             # ReviewView, PreviewPane, ParagraphCard
+│           ├── glossary/GlossaryView.tsx
+│           └── audit/AuditView.tsx
+├── static/                        # PREBUILT SPA (committed; served by FastAPI)
+├── legacy/
+│   └── streamlit_app.py            # previous Streamlit UI, kept for reference/rollback
 ├── resources/                      # DAB-managed resources
 │   ├── app.yml                     # App definition + postgres/sql_warehouse/secret bindings
 │   ├── schema.yml                  # UC schema
 │   ├── volumes.yml                 # UC managed volume
-│   ├── secrets.yml                 # Secret scope (values seeded by deploy.sh + postdeploy)
 │   └── jobs/
 │       ├── postdeploy_setup.yml    # One-shot job: DDL + GRANTs + Delta tables + secret seed
 │       └── translation_pipeline.yml # File-arrival-triggered translation job
 ├── setup/                          # Notebooks bundled into the workspace
 │   ├── postdeploy.py               # Postdeploy notebook (idempotent)
 │   ├── auto_translate_watcher.py   # Watcher: scans raw_documents/, calls translator per file
-│   └── docx_inplace_translation.py # Per-file translator (FMAPI + lxml in-place OOXML edit)
+│   ├── docx_inplace_translation.py # Per-file translator (FMAPI + lxml + glossary injection)
+│   └── seed_glossary/              # Optional public clinical seed CSVs (source='seed')
 ├── server/
 │   ├── auth.py                     # Reviewer from X-Forwarded-Email
 │   ├── config.py                   # env + WorkspaceClient singleton (Project + Provisioned)
 │   ├── confidence.py               # Heuristic per-paragraph scoring (no LLM)
 │   ├── db.py                       # Lakebase psycopg pool, lazy-init proxy
-│   ├── delta_sync.py               # Lakebase → Delta mirror at promotion
+│   ├── delta_sync.py               # Lakebase → Delta mirror (review state + glossary)
 │   ├── docx_render.py              # DOCX → HTML via sentinel markers + lxml
-│   ├── glossary.py                 # Mine review_edit_history for correction patterns
+│   ├── glossary.py                 # Mine + ingest + prompt-format glossary entries
 │   ├── store.py                    # Lakebase CRUD + audit emits + lifecycle
-│   ├── styles.py                   # Editorial-palette CSS for the app
+│   ├── styles.py                   # (legacy Streamlit CSS)
 │   └── volume.py                   # UC Volume listing, DOCX read, golden promotion
-├── components/
-│   └── dual_pane/
-│       ├── __init__.py             # Custom Streamlit component declaration
-│       └── frontend/index.html     # Vanilla HTML/CSS/JS dual-pane viewer
 └── docs/
     ├── architecture.png            # Architecture diagram (PNG)
     ├── architecture.svg            # Architecture diagram (SVG)
@@ -368,6 +385,7 @@ Requires arm64 Python (x86_64 venv breaks `cryptography`'s `_cffi_backend` impor
 python3.10 -m venv .venv  # /opt/homebrew/bin/python3.10 on macOS
 .venv/bin/pip install -r requirements.txt
 
+# Terminal 1 — FastAPI backend
 DATABRICKS_PROFILE=<profile> \
 PGHOST=instance-...database.cloud.databricks.com \
 PGPORT=5432 PGDATABASE=databricks_postgres PGSSLMODE=require \
@@ -375,15 +393,21 @@ PGSCHEMA=doc_translation LAKEBASE_INSTANCE=lakebasepoc \
 VOLUME_ROOT=/Volumes/.../doc-translation \
 DATABRICKS_WAREHOUSE_ID=<warehouse-id> \
 DELTA_CATALOG=hls_amer_catalog DELTA_SCHEMA=guanyu_chen \
-.venv/bin/streamlit run app.py \
-  --server.port=8501 --server.address=0.0.0.0 --server.headless=true
+.venv/bin/uvicorn server_api:app --port 8000 --reload
+
+# Terminal 2 — Vite dev server (proxies /api → localhost:8000)
+cd frontend && npm install && npm run dev   # http://localhost:5173
 ```
+
+For a production-shaped local run, `./build.sh` then hit the FastAPI port directly
+(it serves the built SPA from `static/`). The legacy Streamlit UI is still runnable
+with `.venv/bin/streamlit run legacy/streamlit_app.py` against the same env vars.
 
 ---
 
 ## What's deferred
 
-- **Phase 1c — glossary injection** into the translation prompt (one-line read of `glossary.glossary_for_prompt(...)` in the inner notebook's system prompt; deferred until live data has a few dozen entries to validate against)
+- **Paragraph/sentence-level correction learning** — semantic retrieval (Databricks Vector Search) over past (original, revised) paragraph pairs, injected as few-shot examples. Complements the term-level glossary; gated on classifying reviewer feedback as term- vs sentence-level first.
 - **PDF support** — designed but not built; would need `pymupdf` extraction + an "overlay vs. in-place" writeback choice per document
 - **Two-eyes / multi-reviewer attestation** before promotion
 - **AI/BI dashboards** on the Delta tables (pipeline health, review backlog, SLA breach)

@@ -11,13 +11,12 @@
 # for the Postgres + SQL warehouse.
 
 command:
-  - "streamlit"
-  - "run"
-  - "app.py"
-  - "--server.port=8000"
-  - "--server.address=0.0.0.0"
-  - "--server.headless=true"
-  - "--browser.gatherUsageStats=false"
+  - "uvicorn"
+  - "server_api:app"
+  - "--host"
+  - "0.0.0.0"
+  - "--port"
+  - "8000"
 
 env:
   # ---- Lakebase Postgres connection (mostly auto-injected) ----

@@ -1,6 +1,7 @@
 # Databricks Asset Bundle — Doc Translation Review Platform
 #
-# Deploys: a Streamlit Databricks App + a Lakebase-bound review database +
+# Deploys: a FastAPI + React Databricks App (React SPA prebuilt into static/
+# by ./build.sh, served by server_api.py) + a Lakebase-bound review database +
 # a UC Volume for files + a postdeploy job that runs schema migrations and
 # GRANTs the App service principal what it needs.
 #
@@ -28,6 +29,16 @@ sync:
     - .databricks
     - DATABRICKS_COMPONENTS.html
     - "DATABRICKS_COMPONENTS_files/**"
+    # The React app is shipped PREBUILT as static/ (see build.sh). The source
+    # tree and its node_modules must never be synced — the Apps runtime has no
+    # Node, and node_modules is huge.
+    - "frontend/node_modules/**"
+    - "frontend/**"
+    # Legacy Streamlit app is kept in-repo for reference/rollback but isn't
+    # part of the deployed FastAPI app.
+    - "legacy/**"
+    - demo_docs
+    - "demo_docs/**"
 
 targets:
   # Default target — customer fills in variable-overrides.json with their values.
