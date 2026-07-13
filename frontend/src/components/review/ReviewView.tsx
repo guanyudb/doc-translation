@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, Flag, ScrollText, UploadCloud, Award, Loader2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { CheckCircle2, ScrollText, UploadCloud, Award, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/input";
 import { api, PairDetail, PairSummary, Paragraph } from "@/api";
-import { PreviewPane } from "@/components/review/PreviewPane";
-import { ParagraphCard } from "@/components/review/ParagraphCard";
+import { DocPane, FeedbackMeta } from "@/components/review/DocPane";
+import { ActiveParagraphPanel } from "@/components/review/ActiveParagraphPanel";
 
 export function ReviewView({
   activePair,
@@ -21,6 +21,7 @@ export function ReviewView({
   const [origHtml, setOrigHtml] = useState("");
   const [tranHtml, setTranHtml] = useState("");
   const [activeIdx, setActiveIdx] = useState<number | null>(null);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -36,16 +37,12 @@ export function ReviewView({
   const loadDetail = useCallback((id: string) => {
     setLoading(true);
     setError(null);
-    Promise.all([
-      api.pair(id),
-      api.preview(id, "original"),
-      api.preview(id, "translated"),
-    ])
+    Promise.all([api.pair(id), api.preview(id, "original"), api.preview(id, "translated")])
       .then(([d, o, t]) => {
         setDetail(d);
         setOrigHtml(o);
         setTranHtml(t);
-        setActiveIdx(d.paragraphs.length ? d.paragraphs[0].idx : null);
+        setActiveIdx(null);
       })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
@@ -55,6 +52,20 @@ export function ReviewView({
     if (activePair) loadDetail(activePair);
     else setDetail(null);
   }, [activePair, loadDetail]);
+
+  const feedback = useMemo<Record<number, FeedbackMeta>>(() => {
+    const m: Record<number, FeedbackMeta> = {};
+    if (detail) {
+      for (const p of detail.paragraphs) {
+        m[p.idx] = {
+          status: p.status,
+          commented: !!(p.comment && p.comment.trim()),
+          edited: p.edited_text !== null,
+        };
+      }
+    }
+    return m;
+  }, [detail]);
 
   const progress = useMemo(() => {
     if (!detail) return { certified: 0, flagged: 0, pending: 0, total: 0 };
@@ -67,13 +78,18 @@ export function ReviewView({
     return { certified: c, flagged: f, pending: p, total: detail.paragraphs.length };
   }, [detail]);
 
-  const patchPara = (updated: Paragraph) => {
+  const totalPages = useMemo(
+    () => (detail ? detail.paragraphs.reduce((mx, p) => Math.max(mx, p.page), 1) : 1),
+    [detail]
+  );
+
+  const activePara: Paragraph | null =
+    detail && activeIdx !== null ? detail.paragraphs.find((p) => p.idx === activeIdx) ?? null : null;
+
+  const patchPara = (updated: Paragraph) =>
     setDetail((d) =>
-      d
-        ? { ...d, paragraphs: d.paragraphs.map((x) => (x.idx === updated.idx ? updated : x)) }
-        : d
+      d ? { ...d, paragraphs: d.paragraphs.map((x) => (x.idx === updated.idx ? updated : x)) } : d
     );
-  };
 
   const locked = detail?.locked ?? false;
 
@@ -89,6 +105,13 @@ export function ReviewView({
     } finally {
       setBusy(null);
     }
+  };
+
+  const stepActive = (dir: 1 | -1) => {
+    if (!detail || !detail.paragraphs.length) return;
+    const cur = activeIdx ?? (dir === 1 ? -1 : detail.paragraphs.length);
+    const next = Math.min(Math.max(cur + dir, 0), detail.paragraphs.length - 1);
+    setActiveIdx(next);
   };
 
   return (
@@ -112,14 +135,12 @@ export function ReviewView({
 
         {detail && (
           <>
-            <Badge variant="outline" className="gap-1">
+            <Badge variant="outline">
               {detail.source_lang ?? "?"} → {detail.target_lang ?? "?"}
             </Badge>
-            <span className="status-badge">
-              <Badge className={`status-${detail.lifecycle_state.toLowerCase()}`}>
-                {detail.lifecycle_state}
-              </Badge>
-            </span>
+            <Badge className={`status-${detail.lifecycle_state.toLowerCase()}`}>
+              {detail.lifecycle_state}
+            </Badge>
             <div className="flex-1" />
             <Button
               variant="success"
@@ -127,8 +148,7 @@ export function ReviewView({
               disabled={locked || busy !== null}
               onClick={() => act("certify", () => api.certifyAll(detail.pair_id), true)}
             >
-              {busy === "certify" ? <Loader2 className="animate-spin" /> : <CheckCircle2 />}
-              Certify all
+              {busy === "certify" ? <Loader2 className="animate-spin" /> : <CheckCircle2 />} Certify all
             </Button>
             <Button
               variant="outline"
@@ -136,8 +156,7 @@ export function ReviewView({
               disabled={locked || busy !== null}
               onClick={() => act("publish", () => api.publish(detail.pair_id), true)}
             >
-              {busy === "publish" ? <Loader2 className="animate-spin" /> : <UploadCloud />}
-              Publish
+              {busy === "publish" ? <Loader2 className="animate-spin" /> : <UploadCloud />} Publish
             </Button>
             <Button
               variant="default"
@@ -145,8 +164,7 @@ export function ReviewView({
               disabled={busy !== null}
               onClick={() => act("promote", () => api.promote(detail.pair_id), true)}
             >
-              {busy === "promote" ? <Loader2 className="animate-spin" /> : <Award />}
-              Promote to gold
+              {busy === "promote" ? <Loader2 className="animate-spin" /> : <Award />} Promote to gold
             </Button>
             <Button variant="ghost" size="sm" onClick={() => onOpenAudit(detail.pair_id)}>
               <ScrollText /> Audit
@@ -162,7 +180,7 @@ export function ReviewView({
       )}
 
       {detail && (
-        <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+        <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
           <span>{progress.total} paragraphs</span>
           <span className="text-emerald-600">✓ {progress.certified} certified</span>
           <span className="text-rose-600">⚑ {progress.flagged} flagged</span>
@@ -183,44 +201,62 @@ export function ReviewView({
         </div>
       )}
 
-      {/* Two-region layout: preview (left) + action rail (right) */}
+      {/* Document-centric layout: two synced panes + compact inspector */}
       {!loading && detail && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_460px]">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_340px]">
           <div className="grid grid-cols-2 gap-3">
-            <PreviewPane title={`Source (${detail.source_lang ?? "?"})`} html={origHtml} activeIdx={activeIdx} />
-            <PreviewPane
-              title={`Translation (${detail.target_lang ?? "?"})`}
-              html={tranHtml}
+            <DocPane
+              title="Source"
+              lang={(detail.source_lang ?? "src").toUpperCase()}
+              html={origHtml}
+              totalParas={progress.total}
+              feedback={feedback}
               activeIdx={activeIdx}
+              hoverIdx={hoverIdx}
+              pageForActive={activePara?.page ?? null}
+              totalPages={totalPages}
+              onActivate={setActiveIdx}
+              onHover={setHoverIdx}
+            />
+            <DocPane
+              title="Translation"
+              lang={(detail.target_lang ?? "tgt").toUpperCase()}
+              html={tranHtml}
+              totalParas={progress.total}
+              feedback={feedback}
+              activeIdx={activeIdx}
+              hoverIdx={hoverIdx}
+              pageForActive={activePara?.page ?? null}
+              totalPages={totalPages}
+              onActivate={setActiveIdx}
+              onHover={setHoverIdx}
             />
           </div>
 
-          <div className="max-h-[calc(100vh-220px)] space-y-2 overflow-y-auto pr-1">
-            {detail.paragraphs.map((para) => (
-              <ParagraphCard
-                key={para.idx}
-                para={para}
-                active={para.idx === activeIdx}
-                locked={locked}
-                onFocus={() => setActiveIdx(para.idx)}
-                onStatus={(status) =>
-                  act(`status-${para.idx}`, async () =>
-                    patchPara(await api.setStatus(detail.pair_id, para.idx, status))
-                  )
-                }
-                onComment={(comment) =>
-                  act(`comment-${para.idx}`, async () =>
-                    patchPara(await api.setComment(detail.pair_id, para.idx, comment))
-                  )
-                }
-                onEdit={(text) =>
-                  act(`edit-${para.idx}`, async () =>
-                    patchPara(await api.setEdit(detail.pair_id, para.idx, text))
-                  )
-                }
-              />
-            ))}
-          </div>
+          <ActiveParagraphPanel
+            para={activePara}
+            locked={locked}
+            onStatus={(status) =>
+              activePara &&
+              act(`status-${activePara.idx}`, async () =>
+                patchPara(await api.setStatus(detail.pair_id, activePara.idx, status))
+              )
+            }
+            onComment={(comment) =>
+              activePara &&
+              act(`comment-${activePara.idx}`, async () =>
+                patchPara(await api.setComment(detail.pair_id, activePara.idx, comment))
+              )
+            }
+            onEdit={(text) =>
+              activePara &&
+              act(`edit-${activePara.idx}`, async () =>
+                patchPara(await api.setEdit(detail.pair_id, activePara.idx, text))
+              )
+            }
+            onPrev={() => stepActive(-1)}
+            onNext={() => stepActive(1)}
+          />
         </div>
       )}
     </div>

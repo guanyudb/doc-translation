@@ -83,19 +83,82 @@
   }
 }
 
-/* DOCX HTML preview panes rendered from server docx_render.render(). */
-.docx-preview { line-height: 1.5; font-size: 0.85rem; }
-.docx-preview p { margin: 0 0 0.5rem; }
-.docx-preview h1, .docx-preview h2, .docx-preview h3 { font-weight: 600; margin: 0.75rem 0 0.4rem; }
-.docx-preview table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
-.docx-preview td, .docx-preview th { border: 1px solid var(--border); padding: 3px 6px; font-size: 0.78rem; }
-.docx-preview img { max-width: 100%; height: auto; }
-.docx-preview [data-pidx] { scroll-margin-top: 1rem; border-radius: 3px; transition: background-color 0.2s; }
-.docx-preview [data-pidx].pidx-active {
-  background-color: color-mix(in oklch, var(--primary) 18%, transparent);
-  box-shadow: 0 0 0 2px color-mix(in oklch, var(--primary) 35%, transparent);
+/* ============================================================================
+   Document-centric review panes (ported from the legacy dual_pane component).
+   Two full rendered-DOCX panes; you navigate the document itself. Each
+   paragraph carries an inline status dot, hover-pairs across panes, and
+   click-activates (scrolling both panes). A minimap strip summarizes status.
+   ========================================================================= */
+.docx-doc {
+  line-height: 1.6;
+  font-size: 0.86rem;
+  padding-bottom: 40px;
 }
-.docx-preview [data-edited="1"] { border-left: 3px solid var(--primary); padding-left: 6px; }
+.docx-doc > *:first-child { margin-top: 0; }
+.docx-doc h1, .docx-doc h2, .docx-doc h3, .docx-doc h4 {
+  font-weight: 600; letter-spacing: -0.01em;
+  margin: 1.2em 0 0.35em; line-height: 1.25;
+}
+.docx-doc h1 { font-size: 1.4em; }
+.docx-doc h2 { font-size: 1.2em; }
+.docx-doc h3 { font-size: 1.08em; }
+.docx-doc p, .docx-doc li { margin: 0.4em 0; }
+.docx-doc a { color: #2563eb; text-underline-offset: 2px; }
+.dark .docx-doc a { color: #60a5fa; }
+.docx-doc .table-scroll { overflow-x: auto; max-width: 100%; margin: 0.8em 0; border: 1px solid var(--border); border-radius: 4px; }
+.docx-doc table { border-collapse: collapse; width: 100%; font-size: 0.78rem; }
+.docx-doc td, .docx-doc th { border: 1px solid var(--border); padding: 4px 7px; text-align: left; vertical-align: top; word-break: break-word; }
+.docx-doc th { background: var(--muted); font-weight: 600; }
+.docx-doc img { max-width: 100%; height: auto; }
+
+/* Paragraph rows: gutter status dot + activation states */
+.docx-doc [data-pidx] {
+  position: relative; padding: 3px 8px 3px 22px;
+  border-radius: 3px; cursor: pointer; scroll-margin-top: 56px;
+  transition: background-color 60ms ease;
+}
+.docx-doc [data-pidx]:hover { background: var(--accent); }
+.docx-doc [data-pidx].pair-hover { background: color-mix(in oklch, #f59e0b 12%, transparent); }
+.docx-doc [data-pidx].active {
+  background: color-mix(in oklch, var(--primary) 14%, transparent) !important;
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+.docx-doc [data-pidx]::before {
+  content: ''; position: absolute; left: 8px; top: 0.85em;
+  transform: translateY(-50%); width: 7px; height: 7px; border-radius: 50%;
+  background: var(--muted-foreground); opacity: 0.5;
+  transition: box-shadow 80ms, background 80ms, opacity 80ms;
+}
+.docx-doc [data-pidx][data-status="certified"]::before { background: #16a34a; opacity: 1; }
+.docx-doc [data-pidx][data-status="flagged"]::before   { background: #e11d48; opacity: 1; }
+.docx-doc [data-pidx][data-commented="1"]::before { box-shadow: 0 0 0 2px color-mix(in oklch, #2563eb 55%, transparent); }
+.docx-doc [data-pidx][data-edited="1"] { box-shadow: inset 2px 0 0 var(--primary); }
+.docx-doc [data-pidx][data-edited="1"]::after {
+  content: 'edited'; position: absolute; top: 2px; right: 4px;
+  font-size: 8px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--primary-foreground); background: var(--primary);
+  padding: 1px 5px; border-radius: 2px; pointer-events: none;
+}
+
+/* Inline page dividers */
+.docx-doc .page-divider {
+  display: flex; align-items: center; gap: 12px; margin: 22px 0 8px;
+  font-size: 9px; font-weight: 600; letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+.docx-doc .page-divider::before, .docx-doc .page-divider::after {
+  content: ''; flex: 1; height: 1px; background: var(--border);
+}
+
+/* Minimap */
+.doc-minimap { position: absolute; top: 0; right: 0; bottom: 0; width: 6px; background: var(--muted); }
+.doc-minimap .seg { position: absolute; left: 0; right: 0; cursor: pointer; }
+.doc-minimap .seg:hover { filter: brightness(0.85); }
+.doc-minimap .seg.pending   { background: var(--muted-foreground); opacity: 0.35; }
+.doc-minimap .seg.certified { background: #16a34a; }
+.doc-minimap .seg.flagged   { background: #e11d48; }
+.doc-minimap .seg.commented { background: #2563eb; opacity: 0.7; }
+.doc-minimap .active-marker { position: absolute; left: -2px; right: -2px; height: 2px; background: var(--foreground); pointer-events: none; }
 
 /* Status badge color utilities (semantic colors that survive dark mode) */
 .status-draft { @apply bg-muted text-muted-foreground; }
