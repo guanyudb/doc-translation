@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, ScrollText, UploadCloud, Award, Loader2, FilePlus2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -97,12 +97,24 @@ export function ReviewView({
 
   const locked = detail?.locked ?? false;
 
+  // Light refresh: re-fetch ONLY the review JSON (statuses/edits/lifecycle),
+  // leaving the rendered HTML, the active paragraph, and both panes' scroll
+  // positions untouched. Used after certify/publish/promote so the view
+  // doesn't jump back to the top of the document.
+  const refreshReviewState = useCallback(() => {
+    if (!activePair) return Promise.resolve();
+    return api
+      .pair(activePair)
+      .then((d) => setDetail((prev) => (prev ? { ...d } : d)))
+      .catch((e) => setError(String(e)));
+  }, [activePair]);
+
   const act = async (label: string, fn: () => Promise<unknown>, reload = false) => {
     setBusy(label);
     setError(null);
     try {
       await fn();
-      if (reload && activePair) loadDetail(activePair);
+      if (reload) await refreshReviewState();
       loadPairs();
     } catch (e) {
       setError(String(e));
@@ -110,6 +122,61 @@ export function ReviewView({
       setBusy(null);
     }
   };
+
+  // ---- Synchronized scrolling between the two panes ----------------------
+  // Anchor on the topmost visible paragraph: when the user scrolls one pane,
+  // find the first data-pidx whose top is at/below the pane top, then scroll
+  // the OTHER pane so the same paragraph sits at the same offset. This keeps
+  // source ¶N and translation ¶N aligned even though English wraps taller.
+  const origBody = useRef<HTMLDivElement | null>(null);
+  const tranBody = useRef<HTMLDivElement | null>(null);
+  // Per-pane suppression counters: when we programmatically set a pane's
+  // scrollTop we bump its counter, and that pane's resulting scroll event
+  // decrements it and no-ops — so the mirror write never bounces back into an
+  // infinite loop. (Robust against the rAF-timing race a boolean guard has.)
+  const suppress = useRef({ orig: 0, tran: 0 });
+
+  const syncFrom = useCallback(
+    (
+      src: HTMLDivElement | null,
+      dst: HTMLDivElement | null,
+      srcKey: "orig" | "tran",
+      dstKey: "orig" | "tran"
+    ) => {
+      if (!src || !dst) return;
+      if (suppress.current[srcKey] > 0) {
+        suppress.current[srcKey] -= 1;
+        return;
+      }
+      const srcTop = src.getBoundingClientRect().top;
+      let anchorIdx: number | null = null;
+      let deltaAbove = 0;
+      for (const el of Array.from(src.querySelectorAll<HTMLElement>("[data-pidx]"))) {
+        const r = el.getBoundingClientRect();
+        if (r.bottom >= srcTop) {
+          anchorIdx = parseInt(el.getAttribute("data-pidx")!, 10);
+          deltaAbove = srcTop - r.top;
+          break;
+        }
+      }
+      if (anchorIdx === null) return;
+      const target = dst.querySelector<HTMLElement>(`[data-pidx="${anchorIdx}"]`);
+      if (!target) return;
+      const dstTop = dst.getBoundingClientRect().top;
+      const targetTop = target.getBoundingClientRect().top;
+      const maxScroll = dst.scrollHeight - dst.clientHeight;
+      const newScroll = Math.max(
+        0,
+        Math.min(maxScroll, dst.scrollTop + (targetTop - dstTop) - deltaAbove)
+      );
+      // Skip if effectively unchanged — avoids leaking a suppress count when
+      // no scroll event will actually fire.
+      if (Math.abs(newScroll - dst.scrollTop) < 1) return;
+      suppress.current[dstKey] += 1;
+      dst.scrollTop = newScroll;
+    },
+    []
+  );
 
   const stepActive = (dir: 1 | -1) => {
     if (!detail || !detail.paragraphs.length) return;
@@ -258,6 +325,8 @@ export function ReviewView({
               totalPages={totalPages}
               onActivate={setActiveIdx}
               onHover={setHoverIdx}
+              onBodyMount={(el) => (origBody.current = el)}
+              onScroll={() => syncFrom(origBody.current, tranBody.current, "orig", "tran")}
             />
             <DocPane
               title="Translation"
@@ -271,6 +340,8 @@ export function ReviewView({
               totalPages={totalPages}
               onActivate={setActiveIdx}
               onHover={setHoverIdx}
+              onBodyMount={(el) => (tranBody.current = el)}
+              onScroll={() => syncFrom(tranBody.current, origBody.current, "tran", "orig")}
             />
           </div>
 

@@ -22,6 +22,8 @@ export function DocPane({
   totalPages,
   onActivate,
   onHover,
+  onBodyMount,
+  onScroll,
 }: {
   title: string;
   lang: string;
@@ -34,9 +36,18 @@ export function DocPane({
   totalPages: number;
   onActivate: (idx: number) => void;
   onHover: (idx: number | null) => void;
+  onBodyMount?: (el: HTMLDivElement | null) => void;
+  onScroll?: () => void;
 }) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const docRef = useRef<HTMLDivElement>(null);
+
+  // Expose the scroll container to the parent so it can synchronize the two
+  // panes' scroll positions (keep the same paragraph aligned across panes).
+  useEffect(() => {
+    onBodyMount?.(bodyRef.current);
+    return () => onBodyMount?.(null);
+  }, [onBodyMount]);
 
   // Keep latest callbacks in refs so the delegated listeners (wired once per
   // html change) always call the current handlers.
@@ -174,7 +185,11 @@ export function DocPane({
           </span>
         )}
       </div>
-      <div ref={bodyRef} className="relative max-h-[calc(100vh-250px)] overflow-y-auto px-4 py-3">
+      <div
+        ref={bodyRef}
+        onScroll={onScroll}
+        className="relative max-h-[calc(100vh-250px)] overflow-y-auto px-4 py-3"
+      >
         <div ref={docRef} className="docx-doc" dangerouslySetInnerHTML={{ __html: html }} />
         <div className="doc-minimap">
           {segments.map((s) => (
