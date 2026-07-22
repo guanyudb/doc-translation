@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Body
+from fastapi import FastAPI, HTTPException, UploadFile, File, Body, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -36,6 +36,15 @@ from server.db import pool
 app = FastAPI(title="Doc Translation Review")
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+
+@app.middleware("http")
+async def _capture_identity(request: Request, call_next):
+    # Databricks Apps forwards the signed-in user as X-Forwarded-Email. Stash
+    # the request headers so auth.reviewer() can read them (contextvar-based,
+    # so it's correct even under concurrency).
+    auth.set_request_headers(dict(request.headers))
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -318,6 +327,62 @@ def certify_all(pair_id: str):
     except store.PairLockedError as e:
         raise HTTPException(409, str(e))
     return {"certified": n}
+
+
+@app.post("/api/pairs/{pair_id}/certify-page")
+def certify_page(pair_id: str, page: int = Body(..., embed=True)):
+    """Certify every paragraph on a single page (the page containing the
+    active paragraph). Uses the source-side page numbers from docx_render."""
+    match = _resolve(pair_id)
+    _, orig_paras = _render(match["original_path"])
+    idxs = [p["idx"] for p in orig_paras if p.get("page") == page]
+    if not idxs:
+        return {"certified": 0, "page": page}
+    try:
+        n = store.bulk_upsert_feedback(
+            pair_id, idxs, "certified", auth.reviewer(), skip_commented=True,
+        )
+    except store.PairLockedError as e:
+        raise HTTPException(409, str(e))
+    return {"certified": n, "page": page}
+
+
+@app.post("/api/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    target_language: str = Form("English"),
+):
+    """Accept a source .docx, write it to raw_documents/. The file-arrival
+    trigger on that folder kicks off the translation pipeline; the resulting
+    pair shows up in /api/pairs once translation completes.
+
+    target_language is recorded as a per-file sidecar (.lang) so the pipeline
+    (and the review UI) know the intended target without changing the bundle
+    default. Source language is auto-detected downstream."""
+    name = (file.filename or "").strip()
+    if not name.lower().endswith(".docx"):
+        raise HTTPException(400, "only .docx files are supported")
+    if name.startswith("~$") or "/" in name or "\\" in name:
+        raise HTTPException(400, "invalid filename")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "empty file")
+
+    dest = f"{config.RAW_DIR}/{name}"
+    volume.upload_docx(dest, data)
+    # Sidecar carrying the requested target language for this document.
+    try:
+        volume.upload_docx(f"{config.RAW_DIR}/{name}.lang", target_language.encode("utf-8"))
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "name": name,
+        "path": dest,
+        "target_language": target_language,
+        "message": "Uploaded. Translation runs on file arrival; the pair will "
+                   "appear in the list once it completes (usually 1–3 min).",
+    }
 
 
 @app.post("/api/pairs/{pair_id}/publish")

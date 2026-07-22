@@ -128,6 +128,24 @@ def _to_fs(p: str) -> str:
     """dbutils returns paths like 'dbfs:/Volumes/...'. open() wants '/Volumes/...'."""
     return p[len("dbfs:"):] if p.startswith("dbfs:") else p
 
+def _slug(lang: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (lang or "").lower()).strip("_") or "translated"
+
+def _target_for(fs_path: str) -> str:
+    """Per-file target language. The app writes a `<name>.docx.lang` sidecar
+    next to an uploaded file carrying the reviewer's chosen target. If present,
+    it overrides the job-level default; otherwise use the job default."""
+    sidecar = fs_path + ".lang"
+    try:
+        if os.path.exists(sidecar):
+            with open(sidecar, "r", encoding="utf-8") as fh:
+                val = fh.read().strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return target_language
+
 raw_files = []
 for entry in dbutils.fs.ls(raw_dir):
     name = entry.name.rstrip("/")
@@ -146,14 +164,17 @@ for entry in dbutils.fs.ls(raw_dir):
 unpaired = []
 for f in raw_files:
     stem = f["name"][:-len(".docx")]
-    expected_out = f"{translated_dir}/{stem}_translated_{lang_slug}.docx"
+    file_target = _target_for(f["path"])
+    file_slug = _slug(file_target)
+    expected_out = f"{translated_dir}/{stem}_translated_{file_slug}.docx"
     # `dbutils.fs.head` on a Volume from serverless raises an internal
     # error instead of a clean FileNotFoundError, so we can't rely on it.
     # Plain POSIX `os.path.exists` against the FUSE-mounted Volume path
     # is reliable for file presence.
     if os.path.exists(expected_out):
         continue
-    unpaired.append({**f, "expected_output": expected_out, "stem": stem})
+    unpaired.append({**f, "expected_output": expected_out, "stem": stem,
+                     "target_language": file_target})
 
 print(f"raw files   : {len(raw_files)}")
 print(f"already done: {len(raw_files) - len(unpaired)}")
@@ -188,6 +209,8 @@ for f in unpaired:
     doc_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{fs_path}:{h or ''}"))
     landed = datetime.datetime.fromtimestamp(f["modified_ms"] / 1000, tz=datetime.timezone.utc)
     first_seen = datetime.datetime.now(datetime.timezone.utc)
+    file_target = f.get("target_language") or target_language
+    file_target_sql = file_target.replace("'", "''")
 
     # Bronze upsert: TRANSLATING
     spark.sql(f"""
@@ -203,7 +226,7 @@ for f in unpaired:
             'TRANSLATING' AS translation_status,
             current_timestamp() AS translation_started_at,
             '{model_endpoint}' AS model_endpoint,
-            '{target_language}' AS target_language
+            '{file_target_sql}' AS target_language
         ) AS s
         ON t.document_id = s.document_id
         WHEN MATCHED THEN UPDATE SET
@@ -235,7 +258,7 @@ for f in unpaired:
             arguments={
                 "input_path":             fs_path,
                 "output_dir":             translated_dir,
-                "target_language":        target_language,
+                "target_language":        file_target,
                 "model_endpoint":         model_endpoint,
                 "max_workers":            max_workers,
                 "max_pages":              max_pages,

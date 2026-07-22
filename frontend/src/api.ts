@@ -118,6 +118,22 @@ export const api = {
       j<{ certified: number }>
     ),
 
+  certifyPage: (id: string, page: number) =>
+    fetch(`/api/pairs/${encodeURIComponent(id)}/certify-page`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ page }),
+    }).then(j<{ certified: number; page: number }>),
+
+  upload: (file: File, targetLanguage: string) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("target_language", targetLanguage);
+    return fetch("/api/upload", { method: "POST", body: fd }).then(
+      j<{ ok: boolean; name: string; message: string; target_language: string }>
+    );
+  },
+
   publish: (id: string) =>
     fetch(`/api/pairs/${encodeURIComponent(id)}/publish`, { method: "POST" }).then(
       j<{ output_path: string; edits_applied: number; version: number }>

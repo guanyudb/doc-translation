@@ -21,13 +21,22 @@ export default function App() {
         <Navbar
           active={tab}
           onNavigate={setTab}
-          subtitle={cfg ? `${cfg.reviewer} · target ${cfg.target_language}` : undefined}
+          subtitle={
+            cfg ? (
+              <>
+                Signed in as <span className="font-medium text-foreground">{cfg.reviewer}</span>
+                {" · default target "}
+                {cfg.target_language}
+              </>
+            ) : undefined
+          }
         />
-        <main className="mx-auto max-w-[1400px] px-4 py-6 sm:px-6">
+        <main className="mx-auto w-full max-w-[1920px] px-4 py-6 sm:px-6 lg:px-8">
           {tab === "review" && (
             <ReviewView
               activePair={activePair}
               setActivePair={setActivePair}
+              defaultTarget={cfg?.target_language ?? "English"}
               onOpenAudit={(id) => {
                 setActivePair(id);
                 setTab("audit");

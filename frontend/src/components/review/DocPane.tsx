@@ -74,6 +74,10 @@ export function DocPane({
     });
 
     const onClick = (e: Event) => {
+      // Don't hijack a click that's really a text selection — let the user
+      // select + copy source/translation text without it snapping the panes.
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) return;
       const t = (e.target as HTMLElement).closest("[data-pidx]");
       if (t) cb.current.onActivate(parseInt(t.getAttribute("data-pidx")!, 10));
     };
@@ -105,23 +109,43 @@ export function DocPane({
     });
   }, [feedback, html]);
 
-  // Active / hover highlight + scroll-to-active.
+  // Highlight only (active + hover). Cheap class toggles — safe to run on
+  // every hover. Crucially this does NOT scroll, so hovering a paragraph or a
+  // re-render never yanks the viewport.
   useEffect(() => {
     const root = docRef.current;
     if (!root) return;
     root.querySelectorAll("[data-pidx].active").forEach((el) => el.classList.remove("active"));
     root.querySelectorAll("[data-pidx].pair-hover").forEach((el) => el.classList.remove("pair-hover"));
     if (activeIdx !== null) {
-      const el = root.querySelector<HTMLElement>(`[data-pidx="${activeIdx}"]`);
-      if (el) {
-        el.classList.add("active");
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
-      }
+      root.querySelector(`[data-pidx="${activeIdx}"]`)?.classList.add("active");
     }
     if (hoverIdx !== null && hoverIdx !== activeIdx) {
       root.querySelector(`[data-pidx="${hoverIdx}"]`)?.classList.add("pair-hover");
     }
   }, [activeIdx, hoverIdx, html]);
+
+  // Scroll-to-active — runs ONLY when the active paragraph actually changes,
+  // never on hover or re-render. This is what fixes the "snap back to the
+  // highlighted paragraph while I'm scrolling" bug: scrolling/hovering no
+  // longer re-triggers a scrollIntoView. We also skip the scroll when the
+  // active paragraph is already comfortably in view.
+  const lastScrolled = useRef<number | null>(null);
+  useEffect(() => {
+    const root = docRef.current;
+    const body = bodyRef.current;
+    if (!root || !body || activeIdx === null) return;
+    if (lastScrolled.current === activeIdx) return;
+    lastScrolled.current = activeIdx;
+    const el = root.querySelector<HTMLElement>(`[data-pidx="${activeIdx}"]`);
+    if (!el) return;
+    const bodyRect = body.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    const fullyVisible = elRect.top >= bodyRect.top && elRect.bottom <= bodyRect.bottom;
+    if (!fullyVisible) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [activeIdx]);
 
   const segments = useMemo(() => {
     if (!totalParas) return [];
