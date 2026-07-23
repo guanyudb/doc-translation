@@ -124,58 +124,73 @@ export function ReviewView({
   };
 
   // ---- Synchronized scrolling between the two panes ----------------------
-  // Anchor on the topmost visible paragraph: when the user scrolls one pane,
-  // find the first data-pidx whose top is at/below the pane top, then scroll
-  // the OTHER pane so the same paragraph sits at the same offset. This keeps
-  // source ¶N and translation ¶N aligned even though English wraps taller.
+  // Design notes (this is the third attempt — the earlier top-anchor +
+  // suppress-counter version drifted badly on chart/table-heavy docs):
+  //   * POINTER-DRIVEN: only the pane the cursor is over drives the other.
+  //     One-way at a time → no feedback loop, so no guard/suppress counter
+  //     is needed at all (the guard was the source of the racy drift when
+  //     images finished loading mid-scroll and fired stray scroll events).
+  //   * CENTER-ANCHORED with a FRACTIONAL offset: align the paragraph at the
+  //     vertical center of the driving pane, and preserve how far *through*
+  //     that paragraph you are. Tall blocks (charts, big tables) that render
+  //     at different heights on each side then stay smoothly aligned instead
+  //     of snapping.
+  //   * rAF-THROTTLED: at most one alignment per frame.
   const origBody = useRef<HTMLDivElement | null>(null);
   const tranBody = useRef<HTMLDivElement | null>(null);
-  // Per-pane suppression counters: when we programmatically set a pane's
-  // scrollTop we bump its counter, and that pane's resulting scroll event
-  // decrements it and no-ops — so the mirror write never bounces back into an
-  // infinite loop. (Robust against the rAF-timing race a boolean guard has.)
-  const suppress = useRef({ orig: 0, tran: 0 });
+  const driver = useRef<"orig" | "tran" | null>(null);
+  const rafPending = useRef(false);
 
-  const syncFrom = useCallback(
-    (
-      src: HTMLDivElement | null,
-      dst: HTMLDivElement | null,
-      srcKey: "orig" | "tran",
-      dstKey: "orig" | "tran"
-    ) => {
-      if (!src || !dst) return;
-      if (suppress.current[srcKey] > 0) {
-        suppress.current[srcKey] -= 1;
-        return;
+  const alignFrom = useCallback((src: HTMLDivElement | null, dst: HTMLDivElement | null) => {
+    if (!src || !dst) return;
+    const srcRect = src.getBoundingClientRect();
+    const focusY = srcRect.top + srcRect.height / 2; // vertical center of the driving pane
+
+    // Find the paragraph spanning the center line, and how far through it we are.
+    let anchorIdx: number | null = null;
+    let frac = 0;
+    for (const el of Array.from(src.querySelectorAll<HTMLElement>("[data-pidx]"))) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom >= focusY && r.top <= focusY) {
+        anchorIdx = parseInt(el.getAttribute("data-pidx")!, 10);
+        frac = r.height > 0 ? (focusY - r.top) / r.height : 0;
+        break;
       }
-      const srcTop = src.getBoundingClientRect().top;
-      let anchorIdx: number | null = null;
-      let deltaAbove = 0;
-      for (const el of Array.from(src.querySelectorAll<HTMLElement>("[data-pidx]"))) {
-        const r = el.getBoundingClientRect();
-        if (r.bottom >= srcTop) {
-          anchorIdx = parseInt(el.getAttribute("data-pidx")!, 10);
-          deltaAbove = srcTop - r.top;
-          break;
-        }
+      // Fallback: first paragraph below the center line (gaps between blocks).
+      if (r.top > focusY) {
+        anchorIdx = parseInt(el.getAttribute("data-pidx")!, 10);
+        frac = 0;
+        break;
       }
-      if (anchorIdx === null) return;
-      const target = dst.querySelector<HTMLElement>(`[data-pidx="${anchorIdx}"]`);
-      if (!target) return;
-      const dstTop = dst.getBoundingClientRect().top;
-      const targetTop = target.getBoundingClientRect().top;
-      const maxScroll = dst.scrollHeight - dst.clientHeight;
-      const newScroll = Math.max(
-        0,
-        Math.min(maxScroll, dst.scrollTop + (targetTop - dstTop) - deltaAbove)
-      );
-      // Skip if effectively unchanged — avoids leaking a suppress count when
-      // no scroll event will actually fire.
-      if (Math.abs(newScroll - dst.scrollTop) < 1) return;
-      suppress.current[dstKey] += 1;
-      dst.scrollTop = newScroll;
+    }
+    if (anchorIdx === null) return;
+
+    const target = dst.querySelector<HTMLElement>(`[data-pidx="${anchorIdx}"]`);
+    if (!target) return;
+    const dstRect = dst.getBoundingClientRect();
+    const tRect = target.getBoundingClientRect();
+    // Put the same fractional point of the same paragraph on dst's center line.
+    const targetPointTop = tRect.top + frac * tRect.height;
+    const delta = targetPointTop - (dstRect.top + dstRect.height / 2);
+    const maxScroll = dst.scrollHeight - dst.clientHeight;
+    const next = Math.max(0, Math.min(maxScroll, dst.scrollTop + delta));
+    if (Math.abs(next - dst.scrollTop) > 0.5) dst.scrollTop = next;
+  }, []);
+
+  const onPaneScroll = useCallback(
+    (who: "orig" | "tran") => {
+      // Only the pane under the pointer drives; the mirrored pane's own scroll
+      // event is ignored because it isn't the driver. No suppression needed.
+      if (driver.current !== who) return;
+      if (rafPending.current) return;
+      rafPending.current = true;
+      requestAnimationFrame(() => {
+        rafPending.current = false;
+        if (who === "orig") alignFrom(origBody.current, tranBody.current);
+        else alignFrom(tranBody.current, origBody.current);
+      });
     },
-    []
+    [alignFrom]
   );
 
   const stepActive = (dir: 1 | -1) => {
@@ -326,7 +341,8 @@ export function ReviewView({
               onActivate={setActiveIdx}
               onHover={setHoverIdx}
               onBodyMount={(el) => (origBody.current = el)}
-              onScroll={() => syncFrom(origBody.current, tranBody.current, "orig", "tran")}
+              onEnter={() => (driver.current = "orig")}
+              onScroll={() => onPaneScroll("orig")}
             />
             <DocPane
               title="Translation"
@@ -341,7 +357,8 @@ export function ReviewView({
               onActivate={setActiveIdx}
               onHover={setHoverIdx}
               onBodyMount={(el) => (tranBody.current = el)}
-              onScroll={() => syncFrom(tranBody.current, origBody.current, "tran", "orig")}
+              onEnter={() => (driver.current = "tran")}
+              onScroll={() => onPaneScroll("tran")}
             />
           </div>
 

@@ -24,6 +24,7 @@ export function DocPane({
   onHover,
   onBodyMount,
   onScroll,
+  onEnter,
 }: {
   title: string;
   lang: string;
@@ -38,6 +39,7 @@ export function DocPane({
   onHover: (idx: number | null) => void;
   onBodyMount?: (el: HTMLDivElement | null) => void;
   onScroll?: () => void;
+  onEnter?: () => void;
 }) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const docRef = useRef<HTMLDivElement>(null);
@@ -188,6 +190,7 @@ export function DocPane({
       <div
         ref={bodyRef}
         onScroll={onScroll}
+        onMouseEnter={onEnter}
         className="relative max-h-[calc(100vh-250px)] overflow-y-auto px-4 py-3"
       >
         <div ref={docRef} className="docx-doc" dangerouslySetInnerHTML={{ __html: html }} />
