@@ -385,6 +385,66 @@ async def upload_document(
     }
 
 
+@app.get("/api/documents")
+def list_documents():
+    """Pipeline status for every raw document: what's landed, translating,
+    translated, or failed. Reads the bronze_documents Delta table (populated by
+    the watcher) and cross-references raw_documents/ so a just-uploaded file
+    that hasn't reached bronze yet shows as QUEUED rather than vanishing."""
+    rows: list[dict] = []
+    bronze_names: set[str] = set()
+
+    # Bronze status via the SQL warehouse (defensive: source_language column
+    # only exists after the first pipeline run on the updated watcher).
+    if delta_sync.enabled():
+        fqn = f"{delta_sync.DELTA_CATALOG}.{delta_sync.DELTA_SCHEMA}.bronze_documents"
+        for cols in (
+            "file_name, translation_status, target_language, source_language, "
+            "translation_started_at, translation_ended_at, translation_error",
+            # Fallback for pre-migration tables without source_language.
+            "file_name, translation_status, target_language, "
+            "translation_started_at, translation_ended_at, translation_error",
+        ):
+            try:
+                out = delta_sync._execute(
+                    f"SELECT {cols} FROM {fqn} ORDER BY first_seen_at DESC LIMIT 200"
+                )
+                data = (out.get("result") or {}).get("data_array") or []
+                has_src = "source_language" in cols
+                for r in data:
+                    name = r[0]
+                    bronze_names.add(name)
+                    if has_src:
+                        rows.append({
+                            "file_name": name, "status": r[1], "target_language": r[2],
+                            "source_language": r[3], "started_at": r[4],
+                            "ended_at": r[5], "error": r[6],
+                        })
+                    else:
+                        rows.append({
+                            "file_name": name, "status": r[1], "target_language": r[2],
+                            "source_language": None, "started_at": r[3],
+                            "ended_at": r[4], "error": r[5],
+                        })
+                break  # first query variant that succeeds wins
+            except Exception:
+                continue
+
+    # Raw files not yet in bronze → QUEUED (uploaded, waiting on the trigger).
+    try:
+        for f in volume.list_docx(config.RAW_DIR):
+            if f["name"] not in bronze_names:
+                rows.append({
+                    "file_name": f["name"], "status": "QUEUED", "target_language": None,
+                    "source_language": None, "started_at": None, "ended_at": None,
+                    "error": None,
+                })
+    except Exception:
+        pass
+
+    return {"documents": rows, "warehouse_configured": delta_sync.enabled()}
+
+
 @app.post("/api/pairs/{pair_id}/publish")
 def publish(pair_id: str):
     match = _resolve(pair_id)

@@ -70,6 +70,16 @@ export interface AppConfig {
   delta_sync_enabled: boolean;
 }
 
+export interface DocumentStatus {
+  file_name: string;
+  status: string; // QUEUED | TRANSLATING | TRANSLATED | FAILED_TRANSLATION
+  target_language: string | null;
+  source_language: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  error: string | null;
+}
+
 async function j<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -133,6 +143,9 @@ export const api = {
       j<{ ok: boolean; name: string; message: string; target_language: string }>
     );
   },
+
+  documents: () =>
+    fetch("/api/documents").then(j<{ documents: DocumentStatus[]; warehouse_configured: boolean }>),
 
   publish: (id: string) =>
     fetch(`/api/pairs/${encodeURIComponent(id)}/publish`, { method: "POST" }).then(

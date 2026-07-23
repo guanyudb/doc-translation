@@ -269,6 +269,18 @@ This runs the 4-step deploy in order:
 
 The app URL prints at the end. First boot takes ~30 seconds.
 
+> **⚠ Always re-run postdeploy after any `bundle deploy`.** The file-arrival
+> trigger on the translation pipeline is attached by **postdeploy** (via the
+> Jobs API), not by the bundle YAML — `resources/jobs/translation_pipeline.yml`
+> deliberately omits it to avoid a create-time race against the Volume. But
+> every `bundle deploy` re-applies the job from that YAML and **wipes the
+> trigger**. `./deploy.sh` always runs postdeploy (step 3) so the full flow is
+> safe. If you ever run `bundle deploy` on its own (e.g. a quick code push),
+> follow it with `bundle run -t <target> doc_translation_postdeploy_setup` or
+> uploads will land in `raw_documents/` with nothing listening. Symptom: files
+> appear in the Upload dialog's status list stuck on **queued** and never
+> start translating.
+
 ### Deploy (Workspace UI button)
 
 The "Deploy bundle" button **alone is not enough.** Apps validates secret resource bindings eagerly at app create/update time, so the bundle deploy will 404 unless the secret values already exist.
