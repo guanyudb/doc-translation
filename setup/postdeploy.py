@@ -429,6 +429,28 @@ _exec(f"""
     ) USING DELTA
 """)
 
+# Pre-create bronze_documents so the App SP can be granted SELECT here. The
+# watcher also CREATE-IF-NOT-EXISTS this table on its first run — but if the
+# app tries to read pipeline status before any translation has happened, the
+# table wouldn't exist and (more importantly) the SP wouldn't be granted on a
+# watcher-owned table. Creating it here with the full schema + the SELECT grant
+# makes the /api/documents status view work from the first deploy.
+_exec(f"""
+    CREATE TABLE IF NOT EXISTS {DELTA_FQN}.bronze_documents (
+        document_id STRING, file_name STRING, input_path STRING,
+        input_hash_sha256 STRING, input_size_bytes BIGINT,
+        landed_at TIMESTAMP, first_seen_at TIMESTAMP,
+        translation_status STRING, translation_started_at TIMESTAMP,
+        translation_ended_at TIMESTAMP, translation_output_path STRING,
+        translation_error STRING, translator_run_id STRING,
+        model_endpoint STRING, target_language STRING, source_language STRING
+    ) USING DELTA
+    TBLPROPERTIES (
+        delta.deletedFileRetentionDuration = 'interval 2557 days',
+        delta.logRetentionDuration         = 'interval 2557 days'
+    )
+""")
+
 # Grant the App SP read/write on the Delta tables AND on the UC Volume.
 # Volume names with hyphens need backtick quoting in SQL.
 volume_fqn = f"{uc_catalog}.{uc_schema}.`{uc_volume_name}`"
@@ -439,6 +461,9 @@ for stmt in [
     f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.golden_publications TO `{sp_uuid}`",
     f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.silver_review_snapshots TO `{sp_uuid}`",
     f"GRANT MODIFY, SELECT ON TABLE {DELTA_FQN}.translation_glossary TO `{sp_uuid}`",
+    # bronze_documents is written by the watcher; the app only reads it for the
+    # pipeline status view.
+    f"GRANT SELECT ON TABLE {DELTA_FQN}.bronze_documents TO `{sp_uuid}`",
     # The App reads .docx from raw_documents/ + translated_inplace/ and writes
     # to translated_reviewed/ + golden/. Both READ + WRITE are needed.
     f"GRANT READ VOLUME, WRITE VOLUME ON VOLUME {volume_fqn} TO `{sp_uuid}`",
