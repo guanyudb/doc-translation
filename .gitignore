@@ -31,7 +31,13 @@ build/
 dist/
 *.egg-info/
 
-# Databricks CLI sync metadata
+# Frontend deps (rebuilt via ./build.sh). The built output in static/ IS
+# committed so the bundle can ship it without a Node runtime.
+frontend/node_modules/
+frontend/.vite/
+
+# Databricks CLI sync metadata. variable-overrides.json holds per-workspace
+# values + identities → never commit.
 .databricks/
 
 # Stale HTML/Pandoc export of DATABRICKS_COMPONENTS.md (the .md is canonical)

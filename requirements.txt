@@ -1,5 +1,11 @@
-streamlit>=1.40
+# React SPA is served by FastAPI (server_api.py). The legacy Streamlit app
+# (legacy/streamlit_app.py) still imports streamlit; it's kept for reference /
+# rollback and pinned here so `streamlit run legacy/streamlit_app.py` works.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.9
 psycopg[binary,pool]>=3.2
 databricks-sdk>=0.40
 mammoth>=1.8
 lxml>=5.3
+streamlit>=1.40

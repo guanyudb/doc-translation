@@ -1,16 +1,55 @@
+"""Workspace-portable configuration.
+
+Two Lakebase modes are supported:
+
+  * **Project (Autoscaling)** — the modern path; new workspaces. Set
+    `LAKEBASE_PROJECT` + `LAKEBASE_BRANCH` (default `main`). Apps' `postgres:`
+    resource binding auto-injects PGHOST / PGPORT / PGDATABASE / PGUSER /
+    PGSSLMODE; `server/db.py` mints an OAuth JWT per-connection via
+    `/api/2.0/postgres/credentials`.
+
+  * **Provisioned (legacy)** — pre-2026-03-12 workspaces with an existing
+    instance. Set `LAKEBASE_INSTANCE` (the instance name). The `database:`
+    binding auto-injects PG* env vars; `server/db.py` mints credentials via
+    `WorkspaceClient.database.generate_database_credential`.
+
+Detection is explicit: presence of `LAKEBASE_PROJECT` wins, else fall back
+to `LAKEBASE_INSTANCE`. Exactly one mode must be set or boot will refuse.
+"""
 import os
 from databricks.sdk import WorkspaceClient
 
 IS_DATABRICKS_APP = bool(os.environ.get("DATABRICKS_APP_NAME"))
 
-PGHOST = os.environ["PGHOST"]
-PGPORT = os.environ.get("PGPORT", "5432")
+# Postgres connection — host etc. are auto-injected by the Apps binding.
+PGHOST     = os.environ["PGHOST"]
+PGPORT     = os.environ.get("PGPORT", "5432")
 PGDATABASE = os.environ.get("PGDATABASE", "databricks_postgres")
-PGSSLMODE = os.environ.get("PGSSLMODE", "require")
-PGSCHEMA = os.environ.get("PGSCHEMA", "doc_translation")
-LAKEBASE_INSTANCE = os.environ["LAKEBASE_INSTANCE"]
-VOLUME_ROOT = os.environ["VOLUME_ROOT"].rstrip("/")
-RAW_DIR = f"{VOLUME_ROOT}/raw_documents"
+PGSSLMODE  = os.environ.get("PGSSLMODE", "require")
+PGSCHEMA   = os.environ.get("PGSCHEMA", "doc_translation")
+
+# Lakebase mode — Project takes precedence if both are somehow set. Empty
+# strings (which secrets-backed env vars produce when the customer left a
+# field blank) are normalized to None.
+def _maybe(name: str) -> str | None:
+    v = (os.environ.get(name) or "").strip()
+    return v or None
+
+LAKEBASE_PROJECT  = _maybe("LAKEBASE_PROJECT")
+LAKEBASE_BRANCH   = _maybe("LAKEBASE_BRANCH") or "main"
+LAKEBASE_INSTANCE = _maybe("LAKEBASE_INSTANCE")  # Provisioned fallback
+
+if not LAKEBASE_PROJECT and not LAKEBASE_INSTANCE:
+    raise RuntimeError(
+        "Lakebase not configured. Set LAKEBASE_PROJECT + LAKEBASE_BRANCH "
+        "for a Lakebase Project, or LAKEBASE_INSTANCE for a legacy "
+        "Provisioned instance."
+    )
+
+USE_LAKEBASE_PROJECT = LAKEBASE_PROJECT is not None
+
+VOLUME_ROOT    = os.environ["VOLUME_ROOT"].rstrip("/")
+RAW_DIR        = f"{VOLUME_ROOT}/raw_documents"
 TRANSLATED_DIR = f"{VOLUME_ROOT}/translated_inplace"
 
 

@@ -1,30 +1,47 @@
+# Databricks Apps runtime config.
+#
+# IMPORTANT (deploy guide gotcha #1): `resources/app.yml` only makes bindings
+# AVAILABLE to the SP. Apps still won't expose them as env vars unless they're
+# declared here with `valueFrom: <resource name>`.
+#
+# This file is COMMITTED VERBATIM — DAB does NOT substitute ${var.X} inside
+# user-content files like app.yaml. Workspace-specific values therefore can't
+# live in `value:`; they have to come from resource bindings. We use secrets
+# seeded by `deploy.sh` (step 2) for plain config values, and direct bindings
+# for the Postgres + SQL warehouse.
+
 command:
-  - "streamlit"
-  - "run"
-  - "app.py"
-  - "--server.port=8000"
-  - "--server.address=0.0.0.0"
-  - "--server.headless=true"
-  - "--browser.gatherUsageStats=false"
+  - "uvicorn"
+  - "server_api:app"
+  - "--host"
+  - "0.0.0.0"
+  - "--port"
+  - "8000"
 
 env:
-  - name: PGHOST
-    value: 'instance-6b59171b-cee8-4acc-9209-6c848ffbfbfe.database.cloud.databricks.com'
-  - name: PGPORT
-    value: '5432'
-  - name: PGDATABASE
-    value: 'databricks_postgres'
-  - name: PGSSLMODE
-    value: 'require'
+  # ---- Lakebase Postgres connection (mostly auto-injected) ----
+  #
+  # PGHOST, PGPORT, PGDATABASE, PGUSER, PGSSLMODE are injected automatically
+  # by the `postgres:` (or legacy `database:`) resource binding in
+  # resources/app.yml. We don't redeclare them here.
   - name: PGSCHEMA
-    value: 'doc_translation'
+    valueFrom: pg_schema
+
+  - name: LAKEBASE_PROJECT
+    valueFrom: lakebase_project
+  - name: LAKEBASE_BRANCH
+    valueFrom: lakebase_branch
   - name: LAKEBASE_INSTANCE
-    value: 'lakebasepoc'
+    valueFrom: lakebase_instance
+
+  # ---- UC Volume for documents ----
   - name: VOLUME_ROOT
-    value: '/Volumes/hls_amer_catalog/guanyu_chen/doc-translation'
-  - name: DATABRICKS_WAREHOUSE_ID
-    value: '68d156b1d8b5502b'
+    valueFrom: volume_root
+
+  # ---- Delta long-term archive ----
   - name: DELTA_CATALOG
-    value: 'hls_amer_catalog'
+    valueFrom: delta_catalog
   - name: DELTA_SCHEMA
-    value: 'guanyu_chen'
+    valueFrom: delta_schema
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: warehouse

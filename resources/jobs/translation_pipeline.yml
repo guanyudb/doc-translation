@@ -1,0 +1,82 @@
+# Auto-translation pipeline — file-arrival-triggered job.
+#
+# When a new .docx lands in the raw_documents/ Volume folder, the trigger
+# fires (after a 60s debounce so a batch upload doesn't kick N runs). The
+# watcher notebook scans for unpaired files, audits each landing in
+# bronze_documents, and invokes the inner DOCX translation notebook
+# once per file via dbutils.notebook.run.
+#
+# Run-as: deploying user (FMAPI calls, Volume + Lakebase + Delta writes
+# all go through their identity, not the App SP).
+
+resources:
+  jobs:
+    doc_translation_pipeline:
+      name:        doc-translation · auto-translate pipeline
+      description: |
+        File-arrival trigger on raw_documents/. Scans for unpaired DOCX
+        files, calls the FMAPI translation notebook once per file, writes
+        the output to translated_inplace/ and a bronze_documents audit row.
+
+      tasks:
+        - task_key: watch_and_translate
+          notebook_task:
+            notebook_path: ../../setup/auto_translate_watcher.py
+            source: WORKSPACE
+            base_parameters:
+              raw_dir:                  /Volumes/${var.uc_catalog}/${var.uc_schema}/${var.uc_volume_name}/raw_documents
+              translated_dir:           /Volumes/${var.uc_catalog}/${var.uc_schema}/${var.uc_volume_name}/translated_inplace
+              target_language:          ${var.translation_target_language}
+              model_endpoint:           ${var.translation_model_endpoint}
+              max_workers:              ${var.translation_max_workers}
+              max_pages:                ${var.translation_max_pages}
+              # The inner translator notebook lives in the same bundle.
+              # `${workspace.file_path}` resolves to the bundle's files dir
+              # in the target workspace at deploy time. The notebook file
+              # path (no .py extension at workspace level) is appended.
+              translator_notebook_path: ${workspace.file_path}/setup/docx_inplace_translation
+              bronze_catalog:           ${var.uc_catalog}
+              bronze_schema:            ${var.uc_schema}
+              # Delta mirror of the glossary; the inner notebook reads it to
+              # build the Aho-Corasick prompt-injection automaton. Empty-string
+              # here would disable injection.
+              glossary_delta_table:     ${var.uc_catalog}.${var.uc_schema}.translation_glossary
+          # Pin a modern serverless env so the databricks-sdk is recent enough
+          # to expose `serving_endpoints.get_open_ai_client()`. Env v1 (default
+          # on some workspaces) ships an SDK that pre-dates that helper. The
+          # child notebook spawned by dbutils.notebook.run inherits this env.
+          environment_key: docx_translation_env
+          timeout_seconds: 14400
+          max_retries: 1
+          min_retry_interval_millis: 60000
+
+      environments:
+        - environment_key: docx_translation_env
+          spec:
+            # v5 confirmed working in fe-vm-hls-amer; v1 (e2FE default) has
+            # too-old databricks-sdk and lacks serving_endpoints.get_open_ai_client().
+            client: "5"
+            dependencies:
+              - "lxml"
+              - "langdetect"
+              - "pyahocorasick"
+              - "databricks-sdk>=0.30.0"
+              - "openai"
+              - "pandas"
+
+      # NOTE: the file-arrival trigger is intentionally NOT defined here.
+      # Apps' Jobs API validates the trigger URL against an existing UC
+      # Volume + subdirectory at create time. Bundle deploy creates the
+      # volume but not its subdirectories, so adding the trigger inline
+      # races with directory creation. Postdeploy adds the trigger via
+      # Jobs API update AFTER it creates the subdirs.
+
+      run_as:
+        user_name: ${var.workspace_user_email}
+
+      max_concurrent_runs: 2
+      timeout_seconds:     21600
+
+      tags:
+        app:   doc-translation
+        owner: ${var.workspace_user_email}
