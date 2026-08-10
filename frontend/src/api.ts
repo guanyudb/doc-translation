@@ -135,12 +135,19 @@ export const api = {
       body: JSON.stringify({ page }),
     }).then(j<{ certified: number; page: number }>),
 
-  upload: (file: File, targetLanguage: string) => {
+  upload: (file: File, targetLanguage: string, onConflict: "rename" | "replace" = "rename") => {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("target_language", targetLanguage);
+    fd.append("on_conflict", onConflict);
     return fetch("/api/upload", { method: "POST", body: fd }).then(
-      j<{ ok: boolean; name: string; message: string; target_language: string }>
+      j<{
+        ok: boolean;
+        name: string;
+        message: string;
+        target_language: string;
+        renamed_from: string | null;
+      }>
     );
   },
 

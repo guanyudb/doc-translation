@@ -107,13 +107,18 @@ export function UploadDialog({
     setBusy(false);
   };
 
-  const submit = async () => {
+  // Does the picked filename already exist in the pipeline? pair_id is derived
+  // from the filename stem, so re-using a name would otherwise inherit the
+  // existing document's review state — we surface the choice instead.
+  const collision = file ? docs.some((d) => d.file_name === file.name) : false;
+
+  const submit = async (onConflict: "rename" | "replace" = "rename") => {
     if (!file) return;
     setBusy(true);
     setError(null);
     setMsg(null);
     try {
-      const r = await api.upload(file, target);
+      const r = await api.upload(file, target, onConflict);
       setMsg(r.message);
       setFile(null);
       onUploaded();
@@ -178,6 +183,16 @@ export function UploadDialog({
             />
           </div>
 
+          {collision && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
+              <b>{file?.name}</b> already exists in the pipeline. Because a document's
+              review state is keyed to its filename,{" "}
+              <b>Replace existing</b> will overwrite it and clear its certifications,
+              edits, and comments. <b>Upload as a copy</b> keeps both by adding a
+              numbered suffix.
+            </div>
+          )}
+
           <div>
             <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Target language
@@ -224,14 +239,27 @@ export function UploadDialog({
           )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="gap-2">
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
             Close
           </Button>
-          <Button disabled={!file || busy} onClick={submit}>
-            {busy ? <Loader2 className="animate-spin" /> : <UploadCloud />}
-            Upload &amp; translate
-          </Button>
+          {collision ? (
+            <>
+              <Button variant="outline" disabled={busy} onClick={() => submit("replace")}>
+                {busy ? <Loader2 className="animate-spin" /> : null}
+                Replace existing
+              </Button>
+              <Button disabled={busy} onClick={() => submit("rename")}>
+                {busy ? <Loader2 className="animate-spin" /> : <UploadCloud />}
+                Upload as a copy
+              </Button>
+            </>
+          ) : (
+            <Button disabled={!file || busy} onClick={() => submit("rename")}>
+              {busy ? <Loader2 className="animate-spin" /> : <UploadCloud />}
+              Upload &amp; translate
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

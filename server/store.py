@@ -988,3 +988,31 @@ def get_distinct_reviewers(pair_id: str) -> list[str]:
                 WHERE pair_id = %s AND actor_type = 'human'
             """, (pair_id,))
             return sorted(r[0] for r in cur.fetchall())
+
+
+def delete_pair_state(pair_id: str) -> dict[str, int]:
+    """Drop all Lakebase review state for `pair_id`. Returns rows deleted per
+    table.
+
+    Used when a document is re-uploaded under a name that already exists: the
+    stale certifications/edits describe the OLD content, so carrying them over
+    to new content would be worse than losing them.
+
+    Delete order matters — `golden_publications` references review_pairs
+    WITHOUT `ON DELETE CASCADE`, so it has to go first or the review_pairs
+    delete raises a FK violation. review_feedback / review_edit_history /
+    paragraph_confidence all cascade from review_pairs. audit_events has no FK
+    (pair_id is a plain column) so it's deleted explicitly.
+
+    NOTE: this does not touch the Delta mirror — that archive is intentionally
+    append-only and is the compliance record."""
+    s = config.PGSCHEMA
+    counts: dict[str, int] = {}
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            for tbl in ("golden_publications", "review_publish_log",
+                        "audit_events", "review_pairs"):
+                cur.execute(f"DELETE FROM {s}.{tbl} WHERE pair_id = %s", (pair_id,))
+                counts[tbl] = cur.rowcount
+        conn.commit()
+    return counts

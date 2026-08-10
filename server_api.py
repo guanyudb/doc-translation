@@ -351,6 +351,7 @@ def certify_page(pair_id: str, page: int = Body(..., embed=True)):
 async def upload_document(
     file: UploadFile = File(...),
     target_language: str = Form("English"),
+    on_conflict: str = Form("rename"),  # "rename" (default) | "replace"
 ):
     """Accept a source .docx, write it to raw_documents/. The file-arrival
     trigger on that folder kicks off the translation pipeline; the resulting
@@ -368,6 +369,32 @@ async def upload_document(
     if not data:
         raise HTTPException(400, "empty file")
 
+    # ---- Same-name collision handling -------------------------------------
+    # pair_id is derived from the filename stem (volume.auto_pair), so an
+    # upload that reuses a name would silently overwrite the source AND inherit
+    # the existing pair's review state — certifications and edits made against
+    # different content. That's a correctness hazard, not just confusing, so we
+    # refuse by default and require an explicit choice:
+    #   * rename (default)  — auto-suffix to keep both documents distinct
+    #   * replace           — caller passes ?on_conflict=replace, knowing the
+    #                         existing review state applies to new content
+    stem = name[: -len(".docx")]
+    existing = {f["name"] for f in volume.list_docx(config.RAW_DIR)}
+    renamed_from = None
+    if name in existing:
+        if on_conflict == "replace":
+            # Caller explicitly asked to overwrite. Drop the stale review state
+            # so certifications don't carry over to different content.
+            try:
+                store.delete_pair_state(stem)
+            except Exception:
+                pass
+        else:
+            n = 2
+            while f"{stem}_{n}.docx" in existing:
+                n += 1
+            renamed_from, name = name, f"{stem}_{n}.docx"
+
     dest = f"{config.RAW_DIR}/{name}"
     volume.upload_docx(dest, data)
     # Sidecar carrying the requested target language for this document.
@@ -375,13 +402,29 @@ async def upload_document(
         volume.upload_docx(f"{config.RAW_DIR}/{name}.lang", target_language.encode("utf-8"))
     except Exception:
         pass
+
+    if renamed_from:
+        message = (
+            f"A document named {renamed_from} already exists, so this was uploaded "
+            f"as {name} to keep them separate. Translation runs on file arrival; "
+            f"it will appear in the list once it completes (usually 1–3 min)."
+        )
+    elif on_conflict == "replace":
+        message = (
+            f"Replaced {name} and cleared its previous review state. Translation "
+            f"runs on file arrival; it will reappear once it completes."
+        )
+    else:
+        message = ("Uploaded. Translation runs on file arrival; the pair will "
+                   "appear in the list once it completes (usually 1–3 min).")
+
     return {
         "ok": True,
         "name": name,
         "path": dest,
         "target_language": target_language,
-        "message": "Uploaded. Translation runs on file arrival; the pair will "
-                   "appear in the list once it completes (usually 1–3 min).",
+        "renamed_from": renamed_from,
+        "message": message,
     }
 
 
