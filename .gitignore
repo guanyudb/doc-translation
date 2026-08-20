@@ -17,6 +17,7 @@ env/
 .idea/
 .vscode/
 *.swp
+.isaac
 
 # Streamlit secrets
 .streamlit/secrets.toml
@@ -25,6 +26,7 @@ env/
 .env
 .env.*
 !.env.example
+uv.lock
 
 # Build artifacts
 build/
