@@ -22,6 +22,7 @@ The Streamlit app this replaces is preserved at legacy/streamlit_app.py.
 """
 from __future__ import annotations
 
+import json
 import os
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Body, Request, Form
@@ -31,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from server import config, volume, store, docx_render, auth, delta_sync
 from server import confidence as conf_mod
 from server import glossary as glossary_mod
+from server import prompts as prompts_mod
 from server.db import pool
 
 app = FastAPI(title="Doc Translation Review")
@@ -52,6 +54,13 @@ def _startup() -> None:
     # Open the psycopg pool once. Safe if already open (idempotent proxy).
     try:
         pool.open(wait=True, timeout=30.0)
+    except Exception:
+        pass
+    # Seed the built-in default prompt if the library is empty. Idempotent; the
+    # app SP has INSERT so it can self-seed once the table exists. Best-effort —
+    # never block boot on it.
+    try:
+        prompts_mod.seed_default_prompt()
     except Exception:
         pass
 
@@ -351,14 +360,18 @@ def certify_page(pair_id: str, page: int = Body(..., embed=True)):
 async def upload_document(
     file: UploadFile = File(...),
     target_language: str = Form("English"),
+    prompt_id: int = Form(...),
 ):
     """Accept a source .docx, write it to raw_documents/. The file-arrival
     trigger on that folder kicks off the translation pipeline; the resulting
     pair shows up in /api/pairs once translation completes.
 
-    target_language is recorded as a per-file sidecar (.lang) so the pipeline
-    (and the review UI) know the intended target without changing the bundle
-    default. Source language is auto-detected downstream."""
+    Two per-file sidecars are written alongside the .docx so the pipeline picks
+    up the reviewer's choices without changing the bundle default:
+      * `.lang`   — the target language (source language is auto-detected).
+      * `.prompt` — a JSON snapshot {prompt_id, name, body} of the chosen prompt.
+        The full body is FROZEN here so editing/deleting the prompt later never
+        changes what this document was translated with."""
     name = (file.filename or "").strip()
     if not name.lower().endswith(".docx"):
         raise HTTPException(400, "only .docx files are supported")
@@ -368,18 +381,33 @@ async def upload_document(
     if not data:
         raise HTTPException(400, "empty file")
 
+    # Prompt selection is required (enforced in the UI too). Resolve + snapshot.
+    prompt = prompts_mod.get_prompt(prompt_id)
+    if prompt is None:
+        raise HTTPException(400, f"unknown prompt_id: {prompt_id}")
+
     dest = f"{config.RAW_DIR}/{name}"
-    volume.upload_docx(dest, data)
-    # Sidecar carrying the requested target language for this document.
+    # Write the sidecars FIRST so they're already present when the .docx lands
+    # and the file-arrival trigger fires. The watcher only scans .docx files.
     try:
         volume.upload_docx(f"{config.RAW_DIR}/{name}.lang", target_language.encode("utf-8"))
     except Exception:
         pass
+    snapshot = json.dumps({
+        "prompt_id": prompt["prompt_id"],
+        "name": prompt["name"],
+        "body": prompt["body"],
+    })
+    volume.upload_docx(f"{config.RAW_DIR}/{name}.prompt", snapshot.encode("utf-8"))
+    # The document last — its arrival is what triggers the pipeline.
+    volume.upload_docx(dest, data)
     return {
         "ok": True,
         "name": name,
         "path": dest,
         "target_language": target_language,
+        "prompt_id": prompt["prompt_id"],
+        "prompt_name": prompt["name"],
         "message": "Uploaded. Translation runs on file arrival; the pair will "
                    "appear in the list once it completes (usually 1–3 min).",
     }
@@ -586,6 +614,99 @@ def glossary_mine():
 def glossary_sync():
     res = delta_sync.sync_glossary_to_delta()
     return {"rows": res.get("rows", 0), "skipped": bool(res.get("skipped"))}
+
+
+# ---------------------------------------------------------------------------
+# Translation prompts ("Instructions") — full CRUD over named system prompts.
+# One is chosen per document at upload time (snapshotted into a .prompt sidecar).
+# ---------------------------------------------------------------------------
+
+def _prompt_out(p: dict) -> dict:
+    return {
+        "prompt_id": p["prompt_id"],
+        "name": p["name"],
+        "body": p["body"],
+        "description": p.get("description"),
+        "created_by": p.get("created_by"),
+        "created_at": str(p["created_at"]) if p.get("created_at") else None,
+        "updated_by": p.get("updated_by"),
+        "updated_at": str(p["updated_at"]) if p.get("updated_at") else None,
+    }
+
+
+@app.get("/api/prompts")
+def prompts_list():
+    return [_prompt_out(p) for p in prompts_mod.list_prompts()]
+
+
+@app.get("/api/prompts/template")
+def prompts_template():
+    """The built-in default prompt text — the editor pre-fills new prompts with
+    it (seeded-editable) and offers a 'reset to default template' action."""
+    return {"body": prompts_mod.DEFAULT_PROMPT_BODY}
+
+
+@app.get("/api/prompts/{prompt_id}")
+def prompts_get(prompt_id: int):
+    p = prompts_mod.get_prompt(prompt_id)
+    if p is None:
+        raise HTTPException(404, "prompt not found")
+    return _prompt_out(p)
+
+
+@app.post("/api/prompts")
+def prompts_create(
+    name: str = Body(..., embed=True),
+    body: str = Body(..., embed=True),
+    description: str | None = Body(None, embed=True),
+):
+    try:
+        p = prompts_mod.create_prompt(
+            name=name, body=body, description=description, actor=auth.reviewer())
+    except prompts_mod.DuplicateNameError:
+        raise HTTPException(409, f"a prompt named '{name.strip()}' already exists")
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    return _prompt_out(p)
+
+
+@app.put("/api/prompts/{prompt_id}")
+def prompts_update(
+    prompt_id: int,
+    name: str = Body(..., embed=True),
+    body: str = Body(..., embed=True),
+    description: str | None = Body(None, embed=True),
+):
+    try:
+        p = prompts_mod.update_prompt(
+            prompt_id, name=name, body=body, description=description, actor=auth.reviewer())
+    except prompts_mod.DuplicateNameError:
+        raise HTTPException(409, f"a prompt named '{name.strip()}' already exists")
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    if p is None:
+        raise HTTPException(404, "prompt not found")
+    return _prompt_out(p)
+
+
+@app.delete("/api/prompts/{prompt_id}")
+def prompts_delete(prompt_id: int):
+    if not prompts_mod.delete_prompt(prompt_id, actor=auth.reviewer()):
+        raise HTTPException(404, "prompt not found")
+    return {"ok": True}
+
+
+@app.post("/api/prompts/{prompt_id}/clone")
+def prompts_clone(prompt_id: int, name: str | None = Body(None, embed=True)):
+    try:
+        p = prompts_mod.clone_prompt(prompt_id, new_name=name, actor=auth.reviewer())
+    except prompts_mod.DuplicateNameError:
+        raise HTTPException(409, f"a prompt named '{(name or '').strip()}' already exists")
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    if p is None:
+        raise HTTPException(404, "prompt not found")
+    return _prompt_out(p)
 
 
 # ---------------------------------------------------------------------------

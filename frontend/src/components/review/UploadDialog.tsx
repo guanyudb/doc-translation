@@ -11,7 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { api, DocumentStatus } from "@/api";
+import { api, DocumentStatus, Prompt } from "@/api";
 
 function StatusRow({ d }: { d: DocumentStatus }) {
   const map: Record<string, { icon: JSX.Element; cls: string; label: string }> = {
@@ -78,7 +78,22 @@ export function UploadDialog({
   const [msg, setMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [docs, setDocs] = useState<DocumentStatus[]>([]);
+  const [prompts, setPrompts] = useState<Prompt[]>([]);
+  const [promptId, setPromptId] = useState<number | "">("");
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Prompt selection is required. Load the library when the dialog opens; if
+  // there's exactly one prompt, pre-select it as a convenience.
+  useEffect(() => {
+    if (!open) return;
+    api
+      .prompts()
+      .then((ps) => {
+        setPrompts(ps);
+        setPromptId((cur) => (cur === "" && ps.length === 1 ? ps[0].prompt_id : cur));
+      })
+      .catch(() => setPrompts([]));
+  }, [open]);
 
   // Poll pipeline status while the dialog is open so the user sees their
   // upload move queued → translating → translated without leaving the dialog.
@@ -108,12 +123,12 @@ export function UploadDialog({
   };
 
   const submit = async () => {
-    if (!file) return;
+    if (!file || promptId === "") return;
     setBusy(true);
     setError(null);
     setMsg(null);
     try {
-      const r = await api.upload(file, target);
+      const r = await api.upload(file, target, promptId);
       setMsg(r.message);
       setFile(null);
       onUploaded();
@@ -180,6 +195,28 @@ export function UploadDialog({
 
           <div>
             <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Translation prompt <span className="text-destructive">*</span>
+            </label>
+            <Select
+              value={promptId === "" ? "" : String(promptId)}
+              onChange={(e) => setPromptId(e.target.value === "" ? "" : Number(e.target.value))}
+            >
+              <option value="">— select a prompt —</option>
+              {prompts.map((p) => (
+                <option key={p.prompt_id} value={String(p.prompt_id)}>
+                  {p.name}
+                </option>
+              ))}
+            </Select>
+            {prompts.length === 0 && (
+              <p className="mt-1 text-[11px] text-amber-600">
+                No prompts available. Create one in the Instructions tab first.
+              </p>
+            )}
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Target language
             </label>
             <Select value={target} onChange={(e) => setTarget(e.target.value)}>
@@ -228,7 +265,7 @@ export function UploadDialog({
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
             Close
           </Button>
-          <Button disabled={!file || busy} onClick={submit}>
+          <Button disabled={!file || promptId === "" || busy} onClick={submit}>
             {busy ? <Loader2 className="animate-spin" /> : <UploadCloud />}
             Upload &amp; translate
           </Button>

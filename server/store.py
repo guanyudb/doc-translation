@@ -226,6 +226,23 @@ def ensure_schema() -> None:
                 CREATE INDEX IF NOT EXISTS translation_glossary_lookup_idx
                 ON {s}.translation_glossary (source_lang, target_lang, approved, occurrences DESC)
             """)
+
+            # ---- translation_prompts: named system prompts the reviewer picks
+            #      from at upload time. The chosen prompt's text is frozen with
+            #      the document (a `.prompt` sidecar), so this table is not read
+            #      by the pipeline — see server/prompts.py.
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {s}.translation_prompts (
+                    prompt_id    BIGSERIAL PRIMARY KEY,
+                    name         TEXT NOT NULL UNIQUE,
+                    body         TEXT NOT NULL,
+                    description  TEXT,
+                    created_by   TEXT,
+                    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_by   TEXT,
+                    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
         conn.commit()
 
 
@@ -249,6 +266,10 @@ class EventType:
     GOLD_PROMOTION_FAILED        = "GOLD_PROMOTION_FAILED"
     INVALID_WRITE_BLOCKED        = "INVALID_WRITE_BLOCKED"
     LIFECYCLE_TRANSITIONED       = "LIFECYCLE_TRANSITIONED"
+    PROMPT_CREATED               = "PROMPT_CREATED"
+    PROMPT_UPDATED               = "PROMPT_UPDATED"
+    PROMPT_DELETED               = "PROMPT_DELETED"
+    PROMPT_CLONED                = "PROMPT_CLONED"
 
 
 def _emit_audit(cur, *, pair_id: str | None, event_type: str, actor: str,

@@ -3,6 +3,7 @@ import { ThemeProvider } from "@/components/apx/theme-provider";
 import { Navbar, Tab } from "@/components/apx/navbar";
 import { ReviewView } from "@/components/review/ReviewView";
 import { GlossaryView } from "@/components/glossary/GlossaryView";
+import { InstructionsView } from "@/components/instructions/InstructionsView";
 import { AuditView } from "@/components/audit/AuditView";
 import { api, AppConfig } from "@/api";
 
@@ -44,6 +45,7 @@ export default function App() {
             />
           )}
           {tab === "glossary" && <GlossaryView deltaSyncEnabled={cfg?.delta_sync_enabled ?? false} />}
+          {tab === "instructions" && <InstructionsView />}
           {tab === "audit" && <AuditView pairId={activePair} />}
         </main>
       </div>
