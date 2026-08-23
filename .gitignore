@@ -38,6 +38,9 @@ dist/
 frontend/node_modules/
 frontend/.vite/
 
+# customer custom images
+frontend/public/*.png
+
 # Databricks CLI sync metadata. variable-overrides.json holds per-workspace
 # values + identities → never commit.
 .databricks/

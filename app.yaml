@@ -45,3 +45,11 @@ env:
     valueFrom: delta_schema
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: warehouse
+
+  # ---- Deploy-time branding (optional; blank → default icon + title) ----
+  - name: APP_TITLE
+    valueFrom: app_title
+  - name: APP_LOGO_URL
+    valueFrom: app_logo_url
+  - name: APP_LOGO_ALT
+    valueFrom: app_logo_alt

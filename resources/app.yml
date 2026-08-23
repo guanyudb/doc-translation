@@ -101,3 +101,19 @@ resources:
             scope:      ${var.secret_scope}
             key:        delta_schema
             permission: READ
+        # ---- Deploy-time branding (optional; blank → default icon + title) ---
+        - name: app_title
+          secret:
+            scope:      ${var.secret_scope}
+            key:        app_title
+            permission: READ
+        - name: app_logo_url
+          secret:
+            scope:      ${var.secret_scope}
+            key:        app_logo_url
+            permission: READ
+        - name: app_logo_alt
+          secret:
+            scope:      ${var.secret_scope}
+            key:        app_logo_alt
+            permission: READ

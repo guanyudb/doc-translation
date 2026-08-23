@@ -62,6 +62,33 @@ VOLUME_ROOT    = os.environ["VOLUME_ROOT"].rstrip("/")
 RAW_DIR        = f"{VOLUME_ROOT}/raw_documents"
 TRANSLATED_DIR = f"{VOLUME_ROOT}/translated_inplace"
 
+# Deploy-time branding (all optional). Customers set these via the secret scope
+# (see deploy.sh / resources/app.yml / app.yaml). Unset — including the " "
+# placeholder deploy.sh writes for blank values — falls back to the defaults:
+# the built-in lucide icon and the "Doc Translation Review" title.
+APP_TITLE    = _maybe("APP_TITLE") or "Doc Translation Review"
+APP_LOGO_URL = _maybe("APP_LOGO_URL")  # e.g. "/brand-logo.png"; None → lucide icon
+APP_LOGO_ALT = _maybe("APP_LOGO_ALT")  # image label / alt text; None → falls back to title
+
+
+def _maybe_int(name: str) -> int | None:
+    """Positive integer from an optional env var, else None (unset / blank /
+    non-numeric / non-positive)."""
+    v = _maybe(name)
+    if v is None:
+        return None
+    try:
+        n = int(v)
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
+# Optional logo dimensions in CSS pixels. When set, they're applied to the
+# <img>; when unset (either), the logo renders at its natural size, unconstrained.
+APP_LOGO_WIDTH  = _maybe_int("APP_LOGO_WIDTH")
+APP_LOGO_HEIGHT = _maybe_int("APP_LOGO_HEIGHT")
+
 
 def get_workspace_client() -> WorkspaceClient:
     if IS_DATABRICKS_APP:

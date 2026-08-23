@@ -82,6 +82,9 @@ pairs = [
     ("volume_root",       f"/Volumes/{uc}/{sc}/{vn}"),
     ("delta_catalog",     uc),
     ("delta_schema",      sc),
+    ("app_title",         d.get("app_title","Doc Translation Review")),
+    ("app_logo_url",      d.get("app_logo_url","")),
+    ("app_logo_alt",      d.get("app_logo_alt","")),
 ]
 for k, v in pairs:
     print(f"{k}={v}")'

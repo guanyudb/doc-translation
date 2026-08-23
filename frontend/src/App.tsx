@@ -17,12 +17,22 @@ export default function App() {
     api.config().then(setCfg).catch(() => setCfg(null));
   }, []);
 
+  // Keep the browser tab title in sync with the configured app title.
+  useEffect(() => {
+    if (cfg?.title) document.title = cfg.title;
+  }, [cfg?.title]);
+
   return (
     <ThemeProvider defaultTheme="system" storageKey="doc-translation-theme">
       <div className="min-h-screen bg-background text-foreground">
         <Navbar
           active={tab}
           onNavigate={setTab}
+          title={cfg?.title ?? "Doc Translation Review"}
+          logoUrl={cfg?.logo_url ?? null}
+          logoAlt={cfg?.logo_alt ?? null}
+          logoWidth={cfg?.logo_width ?? null}
+          logoHeight={cfg?.logo_height ?? null}
           subtitle={
             cfg ? (
               <>

@@ -68,6 +68,11 @@ export interface AppConfig {
   reviewer: string;
   target_language: string;
   delta_sync_enabled: boolean;
+  title: string;
+  logo_url: string | null;
+  logo_alt: string | null;
+  logo_width: number | null;
+  logo_height: number | null;
 }
 
 export interface Prompt {

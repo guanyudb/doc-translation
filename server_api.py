@@ -172,6 +172,11 @@ def get_config():
         "reviewer": auth.reviewer(),
         "target_language": os.environ.get("TRANSLATION_TARGET_LANGUAGE", "English"),
         "delta_sync_enabled": delta_sync.enabled(),
+        "title": config.APP_TITLE,
+        "logo_url": config.APP_LOGO_URL,
+        "logo_alt": config.APP_LOGO_ALT,
+        "logo_width": config.APP_LOGO_WIDTH,
+        "logo_height": config.APP_LOGO_HEIGHT,
     }
 
 
