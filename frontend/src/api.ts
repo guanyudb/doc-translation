@@ -91,6 +91,24 @@ export interface DocumentStatus {
   error: string | null;
 }
 
+export interface ProcessingDocument extends DocumentStatus {
+  elapsed_seconds: number | null;
+}
+
+export interface PipelineStatus {
+  job_id: number | null;
+  active: boolean;
+  started_at_ms: number | null;
+  elapsed_seconds: number | null;
+}
+
+export interface ProcessingStatus {
+  user: string;
+  pipeline: PipelineStatus;
+  documents: ProcessingDocument[];
+  warehouse_configured: boolean;
+}
+
 async function j<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -165,6 +183,8 @@ export const api = {
 
   documents: () =>
     fetch("/api/documents").then(j<{ documents: DocumentStatus[]; warehouse_configured: boolean }>),
+
+  processingStatus: () => fetch("/api/processing-status").then(j<ProcessingStatus>),
 
   publish: (id: string) =>
     fetch(`/api/pairs/${encodeURIComponent(id)}/publish`, { method: "POST" }).then(

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ThemeProvider } from "@/components/apx/theme-provider";
 import { Navbar, Tab } from "@/components/apx/navbar";
 import { ReviewView } from "@/components/review/ReviewView";
+import { ProcessingStatusView } from "@/components/processing/ProcessingStatusView";
 import { GlossaryView } from "@/components/glossary/GlossaryView";
 import { InstructionsView } from "@/components/instructions/InstructionsView";
 import { AuditView } from "@/components/audit/AuditView";
@@ -44,6 +45,7 @@ export default function App() {
               }}
             />
           )}
+          {tab === "processing" && <ProcessingStatusView />}
           {tab === "glossary" && <GlossaryView deltaSyncEnabled={cfg?.delta_sync_enabled ?? false} />}
           {tab === "instructions" && <InstructionsView />}
           {tab === "audit" && <AuditView pairId={activePair} />}

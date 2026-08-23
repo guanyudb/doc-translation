@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Body, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -393,6 +394,13 @@ async def upload_document(
         volume.upload_docx(f"{config.RAW_DIR}/{name}.lang", target_language.encode("utf-8"))
     except Exception:
         pass
+    # Uploader identity (from X-Forwarded-Email). The watcher reads this sidecar
+    # into bronze_documents.submitted_by so the Processing view can filter to the
+    # current user. Best-effort — a missing sidecar just yields NULL submitted_by.
+    try:
+        volume.upload_docx(f"{config.RAW_DIR}/{name}.user", auth.reviewer().encode("utf-8"))
+    except Exception:
+        pass
     snapshot = json.dumps({
         "prompt_id": prompt["prompt_id"],
         "name": prompt["name"],
@@ -471,6 +479,138 @@ def list_documents():
         pass
 
     return {"documents": rows, "warehouse_configured": delta_sync.enabled()}
+
+
+# --- Processing status (per-user, Jobs-API-driven) --------------------------
+
+PIPELINE_JOB_NAME = "doc-translation · auto-translate pipeline"
+_pipeline_job_id: int | None = None
+_pipeline_job_looked_up = False
+
+
+def _pipeline_job_id_cached() -> int | None:
+    """The shared translation pipeline's job id, resolved by name once and
+    memoized (it's stable for the app's lifetime). None if not found."""
+    global _pipeline_job_id, _pipeline_job_looked_up
+    if _pipeline_job_looked_up:
+        return _pipeline_job_id
+    _pipeline_job_looked_up = True
+    try:
+        for j in config.w().jobs.list():
+            if j.settings and j.settings.name == PIPELINE_JOB_NAME:
+                _pipeline_job_id = j.job_id
+                break
+    except Exception:
+        _pipeline_job_id = None
+    return _pipeline_job_id
+
+
+def _pipeline_status() -> dict:
+    """Whether the shared pipeline is actively running right now, and for how
+    long — driven by the Jobs API. Best-effort: any failure returns an inactive
+    pipeline so the document list still renders. Note the run is a shared batch
+    across all users, so this is a global signal, not per-user."""
+    job_id = _pipeline_job_id_cached()
+    out = {"job_id": job_id, "active": False, "started_at_ms": None, "elapsed_seconds": None}
+    if job_id is None:
+        return out
+    try:
+        runs = list(config.w().jobs.list_runs(job_id=job_id, active_only=True))
+    except Exception:
+        return out
+    if not runs:
+        return out
+    out["active"] = True
+    starts = [r.start_time for r in runs if getattr(r, "start_time", None)]
+    if starts:
+        earliest = min(starts)  # epoch millis
+        out["started_at_ms"] = earliest
+        out["elapsed_seconds"] = max(0, int(time.time() * 1000 - earliest) // 1000)
+    return out
+
+
+@app.get("/api/processing-status")
+def processing_status():
+    """Documents the CURRENT user has submitted that are queued/translating,
+    plus their recently finished/failed ones (last 24h), each with an elapsed
+    time. The pipeline block reports whether the shared translation job is
+    actively running (Jobs API). See /api/documents for the workspace-wide view.
+
+    Per-user scoping is by bronze_documents.submitted_by (captured at upload via
+    the `.user` sidecar). Freshly-uploaded files not yet in bronze are attributed
+    by reading that same sidecar, so a user sees their upload as QUEUED at once."""
+    user = auth.reviewer()
+    rows: list[dict] = []
+    bronze_names: set[str] = set()
+
+    if delta_sync.enabled():
+        fqn = f"{delta_sync.DELTA_CATALOG}.{delta_sync.DELTA_SCHEMA}.bronze_documents"
+        # elapsed_seconds computed in SQL to avoid fragile timestamp-string
+        # parsing: for in-flight rows measure to now, else start→end.
+        q = f"""
+            SELECT file_name, translation_status, target_language, source_language,
+                   translation_started_at, translation_ended_at, translation_error,
+                   CAST(
+                     unix_timestamp(
+                       CASE WHEN translation_status = 'TRANSLATING'
+                            THEN current_timestamp()
+                            ELSE coalesce(translation_ended_at, current_timestamp()) END
+                     ) - unix_timestamp(translation_started_at)
+                   AS BIGINT) AS elapsed_seconds
+            FROM {fqn}
+            WHERE submitted_by = {delta_sync._esc(user)}
+              AND (translation_status IN ('QUEUED', 'TRANSLATING')
+                   OR translation_ended_at >= current_timestamp() - INTERVAL 24 HOURS)
+            ORDER BY first_seen_at DESC
+            LIMIT 200
+        """
+        # Defensive: submitted_by only exists after the migration/first watcher
+        # run. On any failure we leave bronze rows empty (never fall back to an
+        # unscoped query that would leak other users' documents) — the sidecar
+        # path below still surfaces this user's freshly-uploaded files.
+        try:
+            out = delta_sync._execute(q)
+            data = (out.get("result") or {}).get("data_array") or []
+            for r in data:
+                name = r[0]
+                bronze_names.add(name)
+                elapsed = None
+                if r[7] is not None:
+                    try:
+                        elapsed = max(0, int(r[7]))
+                    except (TypeError, ValueError):
+                        elapsed = None
+                rows.append({
+                    "file_name": name, "status": r[1], "target_language": r[2],
+                    "source_language": r[3], "started_at": r[4], "ended_at": r[5],
+                    "error": r[6], "elapsed_seconds": elapsed,
+                })
+        except Exception:
+            pass
+
+    # Raw files not yet in bronze → QUEUED, but only the ones THIS user uploaded
+    # (attributed via the `.user` sidecar written at upload time).
+    try:
+        for f in volume.list_docx(config.RAW_DIR):
+            if f["name"] in bronze_names:
+                continue
+            owner = volume.read_text(f"{config.RAW_DIR}/{f['name']}.user")
+            if owner != user:
+                continue
+            rows.append({
+                "file_name": f["name"], "status": "QUEUED", "target_language": None,
+                "source_language": None, "started_at": None, "ended_at": None,
+                "error": None, "elapsed_seconds": None,
+            })
+    except Exception:
+        pass
+
+    return {
+        "user": user,
+        "pipeline": _pipeline_status(),
+        "documents": rows,
+        "warehouse_configured": delta_sync.enabled(),
+    }
 
 
 @app.post("/api/pairs/{pair_id}/publish")

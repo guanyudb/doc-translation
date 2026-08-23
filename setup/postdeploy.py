@@ -564,7 +564,8 @@ _exec(f"""
         translation_ended_at TIMESTAMP, translation_output_path STRING,
         translation_error STRING, translator_run_id STRING,
         model_endpoint STRING, target_language STRING, source_language STRING,
-        selected_prompt_id BIGINT, selected_prompt_name STRING, prompt_text_used STRING
+        selected_prompt_id BIGINT, selected_prompt_name STRING, prompt_text_used STRING,
+        submitted_by STRING
     ) USING DELTA
     TBLPROPERTIES (
         delta.deletedFileRetentionDuration = 'interval 2557 days',
@@ -585,6 +586,17 @@ try:
 except RuntimeError as ex:
     if "already exist" in str(ex).lower():
         print("bronze_documents prompt columns already present; skipped")
+    else:
+        raise
+
+# Migrate deployments created before per-user attribution existed. Same
+# non-idempotent ADD COLUMNS caveat as above — tolerate the already-exists case.
+try:
+    _exec(f"ALTER TABLE {DELTA_FQN}.bronze_documents ADD COLUMNS (submitted_by STRING)")
+    print("ok: bronze_documents submitted_by column added")
+except RuntimeError as ex:
+    if "already exist" in str(ex).lower():
+        print("bronze_documents submitted_by column already present; skipped")
     else:
         raise
 
@@ -704,6 +716,7 @@ for sub in ("raw_documents", "translated_inplace", "translated_reviewed", "golde
 
 from databricks.sdk.service.jobs import (
     TriggerSettings, FileArrivalTriggerConfiguration, PauseStatus, JobSettings,
+    JobAccessControlRequest, JobPermissionLevel,
 )
 
 pipeline_jobs = [j for j in w.jobs.list()
@@ -727,6 +740,23 @@ else:
         ),
     )
     print(f"ok: attached file-arrival trigger to job {pj.job_id} watching {trigger_url}")
+
+    # The App SP calls the Jobs API to drive the Processing Status view (is a run
+    # active + how long). jobs.list()/list_runs() only return jobs the caller can
+    # see, so the SP needs at least CAN_VIEW. update_permissions MERGES (unlike
+    # set_permissions, which would replace the owner ACL), so existing grants are
+    # preserved. Best-effort: the doc list still renders if this fails.
+    try:
+        w.jobs.update_permissions(
+            job_id=pj.job_id,
+            access_control_list=[JobAccessControlRequest(
+                service_principal_name=sp_uuid,
+                permission_level=JobPermissionLevel.CAN_VIEW,
+            )],
+        )
+        print(f"ok: granted App SP {sp_uuid} CAN_VIEW on job {pj.job_id}")
+    except Exception as ex:
+        print(f"WARNING: could not grant App SP CAN_VIEW on job {pj.job_id}: {ex}")
 
 # COMMAND ----------
 
