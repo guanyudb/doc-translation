@@ -113,6 +113,76 @@ for k, v in app_config_secrets.items():
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Provisioned Lakebase: register the App SP role + grant it instance access
+# MAGIC
+# MAGIC In **Project mode** the bundle's `postgres:` app-resource binding both
+# MAGIC registers the App SP as a Postgres role and injects PGHOST/PGUSER/… into
+# MAGIC the app at `bundle deploy` time — nothing to do here.
+# MAGIC
+# MAGIC In **Provisioned mode** we do NOT use the classic `database:` binding at
+# MAGIC all. Adding a database resource to an app via the Apps API
+# MAGIC (`w.apps.update`) is gated behind workspace-admin authority the deploying
+# MAGIC user typically lacks — it fails with *"does not have permission to grant
+# MAGIC permissions for added resource: postgres"* even when that user OWNS the
+# MAGIC instance + Postgres database, has CAN_MANAGE, and the SP already holds the
+# MAGIC exact grants the binding would apply. (Verified empirically 2026-08-23.)
+# MAGIC
+# MAGIC The binding is only a convenience: it injects PG* env vars and applies a
+# MAGIC CONNECT/CREATE grant. We reproduce both without it, using operations the
+# MAGIC deploying user CAN perform:
+# MAGIC   1. register the App SP as a Postgres role (so the GRANTs below + the
+# MAGIC      runtime credential mint have a role to target);
+# MAGIC   2. grant the App SP CAN_USE on the instance (so at runtime it can call
+# MAGIC      `generate_database_credential`);
+# MAGIC   3. GRANT CONNECT on the database to the App SP (the GRANTs cell below).
+# MAGIC The app derives PGHOST (instance read/write DNS) + PGUSER
+# MAGIC (DATABRICKS_CLIENT_ID) at runtime — see `server/config.py`.
+# MAGIC
+# MAGIC Idempotent; safe to re-run after every `bundle deploy`.
+
+# COMMAND ----------
+
+if lakebase_instance:
+    from databricks.sdk.service import database as _db
+    from databricks.sdk.service.iam import AccessControlRequest, PermissionLevel
+
+    # (1) Register the App SP as a Postgres role on the instance so the GRANT
+    #     statements further down can target it. Idempotent: a duplicate raises
+    #     (role already exists), which we swallow.
+    try:
+        w.database.create_database_instance_role(
+            instance_name=lakebase_instance,
+            database_instance_role=_db.DatabaseInstanceRole(
+                name=sp_uuid,
+                identity_type=_db.DatabaseInstanceRoleIdentityType.SERVICE_PRINCIPAL,
+            ),
+        )
+        print(f"ok: registered App SP {sp_uuid} as a Lakebase Postgres role")
+    except Exception as e:
+        print(f"  App SP role already present (or create skipped): {e}")
+
+    # (2) Grant the App SP CAN_USE on the instance so the running app can mint
+    #     its own OAuth DB credential (generate_database_credential). This is a
+    #     control-plane permission the deploying user (CAN_MANAGE) can delegate,
+    #     unlike the app-resource database binding. Idempotent.
+    try:
+        w.permissions.update(
+            request_object_type="database-instances",
+            request_object_id=lakebase_instance,
+            access_control_list=[
+                AccessControlRequest(
+                    service_principal_name=sp_uuid,
+                    permission_level=PermissionLevel.CAN_USE,
+                ),
+            ],
+        )
+        print(f"ok: granted App SP {sp_uuid} CAN_USE on instance {lakebase_instance!r}")
+    except Exception as e:
+        print(f"  WARNING: could not grant CAN_USE on instance: {e}")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Mint a Lakebase OAuth JWT for the deployer (NOT a PAT)
 
 # COMMAND ----------
@@ -136,8 +206,13 @@ if lakebase_project:
         )
     pg_db   = "databricks_postgres"  # Lakebase Projects default
 else:
-    # Legacy Provisioned mode
-    cred = w.database.generate_database_credential(instance_names=[lakebase_instance])
+    # Legacy Provisioned mode. Newer SDK/runtime builds require request_id (an
+    # idempotency key) on GenerateDatabaseCredential; older ones ignore it, so
+    # always pass a fresh UUID for cross-version safety.
+    cred = w.database.generate_database_credential(
+        request_id=str(uuid.uuid4()),
+        instance_names=[lakebase_instance],
+    )
     pg_token = cred.token
     inst = w.database.get_database_instance(name=lakebase_instance)
     pg_host = inst.read_write_dns
@@ -287,6 +362,7 @@ CREATE TABLE IF NOT EXISTS {pg_schema}.translation_prompts (
 """
 
 GRANTS_SQL = f"""
+GRANT CONNECT ON DATABASE {pg_db} TO "{sp_uuid}";
 GRANT USAGE, CREATE ON SCHEMA public TO "{sp_uuid}";
 GRANT USAGE ON SCHEMA {pg_schema} TO "{sp_uuid}";
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {pg_schema} TO "{sp_uuid}";

@@ -9,9 +9,16 @@ Two Lakebase modes are supported:
     `/api/2.0/postgres/credentials`.
 
   * **Provisioned (legacy)** — pre-2026-03-12 workspaces with an existing
-    instance. Set `LAKEBASE_INSTANCE` (the instance name). The `database:`
-    binding auto-injects PG* env vars; `server/db.py` mints credentials via
-    `WorkspaceClient.database.generate_database_credential`.
+    instance. Set `LAKEBASE_INSTANCE` (the instance name). We do NOT use the
+    classic `database:` app-resource binding here: binding it via the Apps API
+    requires workspace-admin authority the deploying user typically lacks (it
+    fails with "does not have permission to grant permissions for added
+    resource: postgres" even for the instance owner). So `setup/postdeploy.py`
+    instead registers the app SP as a Postgres role + grants it directly, and
+    this module DERIVES the connection coordinates at runtime: PGHOST from the
+    instance's read/write DNS, PGUSER from the app SP's client id
+    (`DATABRICKS_CLIENT_ID`, always injected into Apps). `server/db.py` mints
+    credentials via `WorkspaceClient.database.generate_database_credential`.
 
 Detection is explicit: presence of `LAKEBASE_PROJECT` wins, else fall back
 to `LAKEBASE_INSTANCE`. Exactly one mode must be set or boot will refuse.
@@ -21,8 +28,11 @@ from databricks.sdk import WorkspaceClient
 
 IS_DATABRICKS_APP = bool(os.environ.get("DATABRICKS_APP_NAME"))
 
-# Postgres connection — host etc. are auto-injected by the Apps binding.
-PGHOST     = os.environ["PGHOST"]
+# Postgres connection. PGHOST/PGUSER are injected by a `postgres:`/`database:`
+# app-resource binding when one exists (Project mode, or Provisioned mode on an
+# admin-deployed workspace). In Provisioned mode without a binding they're
+# absent and derived lazily — see pg_host() / current_pg_user() below.
+PGHOST     = os.environ.get("PGHOST")
 PGPORT     = os.environ.get("PGPORT", "5432")
 PGDATABASE = os.environ.get("PGDATABASE", "databricks_postgres")
 PGSSLMODE  = os.environ.get("PGSSLMODE", "require")
@@ -70,11 +80,44 @@ def w() -> WorkspaceClient:
     return _w_singleton
 
 
+_pg_host_cache: str | None = None
+
+
+def pg_host() -> str:
+    """Resolve the Postgres host.
+
+    When a `postgres:`/`database:` app-resource binding exists (Project mode, or
+    an admin-deployed Provisioned workspace) PGHOST is injected as an env var and
+    we use it directly. In Provisioned mode WITHOUT a binding — the usual case,
+    since a non-admin deployer can't create the classic database binding — PGHOST
+    is absent, so we derive it from the instance's read/write DNS and cache it."""
+    global _pg_host_cache
+    if PGHOST:
+        return PGHOST
+    if _pg_host_cache:
+        return _pg_host_cache
+    if LAKEBASE_INSTANCE:
+        inst = w().database.get_database_instance(name=LAKEBASE_INSTANCE)
+        _pg_host_cache = inst.read_write_dns
+        return _pg_host_cache
+    raise RuntimeError(
+        "PGHOST is not set and cannot be derived (no LAKEBASE_INSTANCE). "
+        "In Project mode the postgres binding must inject PGHOST."
+    )
+
+
 def current_pg_user() -> str:
     """Postgres role used for the connection.
-    In Databricks Apps, PGUSER is auto-injected (the SP client_id).
-    Locally, fall back to the workspace user identity."""
+
+    The role is the app service principal, whose Postgres role name is its OAuth
+    client id. A `postgres:`/`database:` binding injects that as PGUSER; without a
+    binding (Provisioned mode) we read the SP's client id from DATABRICKS_CLIENT_ID
+    (always injected into Databricks Apps). Locally, fall back to the workspace
+    user identity."""
     pguser = os.environ.get("PGUSER")
     if pguser:
         return pguser
+    client_id = os.environ.get("DATABRICKS_CLIENT_ID")
+    if client_id:
+        return client_id
     return w().current_user.me().user_name
