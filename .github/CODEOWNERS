@@ -1,0 +1,23 @@
+# Code owners for doc-translation.
+#
+# Branch protection on `main` and `customer-deployable` has
+# "Require review from Code Owners" enabled, so every PR touching these paths
+# automatically requests @guanyudb and cannot merge without that approval.
+
+# Everything, by default.
+*                       @guanyudb
+
+# Deployment + infrastructure — a bad change here breaks customer deploys.
+/deploy.sh              @guanyudb
+/build.sh               @guanyudb
+/databricks.yml         @guanyudb
+/variables.yml          @guanyudb
+/app.yaml               @guanyudb
+/resources/             @guanyudb
+
+# Pipeline notebooks — these run as the deploying user against FMAPI + Volumes.
+/setup/                 @guanyudb
+
+# Compliance-sensitive: audit trail, golden-zone promotion, Delta mirror.
+/server/store.py        @guanyudb
+/server/delta_sync.py   @guanyudb
