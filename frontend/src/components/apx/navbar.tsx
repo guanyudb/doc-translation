@@ -2,7 +2,7 @@ import { Languages } from "lucide-react";
 import { ModeToggle } from "@/components/apx/mode-toggle";
 import { cn } from "@/lib/utils";
 
-export type Tab = "review" | "glossary" | "instructions" | "audit";
+export type Tab = "review" | "glossary" | "instructions" | "audit" | "settings";
 
 export function Navbar({
   active,
@@ -13,6 +13,7 @@ export function Navbar({
   logoAlt = null,
   logoWidth = null,
   logoHeight = null,
+  showTabs = true,
 }: {
   active: Tab;
   onNavigate: (t: Tab) => void;
@@ -22,12 +23,14 @@ export function Navbar({
   logoAlt?: string | null;
   logoWidth?: number | null;
   logoHeight?: number | null;
+  showTabs?: boolean;
 }) {
   const tabs: { id: Tab; label: string }[] = [
     { id: "review", label: "Review" },
     { id: "glossary", label: "Glossary" },
     { id: "instructions", label: "Instructions" },
     { id: "audit", label: "Audit" },
+    { id: "settings", label: "Settings" },
   ];
   return (
     <header className="sticky top-0 z-50 border-b bg-background/80 backdrop-blur-sm">
@@ -55,7 +58,7 @@ export function Navbar({
           </div>
         </div>
 
-        <nav className="ml-4 flex items-center gap-1">
+        <nav className="ml-4 flex items-center gap-1" hidden={!showTabs}>
           {tabs.map((t) => (
             <button
               key={t.id}
