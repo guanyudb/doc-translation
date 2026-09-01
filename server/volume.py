@@ -39,6 +39,17 @@ def read_docx(path: str) -> bytes:
     return resp.contents
 
 
+def read_text(path: str) -> str | None:
+    """Download a small text sidecar (e.g. `<name>.docx.user`) and decode it.
+    Returns None if the file is absent or unreadable — callers treat that as
+    'no value' rather than an error."""
+    try:
+        raw = read_docx(path)  # generic download; despite the name, any path works
+        return raw.decode("utf-8").strip() or None
+    except Exception:
+        return None
+
+
 REVIEWED_DIR = f"{config.VOLUME_ROOT}/translated_reviewed"
 GOLDEN_DIR   = f"{config.VOLUME_ROOT}/golden"
 

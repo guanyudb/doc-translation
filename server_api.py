@@ -22,20 +22,32 @@ The Streamlit app this replaces is preserved at legacy/streamlit_app.py.
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
+import time
+from collections import OrderedDict
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Body, Request, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Body, Path, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from server import config, volume, store, docx_render, auth, delta_sync
 from server import confidence as conf_mod
 from server import glossary as glossary_mod
+from server import prompts as prompts_mod
 from server.db import pool
+
+log = logging.getLogger("doc_translation")
 
 app = FastAPI(title="Doc Translation Review")
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+# Set by _startup() if the pool can't be opened at boot — surfaced by
+# /api/health so operators can tell a broken app from a healthy one (Databricks
+# Apps report RUNNING even when the backend can't reach its data layer).
+_startup_error: str | None = None
 
 
 @app.middleware("http")
@@ -49,11 +61,41 @@ async def _capture_identity(request: Request, call_next):
 
 @app.on_event("startup")
 def _startup() -> None:
+    global _startup_error
     # Open the psycopg pool once. Safe if already open (idempotent proxy).
+    # Never block boot on it — but DO record the failure so /api/health can
+    # report it (Databricks Apps show RUNNING even when the DB is unreachable).
     try:
         pool.open(wait=True, timeout=30.0)
+    except Exception as e:
+        _startup_error = f"pool.open failed: {e}"
+        log.exception("startup: could not open Lakebase pool")
+    # Seed the built-in default prompt if the library is empty. Idempotent; the
+    # app SP has INSERT so it can self-seed once the table exists. Best-effort.
+    try:
+        prompts_mod.seed_default_prompt()
     except Exception:
-        pass
+        log.exception("startup: default prompt seed failed")
+
+
+@app.get("/api/health")
+def health():
+    """Readiness probe. Databricks Apps report RUNNING even when the backend
+    can't reach Lakebase — this tells them apart. 503 when the pool never
+    opened or a probe query fails."""
+    detail: dict = {"startup_error": _startup_error}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        detail["lakebase"] = "ok"
+    except Exception as e:
+        detail["lakebase"] = f"error: {e}"
+        return JSONResponse(status_code=503, content={"status": "unhealthy", **detail})
+    if _startup_error:
+        return JSONResponse(status_code=503, content={"status": "degraded", **detail})
+    return {"status": "ok", **detail}
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +103,10 @@ def _startup() -> None:
 # ---------------------------------------------------------------------------
 
 # Render is relatively expensive (mammoth conversion); cache per (path, size).
-_render_cache: dict[str, tuple[str, list[dict]]] = {}
+# Bounded LRU so a long-running instance reviewing many documents doesn't grow
+# memory without limit (each entry is a full rendered doc + paragraph list).
+_RENDER_CACHE_MAX = 64
+_render_cache: "OrderedDict[str, tuple[str, list[dict]]]" = OrderedDict()
 
 
 def _render(path: str) -> tuple[str, list[dict]]:
@@ -69,15 +114,28 @@ def _render(path: str) -> tuple[str, list[dict]]:
     key = f"{path}:{len(b)}"
     hit = _render_cache.get(key)
     if hit is not None:
+        _render_cache.move_to_end(key)  # mark most-recently-used
         return hit
     out = docx_render.render(b)
     _render_cache[key] = out
+    if len(_render_cache) > _RENDER_CACHE_MAX:
+        _render_cache.popitem(last=False)  # evict least-recently-used
     return out
 
 
 def _list_pairs() -> list[dict]:
-    originals = volume.list_docx(config.RAW_DIR)
-    translated = volume.list_docx(config.TRANSLATED_DIR)
+    # The Files API can blip; a transient listing failure shouldn't 500 the
+    # whole pairs endpoint — degrade to whatever we can list.
+    try:
+        originals = volume.list_docx(config.RAW_DIR)
+    except Exception:
+        log.exception("_list_pairs: could not list raw_documents")
+        originals = []
+    try:
+        translated = volume.list_docx(config.TRANSLATED_DIR)
+    except Exception:
+        log.exception("_list_pairs: could not list translated_inplace")
+        translated = []
     return volume.auto_pair(originals, translated)
 
 
@@ -88,6 +146,7 @@ def _resolve(pair_id: str) -> dict:
     try:
         db = store.get_pair(pair_id)
     except Exception:
+        log.warning("_resolve: Lakebase get_pair(%s) failed; falling back to Volume scan", pair_id, exc_info=True)
         db = None
     if db and db.get("original_path") and db.get("translated_path"):
         return {
@@ -162,6 +221,11 @@ def get_config():
         "reviewer": auth.reviewer(),
         "target_language": os.environ.get("TRANSLATION_TARGET_LANGUAGE", "English"),
         "delta_sync_enabled": delta_sync.enabled(),
+        "title": config.APP_TITLE,
+        "logo_url": config.APP_LOGO_URL,
+        "logo_alt": config.APP_LOGO_ALT,
+        "logo_width": config.APP_LOGO_WIDTH,
+        "logo_height": config.APP_LOGO_HEIGHT,
     }
 
 
@@ -285,7 +349,7 @@ def _para_response(pair_id: str, idx: int) -> dict:
 
 
 @app.post("/api/pairs/{pair_id}/paragraphs/{idx}/status")
-def set_status(pair_id: str, idx: int, status: str = Body(..., embed=True)):
+def set_status(pair_id: str, idx: int = Path(..., ge=0), status: str = Body(..., embed=True)):
     if status not in ("pending", "certified", "flagged"):
         raise HTTPException(400, "invalid status")
     try:
@@ -296,7 +360,7 @@ def set_status(pair_id: str, idx: int, status: str = Body(..., embed=True)):
 
 
 @app.post("/api/pairs/{pair_id}/paragraphs/{idx}/comment")
-def set_comment(pair_id: str, idx: int, comment: str = Body(..., embed=True)):
+def set_comment(pair_id: str, idx: int = Path(..., ge=0), comment: str = Body(..., embed=True)):
     try:
         store.upsert_feedback(pair_id, idx, None, comment, auth.reviewer())
     except store.PairLockedError as e:
@@ -305,7 +369,7 @@ def set_comment(pair_id: str, idx: int, comment: str = Body(..., embed=True)):
 
 
 @app.post("/api/pairs/{pair_id}/paragraphs/{idx}/edit")
-def set_edit(pair_id: str, idx: int, edited_text: str | None = Body(None, embed=True)):
+def set_edit(pair_id: str, idx: int = Path(..., ge=0), edited_text: str | None = Body(None, embed=True)):
     try:
         store.upsert_edit(pair_id, idx, edited_text, auth.reviewer())
     except store.PairLockedError as e:
@@ -348,26 +412,43 @@ def certify_page(pair_id: str, page: int = Body(..., embed=True)):
 
 
 @app.post("/api/upload")
-async def upload_document(
+def upload_document(
     file: UploadFile = File(...),
     target_language: str = Form("English"),
     on_conflict: str = Form("rename"),  # "rename" (default) | "replace"
+    prompt_id: int = Form(...),
 ):
     """Accept a source .docx, write it to raw_documents/. The file-arrival
     trigger on that folder kicks off the translation pipeline; the resulting
     pair shows up in /api/pairs once translation completes.
 
-    target_language is recorded as a per-file sidecar (.lang) so the pipeline
-    (and the review UI) know the intended target without changing the bundle
-    default. Source language is auto-detected downstream."""
+    Three per-file sidecars are written alongside the .docx so the pipeline
+    picks up the reviewer's choices without changing the bundle default:
+      * `.lang`   — the target language (source language is auto-detected).
+      * `.user`   — the uploader's email (X-Forwarded-Email), surfaced in the
+        Processing view so a reviewer can filter to their own uploads.
+      * `.prompt` — a JSON snapshot {prompt_id, name, body} of the chosen prompt.
+        The full body is FROZEN here so editing/deleting the prompt later never
+        changes what this document was translated with.
+
+    Same-name uploads are handled explicitly (on_conflict): 'rename' (default)
+    auto-suffixes to keep both documents; 'replace' overwrites and clears the
+    prior review state so certifications don't carry over to new content."""
     name = (file.filename or "").strip()
     if not name.lower().endswith(".docx"):
         raise HTTPException(400, "only .docx files are supported")
     if name.startswith("~$") or "/" in name or "\\" in name:
         raise HTTPException(400, "invalid filename")
-    data = await file.read()
+    # Sync endpoint runs in FastAPI's threadpool (all the volume/DB calls below
+    # block), so read the upload via the underlying sync file object.
+    data = file.file.read()
     if not data:
         raise HTTPException(400, "empty file")
+
+    # Prompt selection is required (enforced in the UI too). Resolve + snapshot.
+    prompt = prompts_mod.get_prompt(prompt_id)
+    if prompt is None:
+        raise HTTPException(400, f"unknown prompt_id: {prompt_id}")
 
     # ---- Same-name collision handling -------------------------------------
     # pair_id is derived from the filename stem (volume.auto_pair), so an
@@ -376,7 +457,7 @@ async def upload_document(
     # different content. That's a correctness hazard, not just confusing, so we
     # refuse by default and require an explicit choice:
     #   * rename (default)  — auto-suffix to keep both documents distinct
-    #   * replace           — caller passes ?on_conflict=replace, knowing the
+    #   * replace           — caller passes on_conflict=replace, knowing the
     #                         existing review state applies to new content
     stem = name[: -len(".docx")]
     existing = {f["name"] for f in volume.list_docx(config.RAW_DIR)}
@@ -396,12 +477,28 @@ async def upload_document(
             renamed_from, name = name, f"{stem}_{n}.docx"
 
     dest = f"{config.RAW_DIR}/{name}"
-    volume.upload_docx(dest, data)
-    # Sidecar carrying the requested target language for this document.
+    # Write the sidecars FIRST so they're already present when the .docx lands
+    # and the file-arrival trigger fires. The watcher only scans .docx files.
     try:
         volume.upload_docx(f"{config.RAW_DIR}/{name}.lang", target_language.encode("utf-8"))
     except Exception:
         pass
+    # Uploader identity (from X-Forwarded-Email). The watcher reads this sidecar
+    # into bronze_documents.submitted_by so the Processing view can filter to the
+    # current user. Best-effort — a missing sidecar just yields NULL submitted_by.
+    try:
+        volume.upload_docx(f"{config.RAW_DIR}/{name}.user", auth.reviewer().encode("utf-8"))
+    except Exception:
+        pass
+    # Frozen prompt snapshot — the pipeline reads this, not the live table.
+    snapshot = json.dumps({
+        "prompt_id": prompt["prompt_id"],
+        "name": prompt["name"],
+        "body": prompt["body"],
+    })
+    volume.upload_docx(f"{config.RAW_DIR}/{name}.prompt", snapshot.encode("utf-8"))
+    # The document last — its arrival is what triggers the pipeline.
+    volume.upload_docx(dest, data)
 
     if renamed_from:
         message = (
@@ -424,6 +521,8 @@ async def upload_document(
         "path": dest,
         "target_language": target_language,
         "renamed_from": renamed_from,
+        "prompt_id": prompt["prompt_id"],
+        "prompt_name": prompt["name"],
         "message": message,
     }
 
@@ -486,6 +585,138 @@ def list_documents():
         pass
 
     return {"documents": rows, "warehouse_configured": delta_sync.enabled()}
+
+
+# --- Processing status (per-user, Jobs-API-driven) --------------------------
+
+PIPELINE_JOB_NAME = "doc-translation · auto-translate pipeline"
+_pipeline_job_id: int | None = None
+_pipeline_job_looked_up = False
+
+
+def _pipeline_job_id_cached() -> int | None:
+    """The shared translation pipeline's job id, resolved by name once and
+    memoized (it's stable for the app's lifetime). None if not found."""
+    global _pipeline_job_id, _pipeline_job_looked_up
+    if _pipeline_job_looked_up:
+        return _pipeline_job_id
+    _pipeline_job_looked_up = True
+    try:
+        for j in config.w().jobs.list():
+            if j.settings and j.settings.name == PIPELINE_JOB_NAME:
+                _pipeline_job_id = j.job_id
+                break
+    except Exception:
+        _pipeline_job_id = None
+    return _pipeline_job_id
+
+
+def _pipeline_status() -> dict:
+    """Whether the shared pipeline is actively running right now, and for how
+    long — driven by the Jobs API. Best-effort: any failure returns an inactive
+    pipeline so the document list still renders. Note the run is a shared batch
+    across all users, so this is a global signal, not per-user."""
+    job_id = _pipeline_job_id_cached()
+    out = {"job_id": job_id, "active": False, "started_at_ms": None, "elapsed_seconds": None}
+    if job_id is None:
+        return out
+    try:
+        runs = list(config.w().jobs.list_runs(job_id=job_id, active_only=True))
+    except Exception:
+        return out
+    if not runs:
+        return out
+    out["active"] = True
+    starts = [r.start_time for r in runs if getattr(r, "start_time", None)]
+    if starts:
+        earliest = min(starts)  # epoch millis
+        out["started_at_ms"] = earliest
+        out["elapsed_seconds"] = max(0, int(time.time() * 1000 - earliest) // 1000)
+    return out
+
+
+@app.get("/api/processing-status")
+def processing_status():
+    """Documents the CURRENT user has submitted that are queued/translating,
+    plus their recently finished/failed ones (last 24h), each with an elapsed
+    time. The pipeline block reports whether the shared translation job is
+    actively running (Jobs API). See /api/documents for the workspace-wide view.
+
+    Per-user scoping is by bronze_documents.submitted_by (captured at upload via
+    the `.user` sidecar). Freshly-uploaded files not yet in bronze are attributed
+    by reading that same sidecar, so a user sees their upload as QUEUED at once."""
+    user = auth.reviewer()
+    rows: list[dict] = []
+    bronze_names: set[str] = set()
+
+    if delta_sync.enabled():
+        fqn = f"{delta_sync.DELTA_CATALOG}.{delta_sync.DELTA_SCHEMA}.bronze_documents"
+        # elapsed_seconds computed in SQL to avoid fragile timestamp-string
+        # parsing: for in-flight rows measure to now, else start→end.
+        q = f"""
+            SELECT file_name, translation_status, target_language, source_language,
+                   translation_started_at, translation_ended_at, translation_error,
+                   CAST(
+                     unix_timestamp(
+                       CASE WHEN translation_status = 'TRANSLATING'
+                            THEN current_timestamp()
+                            ELSE coalesce(translation_ended_at, current_timestamp()) END
+                     ) - unix_timestamp(translation_started_at)
+                   AS BIGINT) AS elapsed_seconds
+            FROM {fqn}
+            WHERE submitted_by = {delta_sync._esc(user)}
+              AND (translation_status IN ('QUEUED', 'TRANSLATING')
+                   OR translation_ended_at >= current_timestamp() - INTERVAL 24 HOURS)
+            ORDER BY first_seen_at DESC
+            LIMIT 200
+        """
+        # Defensive: submitted_by only exists after the migration/first watcher
+        # run. On any failure we leave bronze rows empty (never fall back to an
+        # unscoped query that would leak other users' documents) — the sidecar
+        # path below still surfaces this user's freshly-uploaded files.
+        try:
+            out = delta_sync._execute(q)
+            data = (out.get("result") or {}).get("data_array") or []
+            for r in data:
+                name = r[0]
+                bronze_names.add(name)
+                elapsed = None
+                if r[7] is not None:
+                    try:
+                        elapsed = max(0, int(r[7]))
+                    except (TypeError, ValueError):
+                        elapsed = None
+                rows.append({
+                    "file_name": name, "status": r[1], "target_language": r[2],
+                    "source_language": r[3], "started_at": r[4], "ended_at": r[5],
+                    "error": r[6], "elapsed_seconds": elapsed,
+                })
+        except Exception:
+            pass
+
+    # Raw files not yet in bronze → QUEUED, but only the ones THIS user uploaded
+    # (attributed via the `.user` sidecar written at upload time).
+    try:
+        for f in volume.list_docx(config.RAW_DIR):
+            if f["name"] in bronze_names:
+                continue
+            owner = volume.read_text(f"{config.RAW_DIR}/{f['name']}.user")
+            if owner != user:
+                continue
+            rows.append({
+                "file_name": f["name"], "status": "QUEUED", "target_language": None,
+                "source_language": None, "started_at": None, "ended_at": None,
+                "error": None, "elapsed_seconds": None,
+            })
+    except Exception:
+        pass
+
+    return {
+        "user": user,
+        "pipeline": _pipeline_status(),
+        "documents": rows,
+        "warehouse_configured": delta_sync.enabled(),
+    }
 
 
 @app.post("/api/pairs/{pair_id}/publish")
@@ -613,8 +844,10 @@ def glossary_approve(entry_id: int, approved: bool = Body(..., embed=True)):
 
 
 @app.post("/api/glossary/import")
-async def glossary_import(file: UploadFile = File(...)):
-    data = await file.read()
+def glossary_import(file: UploadFile = File(...)):
+    # Sync endpoint (ingest does blocking DB work) → runs in the threadpool;
+    # read via the underlying sync file object.
+    data = file.file.read()
     n = glossary_mod.ingest_glossary_csv(data, source="customer", approved=True)
     return {"imported": n}
 
@@ -629,6 +862,99 @@ def glossary_mine():
 def glossary_sync():
     res = delta_sync.sync_glossary_to_delta()
     return {"rows": res.get("rows", 0), "skipped": bool(res.get("skipped"))}
+
+
+# ---------------------------------------------------------------------------
+# Translation prompts ("Instructions") — full CRUD over named system prompts.
+# One is chosen per document at upload time (snapshotted into a .prompt sidecar).
+# ---------------------------------------------------------------------------
+
+def _prompt_out(p: dict) -> dict:
+    return {
+        "prompt_id": p["prompt_id"],
+        "name": p["name"],
+        "body": p["body"],
+        "description": p.get("description"),
+        "created_by": p.get("created_by"),
+        "created_at": str(p["created_at"]) if p.get("created_at") else None,
+        "updated_by": p.get("updated_by"),
+        "updated_at": str(p["updated_at"]) if p.get("updated_at") else None,
+    }
+
+
+@app.get("/api/prompts")
+def prompts_list():
+    return [_prompt_out(p) for p in prompts_mod.list_prompts()]
+
+
+@app.get("/api/prompts/template")
+def prompts_template():
+    """The built-in default prompt text — the editor pre-fills new prompts with
+    it (seeded-editable) and offers a 'reset to default template' action."""
+    return {"body": prompts_mod.DEFAULT_PROMPT_BODY}
+
+
+@app.get("/api/prompts/{prompt_id}")
+def prompts_get(prompt_id: int):
+    p = prompts_mod.get_prompt(prompt_id)
+    if p is None:
+        raise HTTPException(404, "prompt not found")
+    return _prompt_out(p)
+
+
+@app.post("/api/prompts")
+def prompts_create(
+    name: str = Body(..., embed=True),
+    body: str = Body(..., embed=True),
+    description: str | None = Body(None, embed=True),
+):
+    try:
+        p = prompts_mod.create_prompt(
+            name=name, body=body, description=description, actor=auth.reviewer())
+    except prompts_mod.DuplicateNameError:
+        raise HTTPException(409, f"a prompt named '{name.strip()}' already exists")
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    return _prompt_out(p)
+
+
+@app.put("/api/prompts/{prompt_id}")
+def prompts_update(
+    prompt_id: int,
+    name: str = Body(..., embed=True),
+    body: str = Body(..., embed=True),
+    description: str | None = Body(None, embed=True),
+):
+    try:
+        p = prompts_mod.update_prompt(
+            prompt_id, name=name, body=body, description=description, actor=auth.reviewer())
+    except prompts_mod.DuplicateNameError:
+        raise HTTPException(409, f"a prompt named '{name.strip()}' already exists")
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    if p is None:
+        raise HTTPException(404, "prompt not found")
+    return _prompt_out(p)
+
+
+@app.delete("/api/prompts/{prompt_id}")
+def prompts_delete(prompt_id: int):
+    if not prompts_mod.delete_prompt(prompt_id, actor=auth.reviewer()):
+        raise HTTPException(404, "prompt not found")
+    return {"ok": True}
+
+
+@app.post("/api/prompts/{prompt_id}/clone")
+def prompts_clone(prompt_id: int, name: str | None = Body(None, embed=True)):
+    try:
+        p = prompts_mod.clone_prompt(prompt_id, new_name=name, actor=auth.reviewer())
+    except prompts_mod.DuplicateNameError:
+        raise HTTPException(409, f"a prompt named '{(name or '').strip()}' already exists")
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
+    if p is None:
+        raise HTTPException(404, "prompt not found")
+    return _prompt_out(p)
 
 
 # ---------------------------------------------------------------------------

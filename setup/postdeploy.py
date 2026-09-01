@@ -113,6 +113,76 @@ for k, v in app_config_secrets.items():
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Provisioned Lakebase: register the App SP role + grant it instance access
+# MAGIC
+# MAGIC In **Project mode** the bundle's `postgres:` app-resource binding both
+# MAGIC registers the App SP as a Postgres role and injects PGHOST/PGUSER/… into
+# MAGIC the app at `bundle deploy` time — nothing to do here.
+# MAGIC
+# MAGIC In **Provisioned mode** we do NOT use the classic `database:` binding at
+# MAGIC all. Adding a database resource to an app via the Apps API
+# MAGIC (`w.apps.update`) is gated behind workspace-admin authority the deploying
+# MAGIC user typically lacks — it fails with *"does not have permission to grant
+# MAGIC permissions for added resource: postgres"* even when that user OWNS the
+# MAGIC instance + Postgres database, has CAN_MANAGE, and the SP already holds the
+# MAGIC exact grants the binding would apply. (Verified empirically 2026-08-23.)
+# MAGIC
+# MAGIC The binding is only a convenience: it injects PG* env vars and applies a
+# MAGIC CONNECT/CREATE grant. We reproduce both without it, using operations the
+# MAGIC deploying user CAN perform:
+# MAGIC   1. register the App SP as a Postgres role (so the GRANTs below + the
+# MAGIC      runtime credential mint have a role to target);
+# MAGIC   2. grant the App SP CAN_USE on the instance (so at runtime it can call
+# MAGIC      `generate_database_credential`);
+# MAGIC   3. GRANT CONNECT on the database to the App SP (the GRANTs cell below).
+# MAGIC The app derives PGHOST (instance read/write DNS) + PGUSER
+# MAGIC (DATABRICKS_CLIENT_ID) at runtime — see `server/config.py`.
+# MAGIC
+# MAGIC Idempotent; safe to re-run after every `bundle deploy`.
+
+# COMMAND ----------
+
+if lakebase_instance:
+    from databricks.sdk.service import database as _db
+    from databricks.sdk.service.iam import AccessControlRequest, PermissionLevel
+
+    # (1) Register the App SP as a Postgres role on the instance so the GRANT
+    #     statements further down can target it. Idempotent: a duplicate raises
+    #     (role already exists), which we swallow.
+    try:
+        w.database.create_database_instance_role(
+            instance_name=lakebase_instance,
+            database_instance_role=_db.DatabaseInstanceRole(
+                name=sp_uuid,
+                identity_type=_db.DatabaseInstanceRoleIdentityType.SERVICE_PRINCIPAL,
+            ),
+        )
+        print(f"ok: registered App SP {sp_uuid} as a Lakebase Postgres role")
+    except Exception as e:
+        print(f"  App SP role already present (or create skipped): {e}")
+
+    # (2) Grant the App SP CAN_USE on the instance so the running app can mint
+    #     its own OAuth DB credential (generate_database_credential). This is a
+    #     control-plane permission the deploying user (CAN_MANAGE) can delegate,
+    #     unlike the app-resource database binding. Idempotent.
+    try:
+        w.permissions.update(
+            request_object_type="database-instances",
+            request_object_id=lakebase_instance,
+            access_control_list=[
+                AccessControlRequest(
+                    service_principal_name=sp_uuid,
+                    permission_level=PermissionLevel.CAN_USE,
+                ),
+            ],
+        )
+        print(f"ok: granted App SP {sp_uuid} CAN_USE on instance {lakebase_instance!r}")
+    except Exception as e:
+        print(f"  WARNING: could not grant CAN_USE on instance: {e}")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Mint a Lakebase OAuth JWT for the deployer (NOT a PAT)
 
 # COMMAND ----------
@@ -136,8 +206,13 @@ if lakebase_project:
         )
     pg_db   = "databricks_postgres"  # Lakebase Projects default
 else:
-    # Legacy Provisioned mode
-    cred = w.database.generate_database_credential(instance_names=[lakebase_instance])
+    # Legacy Provisioned mode. Newer SDK/runtime builds require request_id (an
+    # idempotency key) on GenerateDatabaseCredential; older ones ignore it, so
+    # always pass a fresh UUID for cross-version safety.
+    cred = w.database.generate_database_credential(
+        request_id=str(uuid.uuid4()),
+        instance_names=[lakebase_instance],
+    )
     pg_token = cred.token
     inst = w.database.get_database_instance(name=lakebase_instance)
     pg_host = inst.read_write_dns
@@ -273,9 +348,21 @@ CREATE TABLE IF NOT EXISTS {pg_schema}.translation_glossary (
 );
 ALTER TABLE {pg_schema}.translation_glossary
     ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tenant';
+
+CREATE TABLE IF NOT EXISTS {pg_schema}.translation_prompts (
+    prompt_id    BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    body         TEXT NOT NULL,
+    description  TEXT,
+    created_by   TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by   TEXT,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 GRANTS_SQL = f"""
+GRANT CONNECT ON DATABASE {pg_db} TO "{sp_uuid}";
 GRANT USAGE, CREATE ON SCHEMA public TO "{sp_uuid}";
 GRANT USAGE ON SCHEMA {pg_schema} TO "{sp_uuid}";
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {pg_schema} TO "{sp_uuid}";
@@ -293,6 +380,39 @@ with psycopg.connect(conninfo, password=pg_token) as conn:
         cur.execute(GRANTS_SQL)
     conn.commit()
 print("ok: Lakebase schema + grants applied")
+
+# Seed the built-in default prompt so the upload dialog always has a choice
+# (prompt selection is required). Idempotent — only inserts when the table is
+# empty. The body text mirrors server/prompts.py:DEFAULT_PROMPT_BODY and the
+# notebook's TRANSLATE_SYSTEM fallback; keep the three in sync.
+DEFAULT_PROMPT_NAME = "Medical / clinical (default)"
+DEFAULT_PROMPT_BODY = (
+    "You are a professional medical and clinical document translator working on FDA "
+    "regulatory submissions. Translate the user's text to {lang}.\n"
+    "STRICT RULES:\n"
+    "1. Return ONLY the translated text. No commentary, no quotes, no labels, no explanations.\n"
+    "2. Preserve numbers, units, percentages, dates, dosages, and proper nouns exactly.\n"
+    "3. Preserve URLs, email addresses, file paths, and code-like tokens unchanged.\n"
+    "4. Keep medical terminology accurate and consistent.\n"
+    "5. If the input is already in {lang}, return it unchanged.\n"
+    "6. If the input is empty, whitespace, or only punctuation/numbers, return it unchanged.\n"
+    "7. Do not add or remove leading/trailing whitespace beyond what the source has."
+)
+with psycopg.connect(conninfo, password=pg_token) as conn:
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT 1 FROM {pg_schema}.translation_prompts LIMIT 1")
+        if cur.fetchone():
+            print("prompts already present; seed skipped")
+        else:
+            cur.execute(f"""
+                INSERT INTO {pg_schema}.translation_prompts
+                    (name, body, description, created_by, updated_by)
+                VALUES (%s, %s, %s, 'system', 'system')
+                ON CONFLICT (name) DO NOTHING
+            """, (DEFAULT_PROMPT_NAME, DEFAULT_PROMPT_BODY,
+                  "Built-in FDA / clinical translation prompt. Seeded automatically."))
+            conn.commit()
+            print("ok: default translation prompt seeded")
 
 # COMMAND ----------
 
@@ -443,13 +563,42 @@ _exec(f"""
         translation_status STRING, translation_started_at TIMESTAMP,
         translation_ended_at TIMESTAMP, translation_output_path STRING,
         translation_error STRING, translator_run_id STRING,
-        model_endpoint STRING, target_language STRING, source_language STRING
+        model_endpoint STRING, target_language STRING, source_language STRING,
+        selected_prompt_id BIGINT, selected_prompt_name STRING, prompt_text_used STRING,
+        submitted_by STRING
     ) USING DELTA
     TBLPROPERTIES (
         delta.deletedFileRetentionDuration = 'interval 2557 days',
         delta.logRetentionDuration         = 'interval 2557 days'
     )
 """)
+# Migrate deployments created before per-document prompt selection existed.
+# Delta's ADD COLUMNS is not idempotent (no IF NOT EXISTS), so this errors when
+# the columns already exist — expected on a fresh table (created with them above)
+# and on any re-run. Tolerate exactly that case; re-raise anything else.
+try:
+    _exec(f"""
+        ALTER TABLE {DELTA_FQN}.bronze_documents ADD COLUMNS (
+            selected_prompt_id BIGINT, selected_prompt_name STRING, prompt_text_used STRING
+        )
+    """)
+    print("ok: bronze_documents prompt columns added")
+except RuntimeError as ex:
+    if "already exist" in str(ex).lower():
+        print("bronze_documents prompt columns already present; skipped")
+    else:
+        raise
+
+# Migrate deployments created before per-user attribution existed. Same
+# non-idempotent ADD COLUMNS caveat as above — tolerate the already-exists case.
+try:
+    _exec(f"ALTER TABLE {DELTA_FQN}.bronze_documents ADD COLUMNS (submitted_by STRING)")
+    print("ok: bronze_documents submitted_by column added")
+except RuntimeError as ex:
+    if "already exist" in str(ex).lower():
+        print("bronze_documents submitted_by column already present; skipped")
+    else:
+        raise
 
 # Grant the App SP read/write on the Delta tables AND on the UC Volume.
 # Volume names with hyphens need backtick quoting in SQL.
@@ -567,6 +716,7 @@ for sub in ("raw_documents", "translated_inplace", "translated_reviewed", "golde
 
 from databricks.sdk.service.jobs import (
     TriggerSettings, FileArrivalTriggerConfiguration, PauseStatus, JobSettings,
+    JobAccessControlRequest, JobPermissionLevel,
 )
 
 pipeline_jobs = [j for j in w.jobs.list()
@@ -590,6 +740,23 @@ else:
         ),
     )
     print(f"ok: attached file-arrival trigger to job {pj.job_id} watching {trigger_url}")
+
+    # The App SP calls the Jobs API to drive the Processing Status view (is a run
+    # active + how long). jobs.list()/list_runs() only return jobs the caller can
+    # see, so the SP needs at least CAN_VIEW. update_permissions MERGES (unlike
+    # set_permissions, which would replace the owner ACL), so existing grants are
+    # preserved. Best-effort: the doc list still renders if this fails.
+    try:
+        w.jobs.update_permissions(
+            job_id=pj.job_id,
+            access_control_list=[JobAccessControlRequest(
+                service_principal_name=sp_uuid,
+                permission_level=JobPermissionLevel.CAN_VIEW,
+            )],
+        )
+        print(f"ok: granted App SP {sp_uuid} CAN_VIEW on job {pj.job_id}")
+    except Exception as ex:
+        print(f"WARNING: could not grant App SP CAN_VIEW on job {pj.job_id}: {ex}")
 
 # COMMAND ----------
 

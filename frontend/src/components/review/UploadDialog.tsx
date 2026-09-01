@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { UploadCloud, Loader2, FileText, CheckCircle2, XCircle, Clock } from "lucide-react";
+import { UploadCloud, Loader2, FileText } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -10,43 +10,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
-import { api, DocumentStatus } from "@/api";
-
-function StatusRow({ d }: { d: DocumentStatus }) {
-  const map: Record<string, { icon: JSX.Element; cls: string; label: string }> = {
-    QUEUED: { icon: <Clock className="size-3.5" />, cls: "bg-muted text-muted-foreground", label: "queued" },
-    TRANSLATING: {
-      icon: <Loader2 className="size-3.5 animate-spin" />,
-      cls: "bg-amber-100 text-amber-900 dark:bg-amber-900/30 dark:text-amber-200",
-      label: "translating",
-    },
-    TRANSLATED: {
-      icon: <CheckCircle2 className="size-3.5" />,
-      cls: "bg-emerald-100 text-emerald-900 dark:bg-emerald-900/30 dark:text-emerald-200",
-      label: "translated",
-    },
-    FAILED_TRANSLATION: {
-      icon: <XCircle className="size-3.5" />,
-      cls: "bg-rose-100 text-rose-900 dark:bg-rose-900/30 dark:text-rose-200",
-      label: "failed",
-    },
-  };
-  const m = map[d.status] || map.QUEUED;
-  return (
-    <div className="flex items-center gap-2 border-t py-1.5 text-xs">
-      <FileText className="size-3.5 shrink-0 text-muted-foreground" />
-      <span className="min-w-0 flex-1 truncate" title={d.file_name}>
-        {d.file_name}
-      </span>
-      {d.target_language && <span className="text-muted-foreground">→ {d.target_language}</span>}
-      <Badge className={`gap-1 ${m.cls}`}>
-        {m.icon}
-        {m.label}
-      </Badge>
-    </div>
-  );
-}
+import { api, Prompt } from "@/api";
 
 // A curated set of target languages the demo commonly needs. The value is the
 // full English name (the pipeline slugifies it for filenames).
@@ -77,27 +41,27 @@ export function UploadDialog({
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [docs, setDocs] = useState<DocumentStatus[]>([]);
+  const [prompts, setPrompts] = useState<Prompt[]>([]);
+  const [promptId, setPromptId] = useState<number | "">("");
+  const [existingNames, setExistingNames] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Poll pipeline status while the dialog is open so the user sees their
-  // upload move queued → translating → translated without leaving the dialog.
+  // On open: load the prompt library (required selection; pre-select if there's
+  // exactly one) and the set of existing document names (to warn on a same-name
+  // upload before the user commits, since pair_id is keyed to the filename).
   useEffect(() => {
     if (!open) return;
-    let cancelled = false;
-    const tick = () =>
-      api
-        .documents()
-        .then((r) => {
-          if (!cancelled) setDocs(r.documents);
-        })
-        .catch(() => {});
-    tick();
-    const id = setInterval(tick, 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    api
+      .prompts()
+      .then((ps) => {
+        setPrompts(ps);
+        setPromptId((cur) => (cur === "" && ps.length === 1 ? ps[0].prompt_id : cur));
+      })
+      .catch(() => setPrompts([]));
+    api
+      .documents()
+      .then((r) => setExistingNames(new Set(r.documents.map((d) => d.file_name))))
+      .catch(() => setExistingNames(new Set()));
   }, [open]);
 
   const reset = () => {
@@ -107,18 +71,18 @@ export function UploadDialog({
     setBusy(false);
   };
 
-  // Does the picked filename already exist in the pipeline? pair_id is derived
-  // from the filename stem, so re-using a name would otherwise inherit the
-  // existing document's review state — we surface the choice instead.
-  const collision = file ? docs.some((d) => d.file_name === file.name) : false;
+  // Does the picked filename already exist? pair_id is derived from the filename
+  // stem, so re-using a name would otherwise inherit the existing document's
+  // review state — we surface the choice (replace vs copy) instead of guessing.
+  const collision = file ? existingNames.has(file.name) : false;
 
   const submit = async (onConflict: "rename" | "replace" = "rename") => {
-    if (!file) return;
+    if (!file || promptId === "") return;
     setBusy(true);
     setError(null);
     setMsg(null);
     try {
-      const r = await api.upload(file, target, onConflict);
+      const r = await api.upload(file, target, promptId as number, onConflict);
       setMsg(r.message);
       setFile(null);
       onUploaded();
@@ -195,6 +159,28 @@ export function UploadDialog({
 
           <div>
             <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Translation prompt <span className="text-destructive">*</span>
+            </label>
+            <Select
+              value={promptId === "" ? "" : String(promptId)}
+              onChange={(e) => setPromptId(e.target.value === "" ? "" : Number(e.target.value))}
+            >
+              <option value="">— select a prompt —</option>
+              {prompts.map((p) => (
+                <option key={p.prompt_id} value={String(p.prompt_id)}>
+                  {p.name}
+                </option>
+              ))}
+            </Select>
+            {prompts.length === 0 && (
+              <p className="mt-1 text-[11px] text-amber-600">
+                No prompts available. Create one in the Instructions tab first.
+              </p>
+            )}
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Target language
             </label>
             <Select value={target} onChange={(e) => setTarget(e.target.value)}>
@@ -216,27 +202,6 @@ export function UploadDialog({
               {error}
             </div>
           )}
-
-          {docs.length > 0 && (
-            <div>
-              <div className="mb-1 flex items-center justify-between">
-                <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Pipeline status
-                </span>
-                <span className="text-[10px] text-muted-foreground">auto-refreshing</span>
-              </div>
-              <div className="max-h-48 overflow-y-auto rounded-md border px-2">
-                {docs.map((d) => (
-                  <StatusRow key={d.file_name} d={d} />
-                ))}
-              </div>
-              {docs.some((d) => d.status === "FAILED_TRANSLATION" && d.error) && (
-                <p className="mt-1 text-[11px] text-rose-600">
-                  {docs.find((d) => d.status === "FAILED_TRANSLATION")?.error}
-                </p>
-              )}
-            </div>
-          )}
         </div>
 
         <DialogFooter className="gap-2">
@@ -245,17 +210,24 @@ export function UploadDialog({
           </Button>
           {collision ? (
             <>
-              <Button variant="outline" disabled={busy} onClick={() => submit("replace")}>
+              <Button
+                variant="outline"
+                disabled={busy || promptId === ""}
+                onClick={() => submit("replace")}
+              >
                 {busy ? <Loader2 className="animate-spin" /> : null}
                 Replace existing
               </Button>
-              <Button disabled={busy} onClick={() => submit("rename")}>
+              <Button disabled={busy || promptId === ""} onClick={() => submit("rename")}>
                 {busy ? <Loader2 className="animate-spin" /> : <UploadCloud />}
                 Upload as a copy
               </Button>
             </>
           ) : (
-            <Button disabled={!file || busy} onClick={() => submit("rename")}>
+            <Button
+              disabled={!file || promptId === "" || busy}
+              onClick={() => submit("rename")}
+            >
               {busy ? <Loader2 className="animate-spin" /> : <UploadCloud />}
               Upload &amp; translate
             </Button>
