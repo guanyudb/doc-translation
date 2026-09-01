@@ -79,12 +79,22 @@ export function ReviewView({
   const loadDetail = useCallback((id: string) => {
     setLoading(true);
     setError(null);
-    Promise.all([api.pair(id), api.preview(id, "original"), api.preview(id, "translated")])
-      .then(([d, o, t]) => {
+    // The pair detail is required; the two HTML previews are secondary — a
+    // failed preview should leave that pane empty, not blank the whole view.
+    api
+      .pair(id)
+      .then(async (d) => {
         setDetail(d);
-        setOrigHtml(o);
-        setTranHtml(t);
         setActiveIdx(null);
+        const [o, t] = await Promise.allSettled([
+          api.preview(id, "original"),
+          api.preview(id, "translated"),
+        ]);
+        setOrigHtml(o.status === "fulfilled" ? o.value : "");
+        setTranHtml(t.status === "fulfilled" ? t.value : "");
+        if (o.status === "rejected" || t.status === "rejected") {
+          setError("A document preview failed to render; review actions still work.");
+        }
       })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));

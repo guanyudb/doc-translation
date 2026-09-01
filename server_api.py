@@ -23,10 +23,12 @@ The Streamlit app this replaces is preserved at legacy/streamlit_app.py.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
+from collections import OrderedDict
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Body, Request, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Body, Path, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -36,9 +38,16 @@ from server import glossary as glossary_mod
 from server import prompts as prompts_mod
 from server.db import pool
 
+log = logging.getLogger("doc_translation")
+
 app = FastAPI(title="Doc Translation Review")
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+# Set by _startup() if the pool can't be opened at boot — surfaced by
+# /api/health so operators can tell a broken app from a healthy one (Databricks
+# Apps report RUNNING even when the backend can't reach its data layer).
+_startup_error: str | None = None
 
 
 @app.middleware("http")
@@ -52,18 +61,41 @@ async def _capture_identity(request: Request, call_next):
 
 @app.on_event("startup")
 def _startup() -> None:
+    global _startup_error
     # Open the psycopg pool once. Safe if already open (idempotent proxy).
+    # Never block boot on it — but DO record the failure so /api/health can
+    # report it (Databricks Apps show RUNNING even when the DB is unreachable).
     try:
         pool.open(wait=True, timeout=30.0)
-    except Exception:
-        pass
+    except Exception as e:
+        _startup_error = f"pool.open failed: {e}"
+        log.exception("startup: could not open Lakebase pool")
     # Seed the built-in default prompt if the library is empty. Idempotent; the
-    # app SP has INSERT so it can self-seed once the table exists. Best-effort —
-    # never block boot on it.
+    # app SP has INSERT so it can self-seed once the table exists. Best-effort.
     try:
         prompts_mod.seed_default_prompt()
     except Exception:
-        pass
+        log.exception("startup: default prompt seed failed")
+
+
+@app.get("/api/health")
+def health():
+    """Readiness probe. Databricks Apps report RUNNING even when the backend
+    can't reach Lakebase — this tells them apart. 503 when the pool never
+    opened or a probe query fails."""
+    detail: dict = {"startup_error": _startup_error}
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        detail["lakebase"] = "ok"
+    except Exception as e:
+        detail["lakebase"] = f"error: {e}"
+        return JSONResponse(status_code=503, content={"status": "unhealthy", **detail})
+    if _startup_error:
+        return JSONResponse(status_code=503, content={"status": "degraded", **detail})
+    return {"status": "ok", **detail}
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +103,10 @@ def _startup() -> None:
 # ---------------------------------------------------------------------------
 
 # Render is relatively expensive (mammoth conversion); cache per (path, size).
-_render_cache: dict[str, tuple[str, list[dict]]] = {}
+# Bounded LRU so a long-running instance reviewing many documents doesn't grow
+# memory without limit (each entry is a full rendered doc + paragraph list).
+_RENDER_CACHE_MAX = 64
+_render_cache: "OrderedDict[str, tuple[str, list[dict]]]" = OrderedDict()
 
 
 def _render(path: str) -> tuple[str, list[dict]]:
@@ -79,15 +114,28 @@ def _render(path: str) -> tuple[str, list[dict]]:
     key = f"{path}:{len(b)}"
     hit = _render_cache.get(key)
     if hit is not None:
+        _render_cache.move_to_end(key)  # mark most-recently-used
         return hit
     out = docx_render.render(b)
     _render_cache[key] = out
+    if len(_render_cache) > _RENDER_CACHE_MAX:
+        _render_cache.popitem(last=False)  # evict least-recently-used
     return out
 
 
 def _list_pairs() -> list[dict]:
-    originals = volume.list_docx(config.RAW_DIR)
-    translated = volume.list_docx(config.TRANSLATED_DIR)
+    # The Files API can blip; a transient listing failure shouldn't 500 the
+    # whole pairs endpoint — degrade to whatever we can list.
+    try:
+        originals = volume.list_docx(config.RAW_DIR)
+    except Exception:
+        log.exception("_list_pairs: could not list raw_documents")
+        originals = []
+    try:
+        translated = volume.list_docx(config.TRANSLATED_DIR)
+    except Exception:
+        log.exception("_list_pairs: could not list translated_inplace")
+        translated = []
     return volume.auto_pair(originals, translated)
 
 
@@ -98,6 +146,7 @@ def _resolve(pair_id: str) -> dict:
     try:
         db = store.get_pair(pair_id)
     except Exception:
+        log.warning("_resolve: Lakebase get_pair(%s) failed; falling back to Volume scan", pair_id, exc_info=True)
         db = None
     if db and db.get("original_path") and db.get("translated_path"):
         return {
@@ -300,7 +349,7 @@ def _para_response(pair_id: str, idx: int) -> dict:
 
 
 @app.post("/api/pairs/{pair_id}/paragraphs/{idx}/status")
-def set_status(pair_id: str, idx: int, status: str = Body(..., embed=True)):
+def set_status(pair_id: str, idx: int = Path(..., ge=0), status: str = Body(..., embed=True)):
     if status not in ("pending", "certified", "flagged"):
         raise HTTPException(400, "invalid status")
     try:
@@ -311,7 +360,7 @@ def set_status(pair_id: str, idx: int, status: str = Body(..., embed=True)):
 
 
 @app.post("/api/pairs/{pair_id}/paragraphs/{idx}/comment")
-def set_comment(pair_id: str, idx: int, comment: str = Body(..., embed=True)):
+def set_comment(pair_id: str, idx: int = Path(..., ge=0), comment: str = Body(..., embed=True)):
     try:
         store.upsert_feedback(pair_id, idx, None, comment, auth.reviewer())
     except store.PairLockedError as e:
@@ -320,7 +369,7 @@ def set_comment(pair_id: str, idx: int, comment: str = Body(..., embed=True)):
 
 
 @app.post("/api/pairs/{pair_id}/paragraphs/{idx}/edit")
-def set_edit(pair_id: str, idx: int, edited_text: str | None = Body(None, embed=True)):
+def set_edit(pair_id: str, idx: int = Path(..., ge=0), edited_text: str | None = Body(None, embed=True)):
     try:
         store.upsert_edit(pair_id, idx, edited_text, auth.reviewer())
     except store.PairLockedError as e:
@@ -363,7 +412,7 @@ def certify_page(pair_id: str, page: int = Body(..., embed=True)):
 
 
 @app.post("/api/upload")
-async def upload_document(
+def upload_document(
     file: UploadFile = File(...),
     target_language: str = Form("English"),
     on_conflict: str = Form("rename"),  # "rename" (default) | "replace"
@@ -390,7 +439,9 @@ async def upload_document(
         raise HTTPException(400, "only .docx files are supported")
     if name.startswith("~$") or "/" in name or "\\" in name:
         raise HTTPException(400, "invalid filename")
-    data = await file.read()
+    # Sync endpoint runs in FastAPI's threadpool (all the volume/DB calls below
+    # block), so read the upload via the underlying sync file object.
+    data = file.file.read()
     if not data:
         raise HTTPException(400, "empty file")
 
@@ -793,8 +844,10 @@ def glossary_approve(entry_id: int, approved: bool = Body(..., embed=True)):
 
 
 @app.post("/api/glossary/import")
-async def glossary_import(file: UploadFile = File(...)):
-    data = await file.read()
+def glossary_import(file: UploadFile = File(...)):
+    # Sync endpoint (ingest does blocking DB work) → runs in the threadpool;
+    # read via the underlying sync file object.
+    data = file.file.read()
     n = glossary_mod.ingest_glossary_csv(data, source="customer", approved=True)
     return {"imported": n}
 
