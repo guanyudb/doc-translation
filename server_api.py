@@ -36,6 +36,7 @@ from server import config, volume, store, docx_render, auth, delta_sync
 from server import confidence as conf_mod
 from server import glossary as glossary_mod
 from server import prompts as prompts_mod
+from server import settings as settings_mod
 from server.db import pool
 
 log = logging.getLogger("doc_translation")
@@ -217,16 +218,41 @@ def _confidence_flags(c: dict) -> list[str]:
 
 @app.get("/api/config")
 def get_config():
+    # Runtime settings (Volume-backed) override the deploy-time env defaults for
+    # branding / target language / model, and carry the first-run gate flag.
+    s = settings_mod.load()
     return {
         "reviewer": auth.reviewer(),
-        "target_language": os.environ.get("TRANSLATION_TARGET_LANGUAGE", "English"),
+        "target_language": s["target_language"],
+        "model_endpoint": s["model_endpoint"],
+        "is_configured": s["is_configured"],
         "delta_sync_enabled": delta_sync.enabled(),
-        "title": config.APP_TITLE,
-        "logo_url": config.APP_LOGO_URL,
-        "logo_alt": config.APP_LOGO_ALT,
+        "title": s["app_title"],
+        "logo_url": s["logo_url"],
+        "logo_alt": s["logo_alt"],
         "logo_width": config.APP_LOGO_WIDTH,
         "logo_height": config.APP_LOGO_HEIGHT,
     }
+
+
+# ---------------------------------------------------------------------------
+# Settings (first-run setup + admin) — Volume-backed, read by the pipeline too
+# ---------------------------------------------------------------------------
+
+@app.get("/api/settings")
+def get_settings():
+    """Full settings document for the Settings page (force-reads the Volume so
+    an admin sees the persisted truth, not a possibly-stale cache)."""
+    return settings_mod.load(force=True)
+
+
+@app.put("/api/settings")
+def put_settings(patch: dict = Body(...)):
+    """Persist a partial settings update and mark the app configured. Accepts
+    any of: model_endpoint, target_language, app_title, logo_url, logo_alt."""
+    if not isinstance(patch, dict):
+        raise HTTPException(400, "body must be a JSON object")
+    return settings_mod.save(patch, actor=auth.reviewer())
 
 
 # ---------------------------------------------------------------------------

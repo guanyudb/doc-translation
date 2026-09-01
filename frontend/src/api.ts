@@ -67,6 +67,8 @@ export interface GlossaryEntry {
 export interface AppConfig {
   reviewer: string;
   target_language: string;
+  model_endpoint: string;
+  is_configured: boolean;
   delta_sync_enabled: boolean;
   title: string;
   logo_url: string | null;
@@ -74,6 +76,21 @@ export interface AppConfig {
   logo_width: number | null;
   logo_height: number | null;
 }
+
+export interface AppSettings {
+  model_endpoint: string;
+  target_language: string;
+  app_title: string;
+  logo_url: string | null;
+  logo_alt: string | null;
+  is_configured: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+export type SettingsPatch = Partial<
+  Pick<AppSettings, "model_endpoint" | "target_language" | "app_title" | "logo_url" | "logo_alt">
+>;
 
 export interface Prompt {
   prompt_id: number;
@@ -124,6 +141,15 @@ async function j<T>(res: Response): Promise<T> {
 
 export const api = {
   config: () => fetch("/api/config").then(j<AppConfig>),
+
+  settings: () => fetch("/api/settings").then(j<AppSettings>),
+
+  saveSettings: (patch: SettingsPatch) =>
+    fetch("/api/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then(j<AppSettings>),
 
   pairs: () => fetch("/api/pairs").then(j<PairSummary[]>),
 

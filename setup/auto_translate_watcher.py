@@ -63,6 +63,25 @@ glossary_delta_table = dbutils.widgets.get("glossary_delta_table").strip()
 lang_slug = re.sub(r"[^a-z0-9]+", "_", target_language.lower()).strip("_") or "translated"
 bronze_fqn = f"{bronze_catalog}.{bronze_schema}.bronze_documents"
 
+# Runtime model override: the app's Settings page writes the chosen FMAPI model
+# to {vol_root}/config/settings.json (see server/settings.py). If it's present
+# and the app has been configured, it wins over the job-param default so an
+# operator can switch models without redeploying the pipeline. The .prompt
+# sidecar stays the per-document override for the system prompt; this is the
+# global model endpoint.
+_vol_root = raw_dir[: -len("/raw_documents")] if raw_dir.endswith("/raw_documents") else raw_dir.rsplit("/", 1)[0]
+_settings_path = f"{_vol_root}/config/settings.json"
+try:
+    if os.path.exists(_settings_path):
+        with open(_settings_path, "r", encoding="utf-8") as _fh:
+            _s = json.load(_fh)
+        if isinstance(_s, dict) and _s.get("is_configured") and (_s.get("model_endpoint") or "").strip():
+            if _s["model_endpoint"].strip() != model_endpoint:
+                print(f"model_endpoint  : overriding job default with Settings value {_s['model_endpoint'].strip()!r}")
+            model_endpoint = _s["model_endpoint"].strip()
+except Exception as _e:
+    print(f"  (settings.json read skipped: {_e})")
+
 print(f"raw_dir         : {raw_dir}")
 print(f"translated_dir  : {translated_dir}")
 print(f"target_language : {target_language} (slug={lang_slug})")
