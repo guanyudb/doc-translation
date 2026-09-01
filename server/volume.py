@@ -32,6 +32,37 @@ def list_docx(folder: str) -> list[dict]:
     return sorted(out, key=lambda r: r["name"].lower())
 
 
+def list_ext(folder: str, exts: tuple[str, ...]) -> list[dict]:
+    """Return [{name, path, size, modified}] for files in a Volume folder whose
+    name ends with one of `exts` (lowercased). Skips Office lock files."""
+    out: list[dict] = []
+    for entry in config.w().files.list_directory_contents(folder):
+        if entry.is_directory:
+            continue
+        low = entry.path.lower()
+        if not low.endswith(exts):
+            continue
+        if entry.name.startswith("~$"):
+            continue
+        out.append({
+            "name": entry.name,
+            "path": entry.path,
+            "size": entry.file_size,
+            "modified": entry.last_modified,
+        })
+    return sorted(out, key=lambda r: r["name"].lower())
+
+
+def list_pdf(folder: str) -> list[dict]:
+    """Raw source PDFs. `.pdf.json` artifacts end in `.json`, so they're excluded."""
+    return list_ext(folder, (".pdf",))
+
+
+def list_pdf_artifacts(folder: str) -> list[dict]:
+    """PDF translation artifacts written by the in-app PDF pipeline."""
+    return list_ext(folder, (".pdf.json",))
+
+
 def read_docx(path: str) -> bytes:
     resp = config.w().files.download(path)
     if hasattr(resp.contents, "read"):
@@ -158,6 +189,50 @@ def auto_pair(originals: list[dict], translated: list[dict]) -> list[dict]:
             "target_lang": target,
         })
     return pairs
+
+
+def auto_pair_pdf(originals: list[dict], artifacts: list[dict]) -> list[dict]:
+    """Match raw PDFs to their translation artifacts by basename prefix.
+    e.g. 'Protocol.pdf' ↔ 'Protocol_translated_english.pdf.json'.
+
+    Shape matches `auto_pair` (so the app treats PDF and DOCX pairs uniformly)
+    plus a `kind: 'pdf'` tag. `original_path` stays the raw PDF (used as the
+    layout-export base); `translated_path` is the artifact the app renders."""
+    pairs: list[dict] = []
+    used: set[str] = set()
+    for o in originals:
+        stem = o["name"][:-len(".pdf")]
+        marker = "_translated_"
+        match = None
+        for a in artifacts:
+            if a["name"].startswith(stem + marker) and a["name"] not in used:
+                match = a
+                break
+        if match is None:
+            continue
+        used.add(match["name"])
+        tname = match["name"]
+        target = tname[tname.index(marker) + len(marker):]
+        if target.endswith(".pdf.json"):
+            target = target[:-len(".pdf.json")]
+        pairs.append({
+            "pair_id": stem,
+            "original_name": o["name"],
+            "original_path": o["path"],
+            "translated_name": match["name"],
+            "translated_path": match["path"],
+            "target_lang": target,
+            "kind": "pdf",
+        })
+    return pairs
+
+
+def find_pdf_artifact(stem: str) -> str | None:
+    """Locate the translation artifact for a raw PDF stem, if it exists yet."""
+    for a in list_pdf_artifacts(config.TRANSLATED_DIR):
+        if a["name"].startswith(stem + "_translated"):
+            return a["path"]
+    return None
 
 
 def unpaired_originals(originals: list[dict], translated: list[dict]) -> list[dict]:

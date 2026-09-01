@@ -49,3 +49,11 @@ targets:
     default: true
     presets:
       name_prefix: ""
+
+  # Isolated try-app for the PDF workflow (pdf-translation-workflow branch).
+  # Fully walled off from `prod` via distinct app/schema/volume/pg_schema/secret
+  # scope in .databricks/bundle/pdftry/variable-overrides.json — deploy with
+  # `./deploy.sh pdftry --profile <p>`. Not for customer use.
+  pdftry:
+    presets:
+      name_prefix: ""

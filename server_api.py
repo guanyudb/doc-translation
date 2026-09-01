@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from collections import OrderedDict
 
@@ -37,6 +38,7 @@ from server import confidence as conf_mod
 from server import glossary as glossary_mod
 from server import prompts as prompts_mod
 from server import settings as settings_mod
+from server import pdf_render, pdf_translate, pdf_layout
 from server.db import pool
 
 log = logging.getLogger("doc_translation")
@@ -108,9 +110,47 @@ def health():
 # memory without limit (each entry is a full rendered doc + paragraph list).
 _RENDER_CACHE_MAX = 64
 _render_cache: "OrderedDict[str, tuple[str, list[dict]]]" = OrderedDict()
+_artifact_cache: "OrderedDict[str, dict]" = OrderedDict()
+# stem -> artifact path, so a PDF source-side render doesn't re-list the Volume
+# on every edit. Artifacts don't move once written, so this is safe to memoize.
+_pdf_artifact_path: dict[str, str] = {}
+
+
+def _load_artifact(artifact_path: str) -> dict:
+    """Download + parse a PDF translation artifact JSON (bounded LRU cache)."""
+    raw = volume.read_docx(artifact_path)  # generic download; any path works
+    key = f"{artifact_path}:{len(raw)}"
+    hit = _artifact_cache.get(key)
+    if hit is not None:
+        _artifact_cache.move_to_end(key)
+        return hit
+    art = json.loads(raw.decode("utf-8"))
+    _artifact_cache[key] = art
+    if len(_artifact_cache) > _RENDER_CACHE_MAX:
+        _artifact_cache.popitem(last=False)
+    return art
 
 
 def _render(path: str) -> tuple[str, list[dict]]:
+    """Render a document path to (html, paragraphs[]). Format-aware, but the
+    `data-pidx`/`data-page` contract is identical for both, so every downstream
+    review path (detail, preview, edits, certify) is format-agnostic:
+
+      * ``….pdf.json`` → PDF artifact, TARGET side (translated pane)
+      * ``….pdf``      → PDF artifact for that stem, SOURCE side (original pane)
+      * ``….docx``     → DOCX via mammoth (docx_render), cached (conversion is
+                         expensive; PDF render is cheap string-building)
+    """
+    low = path.lower()
+    if low.endswith(".pdf.json"):
+        return pdf_render.render(_load_artifact(path), "target")
+    if low.endswith(".pdf"):
+        stem = path.rsplit("/", 1)[-1][: -len(".pdf")]
+        art_path = _pdf_artifact_path.get(stem) or volume.find_pdf_artifact(stem)
+        if not art_path:
+            raise HTTPException(404, f"no translation artifact yet for {stem}")
+        _pdf_artifact_path[stem] = art_path
+        return pdf_render.render(_load_artifact(art_path), "source")
     b = volume.read_docx(path)
     key = f"{path}:{len(b)}"
     hit = _render_cache.get(key)
@@ -137,7 +177,16 @@ def _list_pairs() -> list[dict]:
     except Exception:
         log.exception("_list_pairs: could not list translated_inplace")
         translated = []
-    return volume.auto_pair(originals, translated)
+    pairs = volume.auto_pair(originals, translated)
+    # PDF pairs (raw .pdf ↔ .pdf.json artifact) — a parallel workflow that shares
+    # the same review model, so they merge into one list the UI renders uniformly.
+    try:
+        raw_pdfs = volume.list_pdf(config.RAW_DIR)
+        artifacts = volume.list_pdf_artifacts(config.TRANSLATED_DIR)
+        pairs += volume.auto_pair_pdf(raw_pdfs, artifacts)
+    except Exception:
+        log.exception("_list_pairs: could not list PDF pairs")
+    return pairs
 
 
 def _resolve(pair_id: str) -> dict:
@@ -437,6 +486,70 @@ def certify_page(pair_id: str, page: int = Body(..., embed=True)):
     return {"certified": n, "page": page}
 
 
+# --- PDF workflow: in-app parse + translate (background), separate from the
+# DOCX file-arrival job. Presence of the artifact = done; a `.error` sidecar =
+# failed; neither, with the raw PDF present = still translating.
+_pdf_inflight: set[str] = set()
+_pdf_inflight_lock = threading.Lock()
+
+
+def _run_pdf_translation_bg(*, pdf_path: str, name: str, target_language: str,
+                            prompt_body: str, model_endpoint: str) -> None:
+    err_path = f"{pdf_path}.error"
+    with _pdf_inflight_lock:
+        _pdf_inflight.add(name)
+    try:
+        pdf_translate.run(
+            pdf_path, target_lang=target_language,
+            base_prompt=prompt_body, model_endpoint=model_endpoint,
+        )
+        # Success — clear any stale error sidecar + force a fresh artifact lookup.
+        _pdf_artifact_path.pop(name[: -len(".pdf")], None)
+        try:
+            config.w().files.delete(err_path)
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception("pdf background translation failed: %s", pdf_path)
+        try:
+            volume.upload_docx(err_path, str(e).encode("utf-8"))
+        except Exception:
+            pass
+    finally:
+        with _pdf_inflight_lock:
+            _pdf_inflight.discard(name)
+
+
+def _pdf_status_rows(*, only_user: str | None = None) -> list[dict]:
+    """Processing-view rows for PDFs (no bronze table — status is derived from
+    Volume state): `.error` sidecar → FAILED, artifact present → TRANSLATED,
+    otherwise → TRANSLATING. Shape matches the DOCX rows the endpoints emit."""
+    rows: list[dict] = []
+    try:
+        raw_pdfs = volume.list_pdf(config.RAW_DIR)
+    except Exception:
+        return rows
+    for f in raw_pdfs:
+        name = f["name"]
+        stem = name[: -len(".pdf")]
+        if only_user is not None and volume.read_text(f"{config.RAW_DIR}/{name}.user") != only_user:
+            continue
+        err = volume.read_text(f"{config.RAW_DIR}/{name}.error")
+        if err:
+            status = "FAILED_TRANSLATION"
+        elif volume.find_pdf_artifact(stem):
+            status = "TRANSLATED"
+        else:
+            status = "TRANSLATING"
+        rows.append({
+            "file_name": name, "status": status,
+            "target_language": volume.read_text(f"{config.RAW_DIR}/{name}.lang"),
+            "source_language": None, "started_at": None, "ended_at": None,
+            "error": err, "elapsed_seconds": None,
+        })
+    return rows
+
+
 @app.post("/api/upload")
 def upload_document(
     file: UploadFile = File(...),
@@ -444,9 +557,12 @@ def upload_document(
     on_conflict: str = Form("rename"),  # "rename" (default) | "replace"
     prompt_id: int = Form(...),
 ):
-    """Accept a source .docx, write it to raw_documents/. The file-arrival
-    trigger on that folder kicks off the translation pipeline; the resulting
-    pair shows up in /api/pairs once translation completes.
+    """Accept a source .docx or .pdf, write it to raw_documents/.
+
+    DOCX: the file-arrival trigger kicks off the Lakeflow translation job.
+    PDF: an in-app background task parses (ai_parse_document) + translates and
+    writes a `.pdf.json` artifact. Either way the pair shows up in /api/pairs
+    once translation completes, and the review UI treats them identically.
 
     Three per-file sidecars are written alongside the .docx so the pipeline
     picks up the reviewer's choices without changing the bundle default:
@@ -461,10 +577,13 @@ def upload_document(
     auto-suffixes to keep both documents; 'replace' overwrites and clears the
     prior review state so certifications don't carry over to new content."""
     name = (file.filename or "").strip()
-    if not name.lower().endswith(".docx"):
-        raise HTTPException(400, "only .docx files are supported")
+    low = name.lower()
+    if not (low.endswith(".docx") or low.endswith(".pdf")):
+        raise HTTPException(400, "only .docx and .pdf files are supported")
     if name.startswith("~$") or "/" in name or "\\" in name:
         raise HTTPException(400, "invalid filename")
+    is_pdf = low.endswith(".pdf")
+    ext = ".pdf" if is_pdf else ".docx"
     # Sync endpoint runs in FastAPI's threadpool (all the volume/DB calls below
     # block), so read the upload via the underlying sync file object.
     data = file.file.read()
@@ -485,8 +604,12 @@ def upload_document(
     #   * rename (default)  — auto-suffix to keep both documents distinct
     #   * replace           — caller passes on_conflict=replace, knowing the
     #                         existing review state applies to new content
-    stem = name[: -len(".docx")]
+    stem = name[: -len(ext)]
     existing = {f["name"] for f in volume.list_docx(config.RAW_DIR)}
+    try:
+        existing |= {f["name"] for f in volume.list_pdf(config.RAW_DIR)}
+    except Exception:
+        pass
     renamed_from = None
     if name in existing:
         if on_conflict == "replace":
@@ -498,9 +621,9 @@ def upload_document(
                 pass
         else:
             n = 2
-            while f"{stem}_{n}.docx" in existing:
+            while f"{stem}_{n}{ext}" in existing:
                 n += 1
-            renamed_from, name = name, f"{stem}_{n}.docx"
+            renamed_from, name = name, f"{stem}_{n}{ext}"
 
     dest = f"{config.RAW_DIR}/{name}"
     # Write the sidecars FIRST so they're already present when the .docx lands
@@ -523,23 +646,37 @@ def upload_document(
         "body": prompt["body"],
     })
     volume.upload_docx(f"{config.RAW_DIR}/{name}.prompt", snapshot.encode("utf-8"))
-    # The document last — its arrival is what triggers the pipeline.
+    # The document last — for DOCX its arrival triggers the Lakeflow job.
     volume.upload_docx(dest, data)
 
+    # PDF: no file-arrival job — parse + translate in-app on a background thread
+    # so the upload returns immediately and the pair appears once the artifact
+    # is written. Uses the runtime model endpoint + the chosen (frozen) prompt.
+    if is_pdf:
+        model_endpoint = settings_mod.load().get("model_endpoint") or "databricks-claude-sonnet-4-6"
+        threading.Thread(
+            target=_run_pdf_translation_bg,
+            kwargs=dict(pdf_path=dest, name=name, target_language=target_language,
+                        prompt_body=prompt["body"], model_endpoint=model_endpoint),
+            daemon=True,
+        ).start()
+
+    how = ("Translation is running now" if is_pdf
+           else "Translation runs on file arrival")
     if renamed_from:
         message = (
             f"A document named {renamed_from} already exists, so this was uploaded "
-            f"as {name} to keep them separate. Translation runs on file arrival; "
-            f"it will appear in the list once it completes (usually 1–3 min)."
+            f"as {name} to keep them separate. {how}; it will appear in the list "
+            f"once it completes (usually 1–3 min)."
         )
     elif on_conflict == "replace":
         message = (
-            f"Replaced {name} and cleared its previous review state. Translation "
-            f"runs on file arrival; it will reappear once it completes."
+            f"Replaced {name} and cleared its previous review state. {how}; it "
+            f"will reappear once it completes."
         )
     else:
-        message = ("Uploaded. Translation runs on file arrival; the pair will "
-                   "appear in the list once it completes (usually 1–3 min).")
+        message = (f"Uploaded. {how}; the pair will appear in the list once it "
+                   f"completes (usually 1–3 min).")
 
     return {
         "ok": True,
@@ -610,6 +747,7 @@ def list_documents():
     except Exception:
         pass
 
+    rows += _pdf_status_rows()  # in-app PDF workflow (not tracked in bronze)
     return {"documents": rows, "warehouse_configured": delta_sync.enabled()}
 
 
@@ -737,6 +875,7 @@ def processing_status():
     except Exception:
         pass
 
+    rows += _pdf_status_rows(only_user=user)  # this user's in-app PDF jobs
     return {
         "user": user,
         "pipeline": _pipeline_status(),
@@ -745,9 +884,49 @@ def processing_status():
     }
 
 
+def _is_pdf_pair(match: dict) -> bool:
+    return (match.get("translated_path") or "").lower().endswith(".pdf.json")
+
+
+def _copy_to_golden_pdf(pair_id: str, target_lang: str,
+                        orig_bytes: bytes, tran_bytes: bytes) -> dict:
+    """PDF analogue of volume.copy_to_golden (which is .docx-named)."""
+    lang = (target_lang or "tr").lower()
+    base = f"{volume.GOLDEN_DIR}/{pair_id}"
+    g_orig = f"{base}/{pair_id}_original.pdf"
+    g_tran = f"{base}/{pair_id}_translated_{lang}.pdf"
+    volume.upload_docx(g_orig, orig_bytes)
+    volume.upload_docx(g_tran, tran_bytes)
+    return {
+        "golden_original_path": g_orig,
+        "golden_translated_path": g_tran,
+        "golden_original_hash": volume.sha256(orig_bytes),
+        "golden_translated_hash": volume.sha256(tran_bytes),
+    }
+
+
+def _publish_pdf(pair_id: str, match: dict) -> dict:
+    """Bake edits (if any) into a layout-preserving translated PDF. Unlike DOCX,
+    PDF publish is allowed with zero edits — it produces the translated PDF
+    deliverable (the layout-preserving 'put it back' output)."""
+    version = store.next_publish_version(pair_id)
+    lang = (match.get("target_lang") or "tr").lower()
+    target_path = f"{volume.REVIEWED_DIR}/{pair_id}_reviewed_{lang}_v{version}.pdf"
+    all_edits = store.get_edits(pair_id)
+    raw_pdf = volume.read_docx(f"{config.RAW_DIR}/{pair_id}.pdf")
+    artifact = _load_artifact(match["translated_path"])
+    new_bytes = pdf_layout.apply_edits_to_pdf(raw_pdf, artifact, all_edits)
+    volume.upload_docx(target_path, new_bytes)
+    applied = len(all_edits)
+    store.record_publish(pair_id, target_path, applied, auth.reviewer())
+    return {"output_path": target_path, "edits_applied": applied, "version": version}
+
+
 @app.post("/api/pairs/{pair_id}/publish")
 def publish(pair_id: str):
     match = _resolve(pair_id)
+    if _is_pdf_pair(match):
+        return _publish_pdf(pair_id, match)
     pending = store.get_pending_edits(pair_id)
     if not pending:
         raise HTTPException(400, "no pending edits to publish")
@@ -775,15 +954,26 @@ def promote(pair_id: str):
 
     store.begin_gold_promotion(pair_id, actor)
     try:
-        orig_bytes = volume.read_docx(match["original_path"])
-        tran_source = publish_history[0]["output_path"] if publish_history else match["translated_path"]
-        tran_bytes = volume.read_docx(tran_source)
-        copy_info = volume.copy_to_golden(
-            pair_id=pair_id,
-            target_lang=match["target_lang"] or "tr",
-            original_bytes=orig_bytes,
-            translated_bytes=tran_bytes,
-        )
+        if _is_pdf_pair(match):
+            orig_bytes = volume.read_docx(f"{config.RAW_DIR}/{pair_id}.pdf")
+            if publish_history:
+                tran_bytes = volume.read_docx(publish_history[0]["output_path"])
+            else:
+                artifact = _load_artifact(match["translated_path"])
+                tran_bytes = pdf_layout.apply_edits_to_pdf(
+                    orig_bytes, artifact, store.get_edits(pair_id))
+            copy_info = _copy_to_golden_pdf(
+                pair_id, match.get("target_lang") or "tr", orig_bytes, tran_bytes)
+        else:
+            orig_bytes = volume.read_docx(match["original_path"])
+            tran_source = publish_history[0]["output_path"] if publish_history else match["translated_path"]
+            tran_bytes = volume.read_docx(tran_source)
+            copy_info = volume.copy_to_golden(
+                pair_id=pair_id,
+                target_lang=match["target_lang"] or "tr",
+                original_bytes=orig_bytes,
+                translated_bytes=tran_bytes,
+            )
         result = store.complete_gold_promotion(
             pair_id=pair_id, actor=actor,
             golden_original_path=copy_info["golden_original_path"],
