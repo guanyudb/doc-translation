@@ -19,38 +19,32 @@ resources:
       source_code_path: ${workspace.file_path}
 
       resources:
-        # ---- Lakebase Project (preferred) -----------------------------------
-        # Commented out: e2-demo-field-eng has no Lakebase Projects, only
-        # provisioned instances. Using the `database:` binding below instead.
-        # - name: postgres
-        #   postgres:
-        #     branch:     projects/${var.lakebase_project}/branches/${var.lakebase_branch}
-        #     database:   projects/${var.lakebase_project}/branches/${var.lakebase_branch}/databases/${var.lakebase_database_slug}
-        #     permission: CAN_CONNECT_AND_CREATE
+        # ---- Lakebase Project (preferred — this template's default) ---------
+        # This binding does two essential things in Project mode: it registers
+        # the app SP as a Postgres ROLE (so postdeploy's GRANTs can target it —
+        # without this they fail with `role "<sp>" does not exist`), and it
+        # injects PGHOST/PGUSER/PGPORT/PGDATABASE/PGSSLMODE into the app.
+        # Required for Project deployments (e.g. the `vlm` project on
+        # e2-demo-field-eng). Keep it ACTIVE unless you're on a legacy
+        # Provisioned instance (see below).
+        - name: postgres
+          postgres:
+            branch:     projects/${var.lakebase_project}/branches/${var.lakebase_branch}
+            database:   projects/${var.lakebase_project}/branches/${var.lakebase_branch}/databases/${var.lakebase_database_slug}
+            permission: CAN_CONNECT_AND_CREATE
 
         # ---- Lakebase Provisioned (legacy) ----------------------------------
-        # DO NOT bind a provisioned instance here, and DON'T bind it from
-        # postdeploy either. Adding a classic `database:` resource to an app is
-        # gated behind workspace-admin authority the deploying user usually
-        # lacks: both the Terraform-at-create path AND `w.apps.update` fail with
-        # "User does not have permission to grant permissions for added resource:
-        # postgres" — even when that user OWNS the instance + Postgres database
-        # and has CAN_MANAGE, and even when the app SP already holds the exact
-        # grants the binding would apply (verified empirically 2026-08-23).
-        #
-        # Instead the bundle creates the app WITHOUT a Postgres binding, and
-        # `setup/postdeploy.py` reproduces everything the binding would do using
-        # operations the deploying user CAN perform: (a) register the app SP as a
-        # Postgres role, (b) grant the SP CAN_USE on the instance so it can mint
-        # runtime DB credentials, and (c) GRANT CONNECT + schema/table privileges
-        # to the SP via SQL. The app derives PGHOST (instance read/write DNS) and
-        # PGUSER (DATABRICKS_CLIENT_ID) at runtime — see `server/config.py`.
-        # Re-runs after every `bundle deploy` (like the file-arrival trigger).
-        # - name: postgres
-        #   database:
-        #     instance_name: ${var.lakebase_instance}
-        #     database_name: databricks_postgres
-        #     permission:    CAN_CONNECT_AND_CREATE
+        # If you're on a legacy PROVISIONED instance (not a Project): comment
+        # out the `postgres:` block above and set `lakebase_instance` in your
+        # overrides. Do NOT add a classic `database:` binding here — for a
+        # non-workspace-admin deployer both the Terraform-at-create path and
+        # `w.apps.update` fail with "User does not have permission to grant
+        # permissions for added resource: postgres" even when the user owns the
+        # instance (verified 2026-08-23). Instead, `setup/postdeploy.py`
+        # reproduces what the binding would do (guarded by `if lakebase_instance:`):
+        # registers the app SP as a Postgres role, grants it CAN_USE on the
+        # instance, and GRANTs schema/table privileges; the app derives PGHOST +
+        # PGUSER at runtime (see server/config.py).
 
         # ---- SQL warehouse for Delta sync -----------------------------------
         - name: warehouse
