@@ -33,31 +33,24 @@ variables:
       translated_reviewed/, golden/. DAB creates it if it doesn't exist.
     default: doc-translation
 
-  # ---- Lakebase Project (preferred / new workspaces) ----
+  # ---- Lakebase (Autoscaling Project) ----
   lakebase_project:
     description: |
-      Lakebase Project name (Autoscaling). Required for new workspaces.
-      Leave empty to fall back to a legacy Provisioned instance.
+      Lakebase Project name (Autoscaling). Required — Provisioned Lakebase is
+      retired. Create/list with `databricks postgres list-projects`.
     default: ""
 
   lakebase_branch:
-    description: Lakebase Project branch. Almost always "main".
-    default: main
+    description: Lakebase Project branch. New projects default to "production".
+    default: production
 
   lakebase_database_slug:
     description: |
       Lakebase Postgres database RESOURCE slug (not the Postgres database
       name). For `databricks_postgres` the resource slug is usually
       `databricks-postgres`. Verify with:
-        databricks api get /api/2.0/postgres/projects/<proj>/branches/<branch>/databases
+        databricks postgres list-databases projects/<proj>/branches/<branch>
     default: databricks-postgres
-
-  # ---- Lakebase Provisioned (legacy) ----
-  lakebase_instance:
-    description: |
-      Lakebase Provisioned instance name. Set if you're on a legacy workspace
-      that still has a Provisioned instance and `lakebase_project` is empty.
-    default: ""
 
   # ---- SQL warehouse for the Delta mirror ----
   warehouse_id:

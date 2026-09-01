@@ -1,62 +1,41 @@
 """Workspace-portable configuration.
 
-Two Lakebase modes are supported:
-
-  * **Project (Autoscaling)** — the modern path; new workspaces. Set
-    `LAKEBASE_PROJECT` + `LAKEBASE_BRANCH` (default `main`). Apps' `postgres:`
-    resource binding auto-injects PGHOST / PGPORT / PGDATABASE / PGUSER /
-    PGSSLMODE; `server/db.py` mints an OAuth JWT per-connection via
-    `/api/2.0/postgres/credentials`.
-
-  * **Provisioned (legacy)** — pre-2026-03-12 workspaces with an existing
-    instance. Set `LAKEBASE_INSTANCE` (the instance name). We do NOT use the
-    classic `database:` app-resource binding here: binding it via the Apps API
-    requires workspace-admin authority the deploying user typically lacks (it
-    fails with "does not have permission to grant permissions for added
-    resource: postgres" even for the instance owner). So `setup/postdeploy.py`
-    instead registers the app SP as a Postgres role + grants it directly, and
-    this module DERIVES the connection coordinates at runtime: PGHOST from the
-    instance's read/write DNS, PGUSER from the app SP's client id
-    (`DATABRICKS_CLIENT_ID`, always injected into Apps). `server/db.py` mints
-    credentials via `WorkspaceClient.database.generate_database_credential`.
-
-Detection is explicit: presence of `LAKEBASE_PROJECT` wins, else fall back
-to `LAKEBASE_INSTANCE`. Exactly one mode must be set or boot will refuse.
+Lakebase runs on **Autoscaling Projects** (the Provisioned tier is retired —
+see the databricks-lakebase skill). Set `LAKEBASE_PROJECT` + `LAKEBASE_BRANCH`
+(default `production`). The app's `postgres:` resource binding auto-injects
+PGHOST / PGPORT / PGDATABASE / PGUSER / PGSSLMODE, and it registers the app
+service principal as a Postgres role so `setup/postdeploy.py` can GRANT to it.
+`server/db.py` mints an OAuth JWT per connection via
+`/api/2.0/postgres/credentials`.
 """
 import os
 from databricks.sdk import WorkspaceClient
 
 IS_DATABRICKS_APP = bool(os.environ.get("DATABRICKS_APP_NAME"))
 
-# Postgres connection. PGHOST/PGUSER are injected by a `postgres:`/`database:`
-# app-resource binding when one exists (Project mode, or Provisioned mode on an
-# admin-deployed workspace). In Provisioned mode without a binding they're
-# absent and derived lazily — see pg_host() / current_pg_user() below.
+# Postgres connection coordinates — injected by the `postgres:` app-resource
+# binding (see resources/app.yml).
 PGHOST     = os.environ.get("PGHOST")
 PGPORT     = os.environ.get("PGPORT", "5432")
 PGDATABASE = os.environ.get("PGDATABASE", "databricks_postgres")
 PGSSLMODE  = os.environ.get("PGSSLMODE", "require")
 PGSCHEMA   = os.environ.get("PGSCHEMA", "doc_translation")
 
-# Lakebase mode — Project takes precedence if both are somehow set. Empty
-# strings (which secrets-backed env vars produce when the customer left a
+
+# Empty strings (which secrets-backed env vars produce when the customer left a
 # field blank) are normalized to None.
 def _maybe(name: str) -> str | None:
     v = (os.environ.get(name) or "").strip()
     return v or None
 
-LAKEBASE_PROJECT  = _maybe("LAKEBASE_PROJECT")
-LAKEBASE_BRANCH   = _maybe("LAKEBASE_BRANCH") or "main"
-LAKEBASE_INSTANCE = _maybe("LAKEBASE_INSTANCE")  # Provisioned fallback
+LAKEBASE_PROJECT = _maybe("LAKEBASE_PROJECT")
+LAKEBASE_BRANCH  = _maybe("LAKEBASE_BRANCH") or "production"
 
-if not LAKEBASE_PROJECT and not LAKEBASE_INSTANCE:
+if not LAKEBASE_PROJECT:
     raise RuntimeError(
-        "Lakebase not configured. Set LAKEBASE_PROJECT + LAKEBASE_BRANCH "
-        "for a Lakebase Project, or LAKEBASE_INSTANCE for a legacy "
-        "Provisioned instance."
+        "Lakebase not configured. Set LAKEBASE_PROJECT (+ LAKEBASE_BRANCH) for "
+        "the Autoscaling Lakebase Project this app connects to."
     )
-
-USE_LAKEBASE_PROJECT = LAKEBASE_PROJECT is not None
 
 VOLUME_ROOT    = os.environ["VOLUME_ROOT"].rstrip("/")
 RAW_DIR        = f"{VOLUME_ROOT}/raw_documents"
@@ -107,40 +86,21 @@ def w() -> WorkspaceClient:
     return _w_singleton
 
 
-_pg_host_cache: str | None = None
-
-
 def pg_host() -> str:
-    """Resolve the Postgres host.
-
-    When a `postgres:`/`database:` app-resource binding exists (Project mode, or
-    an admin-deployed Provisioned workspace) PGHOST is injected as an env var and
-    we use it directly. In Provisioned mode WITHOUT a binding — the usual case,
-    since a non-admin deployer can't create the classic database binding — PGHOST
-    is absent, so we derive it from the instance's read/write DNS and cache it."""
-    global _pg_host_cache
+    """Postgres host — injected as PGHOST by the `postgres:` app-resource
+    binding. Raises if absent (the binding is missing or not yet propagated)."""
     if PGHOST:
         return PGHOST
-    if _pg_host_cache:
-        return _pg_host_cache
-    if LAKEBASE_INSTANCE:
-        inst = w().database.get_database_instance(name=LAKEBASE_INSTANCE)
-        _pg_host_cache = inst.read_write_dns
-        return _pg_host_cache
     raise RuntimeError(
-        "PGHOST is not set and cannot be derived (no LAKEBASE_INSTANCE). "
-        "In Project mode the postgres binding must inject PGHOST."
+        "PGHOST is not set. In Lakebase Project mode the `postgres:` app-resource "
+        "binding (resources/app.yml) must inject it — check the binding is active."
     )
 
 
 def current_pg_user() -> str:
-    """Postgres role used for the connection.
-
-    The role is the app service principal, whose Postgres role name is its OAuth
-    client id. A `postgres:`/`database:` binding injects that as PGUSER; without a
-    binding (Provisioned mode) we read the SP's client id from DATABRICKS_CLIENT_ID
-    (always injected into Databricks Apps). Locally, fall back to the workspace
-    user identity."""
+    """Postgres role for the connection — the app SP, whose role name is its
+    OAuth client id. The `postgres:` binding injects it as PGUSER; fall back to
+    DATABRICKS_CLIENT_ID (always injected into Apps), then the local user."""
     pguser = os.environ.get("PGUSER")
     if pguser:
         return pguser

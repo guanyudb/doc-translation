@@ -33,7 +33,6 @@ resources:
               lakebase_project:       ${var.lakebase_project}
               lakebase_branch:        ${var.lakebase_branch}
               lakebase_database_slug: ${var.lakebase_database_slug}
-              lakebase_instance:      ${var.lakebase_instance}
               warehouse_id:           ${var.warehouse_id}
               app_name:               ${var.app_name}
               secret_scope:           ${var.secret_scope}
