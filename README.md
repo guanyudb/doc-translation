@@ -125,6 +125,16 @@ Approved entries are mirrored to a Delta table and read by the translation pipel
 
 ---
 
+## Prompt management (Instructions)
+
+The system prompt sent to the translation model is no longer hard-coded — the **Instructions** tab is a full CRUD library of named prompts (view / create / clone / edit / delete), stored in the `translation_prompts` Lakebase table. Each prompt's body **replaces** the model's base system prompt at translation time; glossary terms are still appended per-segment afterward, so prompt management and the glossary loop compose. Prompts are **seeded-editable** — the editor opens pre-filled with the built-in default (including the `{lang}` token, which is substituted with the document's target language via `str.replace`, so a custom prompt may safely contain literal `{`/`}`).
+
+**Selection is required at upload.** The upload dialog has a prompt dropdown; the Upload button stays disabled until one is chosen. A built-in `Medical / clinical (default)` prompt is seeded on first deploy (and on app startup if the table is empty) so the list is never empty.
+
+**The chosen prompt is snapshotted, not referenced.** At upload the full prompt text is frozen into a `<file>.docx.prompt` JSON sidecar (`{prompt_id, name, body}`) next to the raw file — mirroring the `.lang` sidecar. The watcher reads it (`_prompt_for`), records `selected_prompt_id` / `selected_prompt_name` / `prompt_text_used` on `bronze_documents`, and passes the body to the inner notebook as the `custom_system_prompt` job argument. **Editing or deleting a prompt afterward never changes what a past document was translated with** — the snapshot is the compliance record of what actually ran. Because the text is frozen at upload, prompts (unlike the glossary) are **not** mirrored to Delta; the notebook needs no lookup. Every prompt mutation emits a `PROMPT_CREATED/UPDATED/DELETED/CLONED` audit event. A file dropped straight into the Volume (bypassing the app) has no sidecar and falls back to the notebook's built-in default prompt.
+
+---
+
 ## Compliance & traceability
 
 - **Append-only** `audit_events` Delta table — INSERT-only ACL for the app SP, 7-year retention (`delta.deletedFileRetentionDuration = 'interval 2557 days'`)
@@ -142,9 +152,10 @@ Approved entries are mirrored to a Delta table and read by the translation pipel
 | Layer | What | Where |
 |---|---|---|
 | Storage (files) | Original / translated / reviewed / golden `.docx` | UC Volume `<uc_catalog>.<uc_schema>.<uc_volume_name>` (from your `variable-overrides.json`) |
-| Storage (state) | Live review state — pairs, feedback, edits, audit, glossary, confidence | Lakebase Postgres (Project or Provisioned), schema `<pg_schema>` |
+| Storage (state) | Live review state — pairs, feedback, edits, audit, glossary, confidence | Lakebase Postgres (Autoscaling Project), schema `<pg_schema>` |
 | Storage (archive) | Long-term audit + publication archive | Delta tables in `<uc_catalog>.<uc_schema>` |
-| Translation | In-place OOXML translation per paragraph | FMAPI endpoint (default `databricks-claude-sonnet-4-6`, configurable via `translation_model_endpoint`) |
+| Translation | In-place OOXML translation per paragraph, with a per-document selectable system prompt | FMAPI endpoint (default `databricks-claude-sonnet-4-6`, configurable via `translation_model_endpoint`) |
+| Prompts | Named translation-prompt library; one is chosen per document at upload (frozen snapshot) | Lakebase `translation_prompts` + Instructions tab; `server/prompts.py` |
 | Orchestration | File-arrival → translation pipeline | Lakeflow Job `doc-translation · auto-translate pipeline` (bundle-managed) |
 | Review UI | Two-region layout (side-by-side DOCX HTML preview + paragraph action rail), certify/edit/publish/promote, glossary admin, audit | React SPA (Vite + TS + Tailwind) served by FastAPI on Databricks Apps |
 | Auth | Reviewer identity via `X-Forwarded-Email`, App SP for system actions | Databricks Apps SSO + Service Principal |
@@ -171,8 +182,9 @@ doc-translation-app/
 │       ├── App.tsx                 # tab shell: Review / Glossary / Audit
 │       ├── api.ts                  # typed client for /api/*
 │       └── components/
-│           ├── review/             # ReviewView, PreviewPane, ParagraphCard
+│           ├── review/             # ReviewView, PreviewPane, ParagraphCard, UploadDialog
 │           ├── glossary/GlossaryView.tsx
+│           ├── instructions/InstructionsView.tsx   # prompt-management CRUD
 │           └── audit/AuditView.tsx
 ├── static/                        # PREBUILT SPA (committed; served by FastAPI)
 ├── legacy/
@@ -191,12 +203,13 @@ doc-translation-app/
 │   └── seed_glossary/              # Optional public clinical seed CSVs (source='seed')
 ├── server/
 │   ├── auth.py                     # Reviewer from X-Forwarded-Email
-│   ├── config.py                   # env + WorkspaceClient singleton (Project + Provisioned)
+│   ├── config.py                   # env + WorkspaceClient singleton (Lakebase Project)
 │   ├── confidence.py               # Heuristic per-paragraph scoring (no LLM)
 │   ├── db.py                       # Lakebase psycopg pool, lazy-init proxy
 │   ├── delta_sync.py               # Lakebase → Delta mirror (review state + glossary)
 │   ├── docx_render.py              # DOCX → HTML via sentinel markers + lxml
 │   ├── glossary.py                 # Mine + ingest + prompt-format glossary entries
+│   ├── prompts.py                  # translation_prompts CRUD + audit + default seed
 │   ├── store.py                    # Lakebase CRUD + audit emits + lifecycle
 │   ├── styles.py                   # (legacy Streamlit CSS)
 │   └── volume.py                   # UC Volume listing, DOCX read, golden promotion
@@ -218,9 +231,7 @@ This branch is set up as a portable Databricks Asset Bundle (DAB). One
 Your target workspace needs:
 
 1. **Unity Catalog access** — a catalog where you can `CREATE SCHEMA` and `CREATE VOLUME`
-2. **Lakebase** — either:
-   - A **Lakebase Project** (Autoscaling) — preferred, the new way. Get the project name + branch.
-   - …or a legacy **Provisioned** instance. Get the instance name.
+2. **A Lakebase Autoscaling Project** — get the project name + branch (Provisioned Lakebase is retired). List with `databricks postgres list-projects`.
 3. **A SQL warehouse** for the Delta archive. Any serverless 2X-Small works.
 4. **Foundation Model API** with access to `databricks-claude-sonnet-4-6` (or another Claude model you specify in the inner translation notebook).
 5. **Databricks CLI** v0.220+ authenticated to the target workspace.
@@ -240,19 +251,14 @@ cp variable-overrides.example.json .databricks/bundle/prod/variable-overrides.js
 # Edit .databricks/bundle/prod/variable-overrides.json:
 #   - workspace_user_email:    your-email@org.com  (deploying user + Lakebase admin)
 #   - uc_catalog:              <catalog you can CREATE SCHEMA on>
-#   - lakebase_project:        <your Lakebase Project name>      [Project mode]
-#   - lakebase_branch:         production                        [or main — check your Project]
+#   - lakebase_project:        <your Lakebase Project name>
+#   - lakebase_branch:         production                        [check your Project's branch]
 #   - lakebase_database_slug:  databricks-postgres               [usually]
-#   - lakebase_instance:       ""                                [empty if using Project]
 #   - warehouse_id:            <your SQL warehouse ID>
 #   - pg_schema:               doc_translation                   [Postgres schema name]
 ```
 
 > **The workspace host comes from your Databricks CLI profile**, not this file. Bundle variables can't be referenced from `workspace.host` (auth resolves before variable substitution). Either run with `--profile <name>` or set `DATABRICKS_HOST` in your environment.
-
-If you're on a **legacy Provisioned** Lakebase instance instead of a Project:
-- Set `lakebase_instance` to your instance name; leave `lakebase_project` empty.
-- In `resources/app.yml`, comment out the `postgres:` binding block and uncomment the `database:` block underneath it.
 
 ### Deploy (CLI — one command, recommended)
 
@@ -262,7 +268,7 @@ If you're on a **legacy Provisioned** Lakebase instance instead of a Project:
 
 This runs the 4-step deploy in order:
 
-1. **Seed secrets** — reads `variable-overrides.json`, creates the scope, puts 7 secrets (`pg_schema`, `lakebase_project`, `lakebase_branch`, `lakebase_instance`, `volume_root`, `delta_catalog`, `delta_schema`). Idempotent.
+1. **Seed secrets** — reads `variable-overrides.json`, creates the scope, puts the config + branding secrets (`pg_schema`, `lakebase_project`, `lakebase_branch`, `volume_root`, `delta_catalog`, `delta_schema`, `app_title`, `app_logo_url`, `app_logo_alt`). Idempotent.
 2. `bundle deploy` — creates UC schema + volume + app (with secret + postgres + warehouse bindings) + postdeploy job, syncs code to the workspace.
 3. `bundle run postdeploy_setup` — Lakebase DDL, GRANTs the App SP `USAGE + CREATE on public` and table/sequence perms, creates the Delta mirror tables, pre-creates Volume subdirectories.
 4. `bundle run doc_translation_app` — pushes the source from the bundle's workspace files into the App runtime and starts it.
@@ -304,7 +310,7 @@ After `./deploy.sh`, you'll have a Lakeflow job called `doc-translation · auto-
   - `setup/auto_translate_watcher.py` — scans for unpaired files, writes `bronze_documents` audit rows, invokes the translator once per file
   - `setup/docx_inplace_translation.py` — translates paragraph-by-paragraph via the configured Foundation Model API endpoint, in-place at the OOXML level (preserves layout, charts, headers/footers, SmartArt)
 
-To kick a translation: just upload a `.docx` to `raw_documents/`. The job fires automatically; the translated file appears in `translated_inplace/`; the reviewer app's sidebar picks up the new pair.
+To kick a translation: upload a `.docx` through the app's Upload dialog (choosing a target language **and** a translation prompt), or drop one straight into `raw_documents/` (which uses the built-in default prompt). The job fires automatically; the translated file appears in `translated_inplace/`; the reviewer app's sidebar picks up the new pair.
 
 Configuration knobs (set in `variable-overrides.json`):
 - `translation_model_endpoint` (default `databricks-claude-sonnet-4-6`)
@@ -316,7 +322,7 @@ Configuration knobs (set in `variable-overrides.json`):
 
 `./deploy.sh` is idempotent. Run it again after code changes; it picks up the diff. Schema migrations in the postdeploy job use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ADD COLUMN IF NOT EXISTS` so re-running is safe.
 
-**Self-healing pattern:** the postdeploy job re-seeds all secret values from its own bundle-variable parameters (no shell-quoting hazards, unlike `deploy.sh`'s step 1). So if `deploy.sh` ever produces wrong secret values (a past bug shifted fields when `lakebase_instance=""`), re-running just the postdeploy job from the UI fixes them — no CLI required.
+**Self-healing pattern:** the postdeploy job re-seeds all secret values from its own bundle-variable parameters (no shell-quoting hazards, unlike `deploy.sh`'s step 1). So if `deploy.sh` ever produces wrong secret values, re-running just the postdeploy job from the UI fixes them — no CLI required.
 
 ### Tearing down
 
@@ -379,8 +385,9 @@ databricks apps deploy doc-translation \
 DDL runs as the table owner (not the SP, which has only INSERT/UPDATE/DELETE on the data tables):
 
 ```bash
-DATABRICKS_PROFILE=<profile> PGHOST=... LAKEBASE_INSTANCE=... \
-  PGDATABASE=... PGSSLMODE=require PGSCHEMA=doc_translation \
+DATABRICKS_PROFILE=<profile> PGHOST=... \
+  LAKEBASE_PROJECT=<project> LAKEBASE_BRANCH=production \
+  PGDATABASE=databricks_postgres PGSSLMODE=require PGSCHEMA=doc_translation \
   VOLUME_ROOT=... \
   .venv/bin/python -c "from server import store; from server.db import pool; pool.open(wait=True); store.ensure_schema()"
 ```
@@ -399,9 +406,9 @@ python3.10 -m venv .venv  # /opt/homebrew/bin/python3.10 on macOS
 
 # Terminal 1 — FastAPI backend
 DATABRICKS_PROFILE=<profile> \
-PGHOST=instance-...database.cloud.databricks.com \
+PGHOST=<endpoint-host>.database.cloud.databricks.com \
 PGPORT=5432 PGDATABASE=databricks_postgres PGSSLMODE=require \
-PGSCHEMA=doc_translation LAKEBASE_INSTANCE=lakebasepoc \
+PGSCHEMA=doc_translation LAKEBASE_PROJECT=<project> LAKEBASE_BRANCH=production \
 VOLUME_ROOT=/Volumes/.../doc-translation \
 DATABRICKS_WAREHOUSE_ID=<warehouse-id> \
 DELTA_CATALOG=hls_amer_catalog DELTA_SCHEMA=guanyu_chen \

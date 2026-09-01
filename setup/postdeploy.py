@@ -30,16 +30,14 @@
 import os
 import sys
 import json
-import uuid
 
 dbutils.widgets.text("uc_catalog",             "", "uc_catalog")
 dbutils.widgets.text("uc_schema",              "doc_translation", "uc_schema")
 dbutils.widgets.text("uc_volume_name",         "doc-translation", "uc_volume_name")
 dbutils.widgets.text("pg_schema",              "doc_translation", "pg_schema")
-dbutils.widgets.text("lakebase_project",       "", "lakebase_project (empty = use Provisioned)")
-dbutils.widgets.text("lakebase_branch",        "main", "lakebase_branch")
+dbutils.widgets.text("lakebase_project",       "", "lakebase_project")
+dbutils.widgets.text("lakebase_branch",        "production", "lakebase_branch")
 dbutils.widgets.text("lakebase_database_slug", "databricks-postgres", "lakebase_database_slug")
-dbutils.widgets.text("lakebase_instance",      "", "lakebase_instance (Provisioned fallback)")
 dbutils.widgets.text("warehouse_id",           "", "warehouse_id")
 dbutils.widgets.text("app_name",               "doc-translation", "app_name")
 dbutils.widgets.text("secret_scope",           "doc_translation_config", "secret_scope")
@@ -51,21 +49,19 @@ uc_schema         = dbutils.widgets.get("uc_schema").strip()
 uc_volume_name    = dbutils.widgets.get("uc_volume_name").strip()
 pg_schema         = dbutils.widgets.get("pg_schema").strip() or "doc_translation"
 lakebase_project  = dbutils.widgets.get("lakebase_project").strip()
-lakebase_branch   = dbutils.widgets.get("lakebase_branch").strip() or "main"
+lakebase_branch   = dbutils.widgets.get("lakebase_branch").strip() or "production"
 lakebase_db_slug  = dbutils.widgets.get("lakebase_database_slug").strip()
-lakebase_instance = dbutils.widgets.get("lakebase_instance").strip()
 warehouse_id      = dbutils.widgets.get("warehouse_id").strip()
 app_name          = dbutils.widgets.get("app_name").strip()
 secret_scope      = dbutils.widgets.get("secret_scope").strip() or "doc_translation_config"
 enable_seed_glossary = dbutils.widgets.get("enable_seed_glossary").lower() == "true"
 
-for k, v in [("uc_catalog", uc_catalog), ("warehouse_id", warehouse_id), ("app_name", app_name)]:
+for k, v in [("uc_catalog", uc_catalog), ("warehouse_id", warehouse_id),
+             ("app_name", app_name), ("lakebase_project", lakebase_project)]:
     if not v:
         raise SystemExit(f"missing required parameter: {k}")
-if not lakebase_project and not lakebase_instance:
-    raise SystemExit("either lakebase_project (Project mode) or lakebase_instance (Provisioned mode) must be set")
 print(f"catalog={uc_catalog}.{uc_schema}.{uc_volume_name}")
-print(f"lakebase mode: {'Project' if lakebase_project else 'Provisioned'}")
+print(f"lakebase project={lakebase_project} branch={lakebase_branch}")
 print(f"warehouse_id={warehouse_id}")
 print(f"app_name={app_name}")
 
@@ -93,15 +89,14 @@ if not sp_uuid:
     raise SystemExit(f"could not resolve service_principal_client_id for app {app_name!r}")
 print(f"app SP UUID: {sp_uuid}")
 
-# Re-seed each config secret idempotently. Empty values are valid (e.g.
-# lakebase_instance="" when in Project mode); the App's config.py treats
-# them as None.
+# Re-seed each config secret idempotently — self-healing if deploy.sh's step-1
+# seeding ever wrote a wrong value (Python put_secret has no shell-quoting
+# hazards).
 vol_root_value = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume_name}"
 app_config_secrets = {
     "pg_schema":         pg_schema,
     "lakebase_project":  lakebase_project,
     "lakebase_branch":   lakebase_branch,
-    "lakebase_instance": lakebase_instance,
     "volume_root":       vol_root_value,
     "delta_catalog":     uc_catalog,
     "delta_schema":      uc_schema,
@@ -114,34 +109,30 @@ for k, v in app_config_secrets.items():
 
 # MAGIC %md
 # MAGIC ## Mint a Lakebase OAuth JWT for the deployer (NOT a PAT)
+# MAGIC
+# MAGIC Postdeploy connects to Lakebase as the DEPLOYING USER to run the schema
+# MAGIC DDL + GRANTs. The App SP is registered as a Postgres role + given its PG*
+# MAGIC env vars by the app's `postgres:` resource binding at `bundle deploy`
+# MAGIC time (resources/app.yml), so there's nothing to register here — the
+# MAGIC GRANTs below just target that already-registered role.
 
 # COMMAND ----------
 
-if lakebase_project:
-    # Lakebase Project mode — POST /api/2.0/postgres/credentials
-    endpoint = f"projects/{lakebase_project}/branches/{lakebase_branch}/endpoints/primary"
-    resp = w.api_client.do("POST", "/api/2.0/postgres/credentials", body={"endpoint": endpoint})
-    pg_token = resp["token"]
-    # Discover host. The endpoint metadata returns it nested under
-    # status.hosts.host (the read/write endpoint). The pooled variant is
-    # status.hosts.read_write_pooled_host — fine to use that too for
-    # postdeploy DDL but the direct host is simpler.
-    epresp = w.api_client.do("GET", f"/api/2.0/postgres/{endpoint}")
-    hosts = (epresp.get("status") or {}).get("hosts") or {}
-    pg_host = hosts.get("host") or hosts.get("read_write_pooled_host")
-    if not pg_host:
-        raise SystemExit(
-            f"could not resolve Lakebase host from endpoint metadata.\n"
-            f"GET /api/2.0/postgres/{endpoint} returned: {epresp}"
-        )
-    pg_db   = "databricks_postgres"  # Lakebase Projects default
-else:
-    # Legacy Provisioned mode
-    cred = w.database.generate_database_credential(instance_names=[lakebase_instance])
-    pg_token = cred.token
-    inst = w.database.get_database_instance(name=lakebase_instance)
-    pg_host = inst.read_write_dns
-    pg_db   = "databricks_postgres"
+# Lakebase Autoscaling Project — POST /api/2.0/postgres/credentials for the
+# deployer's short-lived JWT, and resolve the read/write host from the
+# endpoint metadata.
+endpoint = f"projects/{lakebase_project}/branches/{lakebase_branch}/endpoints/primary"
+resp = w.api_client.do("POST", "/api/2.0/postgres/credentials", body={"endpoint": endpoint})
+pg_token = resp["token"]
+epresp = w.api_client.do("GET", f"/api/2.0/postgres/{endpoint}")
+hosts = (epresp.get("status") or {}).get("hosts") or {}
+pg_host = hosts.get("host") or hosts.get("read_write_pooled_host")
+if not pg_host:
+    raise SystemExit(
+        f"could not resolve Lakebase host from endpoint metadata.\n"
+        f"GET /api/2.0/postgres/{endpoint} returned: {epresp}"
+    )
+pg_db = "databricks_postgres"  # Lakebase Projects default
 
 print(f"pg_host: {pg_host}")
 print(f"pg_db:   {pg_db}")
@@ -273,9 +264,21 @@ CREATE TABLE IF NOT EXISTS {pg_schema}.translation_glossary (
 );
 ALTER TABLE {pg_schema}.translation_glossary
     ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tenant';
+
+CREATE TABLE IF NOT EXISTS {pg_schema}.translation_prompts (
+    prompt_id    BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    body         TEXT NOT NULL,
+    description  TEXT,
+    created_by   TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by   TEXT,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 GRANTS_SQL = f"""
+GRANT CONNECT ON DATABASE {pg_db} TO "{sp_uuid}";
 GRANT USAGE, CREATE ON SCHEMA public TO "{sp_uuid}";
 GRANT USAGE ON SCHEMA {pg_schema} TO "{sp_uuid}";
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {pg_schema} TO "{sp_uuid}";
@@ -293,6 +296,39 @@ with psycopg.connect(conninfo, password=pg_token) as conn:
         cur.execute(GRANTS_SQL)
     conn.commit()
 print("ok: Lakebase schema + grants applied")
+
+# Seed the built-in default prompt so the upload dialog always has a choice
+# (prompt selection is required). Idempotent — only inserts when the table is
+# empty. The body text mirrors server/prompts.py:DEFAULT_PROMPT_BODY and the
+# notebook's TRANSLATE_SYSTEM fallback; keep the three in sync.
+DEFAULT_PROMPT_NAME = "Medical / clinical (default)"
+DEFAULT_PROMPT_BODY = (
+    "You are a professional medical and clinical document translator working on FDA "
+    "regulatory submissions. Translate the user's text to {lang}.\n"
+    "STRICT RULES:\n"
+    "1. Return ONLY the translated text. No commentary, no quotes, no labels, no explanations.\n"
+    "2. Preserve numbers, units, percentages, dates, dosages, and proper nouns exactly.\n"
+    "3. Preserve URLs, email addresses, file paths, and code-like tokens unchanged.\n"
+    "4. Keep medical terminology accurate and consistent.\n"
+    "5. If the input is already in {lang}, return it unchanged.\n"
+    "6. If the input is empty, whitespace, or only punctuation/numbers, return it unchanged.\n"
+    "7. Do not add or remove leading/trailing whitespace beyond what the source has."
+)
+with psycopg.connect(conninfo, password=pg_token) as conn:
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT 1 FROM {pg_schema}.translation_prompts LIMIT 1")
+        if cur.fetchone():
+            print("prompts already present; seed skipped")
+        else:
+            cur.execute(f"""
+                INSERT INTO {pg_schema}.translation_prompts
+                    (name, body, description, created_by, updated_by)
+                VALUES (%s, %s, %s, 'system', 'system')
+                ON CONFLICT (name) DO NOTHING
+            """, (DEFAULT_PROMPT_NAME, DEFAULT_PROMPT_BODY,
+                  "Built-in FDA / clinical translation prompt. Seeded automatically."))
+            conn.commit()
+            print("ok: default translation prompt seeded")
 
 # COMMAND ----------
 
@@ -443,13 +479,42 @@ _exec(f"""
         translation_status STRING, translation_started_at TIMESTAMP,
         translation_ended_at TIMESTAMP, translation_output_path STRING,
         translation_error STRING, translator_run_id STRING,
-        model_endpoint STRING, target_language STRING, source_language STRING
+        model_endpoint STRING, target_language STRING, source_language STRING,
+        selected_prompt_id BIGINT, selected_prompt_name STRING, prompt_text_used STRING,
+        submitted_by STRING
     ) USING DELTA
     TBLPROPERTIES (
         delta.deletedFileRetentionDuration = 'interval 2557 days',
         delta.logRetentionDuration         = 'interval 2557 days'
     )
 """)
+# Migrate deployments created before per-document prompt selection existed.
+# Delta's ADD COLUMNS is not idempotent (no IF NOT EXISTS), so this errors when
+# the columns already exist — expected on a fresh table (created with them above)
+# and on any re-run. Tolerate exactly that case; re-raise anything else.
+try:
+    _exec(f"""
+        ALTER TABLE {DELTA_FQN}.bronze_documents ADD COLUMNS (
+            selected_prompt_id BIGINT, selected_prompt_name STRING, prompt_text_used STRING
+        )
+    """)
+    print("ok: bronze_documents prompt columns added")
+except RuntimeError as ex:
+    if "already exist" in str(ex).lower():
+        print("bronze_documents prompt columns already present; skipped")
+    else:
+        raise
+
+# Migrate deployments created before per-user attribution existed. Same
+# non-idempotent ADD COLUMNS caveat as above — tolerate the already-exists case.
+try:
+    _exec(f"ALTER TABLE {DELTA_FQN}.bronze_documents ADD COLUMNS (submitted_by STRING)")
+    print("ok: bronze_documents submitted_by column added")
+except RuntimeError as ex:
+    if "already exist" in str(ex).lower():
+        print("bronze_documents submitted_by column already present; skipped")
+    else:
+        raise
 
 # Grant the App SP read/write on the Delta tables AND on the UC Volume.
 # Volume names with hyphens need backtick quoting in SQL.
@@ -567,6 +632,7 @@ for sub in ("raw_documents", "translated_inplace", "translated_reviewed", "golde
 
 from databricks.sdk.service.jobs import (
     TriggerSettings, FileArrivalTriggerConfiguration, PauseStatus, JobSettings,
+    JobAccessControlRequest, JobPermissionLevel,
 )
 
 pipeline_jobs = [j for j in w.jobs.list()
@@ -591,6 +657,23 @@ else:
     )
     print(f"ok: attached file-arrival trigger to job {pj.job_id} watching {trigger_url}")
 
+    # The App SP calls the Jobs API to drive the Processing Status view (is a run
+    # active + how long). jobs.list()/list_runs() only return jobs the caller can
+    # see, so the SP needs at least CAN_VIEW. update_permissions MERGES (unlike
+    # set_permissions, which would replace the owner ACL), so existing grants are
+    # preserved. Best-effort: the doc list still renders if this fails.
+    try:
+        w.jobs.update_permissions(
+            job_id=pj.job_id,
+            access_control_list=[JobAccessControlRequest(
+                service_principal_name=sp_uuid,
+                permission_level=JobPermissionLevel.CAN_VIEW,
+            )],
+        )
+        print(f"ok: granted App SP {sp_uuid} CAN_VIEW on job {pj.job_id}")
+    except Exception as ex:
+        print(f"WARNING: could not grant App SP CAN_VIEW on job {pj.job_id}: {ex}")
+
 # COMMAND ----------
 
 print(f"\npostdeploy complete · app SP {sp_uuid} · catalog {uc_catalog} · schema {uc_schema}")
@@ -604,5 +687,5 @@ dbutils.notebook.exit(json.dumps({
     "uc_catalog":  uc_catalog,
     "uc_schema":   uc_schema,
     "uc_volume":   uc_volume_name,
-    "lakebase_mode": "project" if lakebase_project else "provisioned",
+    "lakebase_mode": "project",
 }))

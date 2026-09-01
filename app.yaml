@@ -22,8 +22,8 @@ env:
   # ---- Lakebase Postgres connection (mostly auto-injected) ----
   #
   # PGHOST, PGPORT, PGDATABASE, PGUSER, PGSSLMODE are injected automatically
-  # by the `postgres:` (or legacy `database:`) resource binding in
-  # resources/app.yml. We don't redeclare them here.
+  # by the `postgres:` resource binding in resources/app.yml. We don't
+  # redeclare them here.
   - name: PGSCHEMA
     valueFrom: pg_schema
 
@@ -31,8 +31,6 @@ env:
     valueFrom: lakebase_project
   - name: LAKEBASE_BRANCH
     valueFrom: lakebase_branch
-  - name: LAKEBASE_INSTANCE
-    valueFrom: lakebase_instance
 
   # ---- UC Volume for documents ----
   - name: VOLUME_ROOT
@@ -45,3 +43,11 @@ env:
     valueFrom: delta_schema
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: warehouse
+
+  # ---- Deploy-time branding (optional; blank → default icon + title) ----
+  - name: APP_TITLE
+    valueFrom: app_title
+  - name: APP_LOGO_URL
+    valueFrom: app_logo_url
+  - name: APP_LOGO_ALT
+    valueFrom: app_logo_alt

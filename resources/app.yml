@@ -4,12 +4,6 @@
 #   * postgres binding → PGHOST, PGDATABASE, PGUSER, PGPORT, PGSSLMODE
 #   * sql_warehouse binding → DATABRICKS_WAREHOUSE_ID (when also declared with
 #     valueFrom in app.yaml — per deploy-guide gotcha #1).
-#
-# NOTE on the postgres binding:
-# Lakebase Project uses `postgres:` (new); legacy Provisioned uses `database:`.
-# This bundle uses `postgres:` and assumes the customer is on a Lakebase
-# Project. If they're on a legacy Provisioned instance, comment out the
-# `postgres:` block and uncomment `database:` below.
 
 resources:
   apps:
@@ -19,25 +13,18 @@ resources:
       source_code_path: ${workspace.file_path}
 
       resources:
-        # ---- Lakebase Project (preferred) -----------------------------------
+        # ---- Lakebase (Autoscaling Project) ---------------------------------
+        # Required. This binding both registers the app SP as a Postgres ROLE
+        # (so postdeploy's GRANTs can target it — without it they fail with
+        # `role "<sp>" does not exist`) and injects PGHOST / PGUSER / PGPORT /
+        # PGDATABASE / PGSSLMODE into the app. Point it at your Lakebase Project
+        # via the lakebase_project / lakebase_branch / lakebase_database_slug
+        # overrides. (Provisioned Lakebase is retired — Projects only.)
         - name: postgres
           postgres:
             branch:     projects/${var.lakebase_project}/branches/${var.lakebase_branch}
             database:   projects/${var.lakebase_project}/branches/${var.lakebase_branch}/databases/${var.lakebase_database_slug}
             permission: CAN_CONNECT_AND_CREATE
-
-        # ---- Lakebase Provisioned (legacy) ----------------------------------
-        # If you're on a legacy workspace with a Provisioned instance and no
-        # Project, comment out the `postgres:` block above and uncomment this
-        # block instead. Note: the Databricks Terraform provider has
-        # intermittent crashes on the `database:` binding inside an `apps:`
-        # resource (provider v1.111.0); if you hit it, upgrade the CLI or
-        # bind the database via `databricks apps` CLI separately.
-        # - name: postgres
-        #   database:
-        #     instance_name: ${var.lakebase_instance}
-        #     database_name: databricks_postgres
-        #     permission:    CAN_CONNECT
 
         # ---- SQL warehouse for Delta sync -----------------------------------
         - name: warehouse
@@ -68,11 +55,6 @@ resources:
             scope:      ${var.secret_scope}
             key:        lakebase_branch
             permission: READ
-        - name: lakebase_instance
-          secret:
-            scope:      ${var.secret_scope}
-            key:        lakebase_instance
-            permission: READ
         - name: volume_root
           secret:
             scope:      ${var.secret_scope}
@@ -87,4 +69,20 @@ resources:
           secret:
             scope:      ${var.secret_scope}
             key:        delta_schema
+            permission: READ
+        # ---- Deploy-time branding (optional; blank → default icon + title) ---
+        - name: app_title
+          secret:
+            scope:      ${var.secret_scope}
+            key:        app_title
+            permission: READ
+        - name: app_logo_url
+          secret:
+            scope:      ${var.secret_scope}
+            key:        app_logo_url
+            permission: READ
+        - name: app_logo_alt
+          secret:
+            scope:      ${var.secret_scope}
+            key:        app_logo_alt
             permission: READ

@@ -8,7 +8,7 @@
 #
 # Prerequisites (workspace must already have):
 #   * A Unity Catalog with CREATE SCHEMA + CREATE VOLUME permission for you
-#   * A Lakebase instance (Project preferred; Provisioned legacy ok)
+#   * A Lakebase Autoscaling Project (branch + database)
 #   * A SQL warehouse (any serverless 2X-Small is fine)
 #   * `.databricks/bundle/<target>/variable-overrides.json` populated from
 #     `variable-overrides.example.json`
@@ -77,18 +77,20 @@ vn = d.get("uc_volume_name","doc-translation")
 pairs = [
     ("pg_schema",         d.get("pg_schema","doc_translation")),
     ("lakebase_project",  d.get("lakebase_project","")),
-    ("lakebase_branch",   d.get("lakebase_branch","main")),
-    ("lakebase_instance", d.get("lakebase_instance","")),
+    ("lakebase_branch",   d.get("lakebase_branch","production")),
     ("volume_root",       f"/Volumes/{uc}/{sc}/{vn}"),
     ("delta_catalog",     uc),
     ("delta_schema",      sc),
+    ("app_title",         d.get("app_title","Doc Translation Review")),
+    ("app_logo_url",      d.get("app_logo_url","")),
+    ("app_logo_alt",      d.get("app_logo_alt","")),
 ]
 for k, v in pairs:
     print(f"{k}={v}")'
 
-# Empty string is a valid secret value (e.g., lakebase_instance="" in Project
-# mode). The CLI rejects empty `--string-value`, so substitute a single space;
-# the app config.py treats both empty and whitespace-only as None.
+# Empty string is a valid secret value (e.g. a blank branding field). The CLI
+# rejects empty `--string-value`, so substitute a single space; the app
+# config.py treats both empty and whitespace-only as None.
 OVR="$OVERRIDES" python3 -c "$PYREAD" | while IFS= read -r LINE; do
     KEY="${LINE%%=*}"
     VALUE="${LINE#*=}"

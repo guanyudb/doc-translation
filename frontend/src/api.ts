@@ -67,7 +67,40 @@ export interface GlossaryEntry {
 export interface AppConfig {
   reviewer: string;
   target_language: string;
+  model_endpoint: string;
+  is_configured: boolean;
   delta_sync_enabled: boolean;
+  title: string;
+  logo_url: string | null;
+  logo_alt: string | null;
+  logo_width: number | null;
+  logo_height: number | null;
+}
+
+export interface AppSettings {
+  model_endpoint: string;
+  target_language: string;
+  app_title: string;
+  logo_url: string | null;
+  logo_alt: string | null;
+  is_configured: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+export type SettingsPatch = Partial<
+  Pick<AppSettings, "model_endpoint" | "target_language" | "app_title" | "logo_url" | "logo_alt">
+>;
+
+export interface Prompt {
+  prompt_id: number;
+  name: string;
+  body: string;
+  description: string | null;
+  created_by: string | null;
+  created_at: string | null;
+  updated_by: string | null;
+  updated_at: string | null;
 }
 
 export interface DocumentStatus {
@@ -80,6 +113,24 @@ export interface DocumentStatus {
   error: string | null;
 }
 
+export interface ProcessingDocument extends DocumentStatus {
+  elapsed_seconds: number | null;
+}
+
+export interface PipelineStatus {
+  job_id: number | null;
+  active: boolean;
+  started_at_ms: number | null;
+  elapsed_seconds: number | null;
+}
+
+export interface ProcessingStatus {
+  user: string;
+  pipeline: PipelineStatus;
+  documents: ProcessingDocument[];
+  warehouse_configured: boolean;
+}
+
 async function j<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -90,6 +141,15 @@ async function j<T>(res: Response): Promise<T> {
 
 export const api = {
   config: () => fetch("/api/config").then(j<AppConfig>),
+
+  settings: () => fetch("/api/settings").then(j<AppSettings>),
+
+  saveSettings: (patch: SettingsPatch) =>
+    fetch("/api/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+    }).then(j<AppSettings>),
 
   pairs: () => fetch("/api/pairs").then(j<PairSummary[]>),
 
@@ -135,17 +195,34 @@ export const api = {
       body: JSON.stringify({ page }),
     }).then(j<{ certified: number; page: number }>),
 
-  upload: (file: File, targetLanguage: string) => {
+  upload: (
+    file: File,
+    targetLanguage: string,
+    promptId: number,
+    onConflict: "rename" | "replace" = "rename"
+  ) => {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("target_language", targetLanguage);
+    fd.append("prompt_id", String(promptId));
+    fd.append("on_conflict", onConflict);
     return fetch("/api/upload", { method: "POST", body: fd }).then(
-      j<{ ok: boolean; name: string; message: string; target_language: string }>
+      j<{
+        ok: boolean;
+        name: string;
+        message: string;
+        target_language: string;
+        renamed_from: string | null;
+        prompt_id: number;
+        prompt_name: string;
+      }>
     );
   },
 
   documents: () =>
     fetch("/api/documents").then(j<{ documents: DocumentStatus[]; warehouse_configured: boolean }>),
+
+  processingStatus: () => fetch("/api/processing-status").then(j<ProcessingStatus>),
 
   publish: (id: string) =>
     fetch(`/api/pairs/${encodeURIComponent(id)}/publish`, { method: "POST" }).then(
@@ -190,4 +267,33 @@ export const api = {
     fetch("/api/glossary/sync-delta", { method: "POST" }).then(
       j<{ rows: number; skipped: boolean }>
     ),
+
+  // ---- Translation prompts ("Instructions") ----
+  prompts: () => fetch("/api/prompts").then(j<Prompt[]>),
+
+  promptTemplate: () => fetch("/api/prompts/template").then(j<{ body: string }>),
+
+  createPrompt: (data: { name: string; body: string; description?: string | null }) =>
+    fetch("/api/prompts", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(data),
+    }).then(j<Prompt>),
+
+  updatePrompt: (id: number, data: { name: string; body: string; description?: string | null }) =>
+    fetch(`/api/prompts/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(data),
+    }).then(j<Prompt>),
+
+  deletePrompt: (id: number) =>
+    fetch(`/api/prompts/${id}`, { method: "DELETE" }).then(j<{ ok: boolean }>),
+
+  clonePrompt: (id: number, name?: string) =>
+    fetch(`/api/prompts/${id}/clone`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: name ?? null }),
+    }).then(j<Prompt>),
 };

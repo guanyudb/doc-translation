@@ -2,11 +2,9 @@
 
 Tokens are 1-hour TTL. Pool `max_lifetime=2700s` (45min) recycles before expiry.
 
-Auth path branches on Lakebase mode (see `config.py`):
-  * Project (Autoscaling): POST `/api/2.0/postgres/credentials` with the
-    endpoint path. Returns a JWT.
-  * Provisioned (legacy): `WorkspaceClient.database.generate_database_credential`
-    with the instance name.
+Auth (Lakebase Autoscaling Project): POST `/api/2.0/postgres/credentials` with
+the branch's `primary` endpoint path returns a short-lived JWT used as the
+Postgres password.
 
 Pool lifecycle:
   psycopg-pool 3.2+ enforces a strict state machine — once a pool enters
@@ -30,24 +28,18 @@ from . import config
 class OAuthConnection(psycopg.Connection):
     @classmethod
     def connect(cls, conninfo: str = "", **kwargs):
-        if config.USE_LAKEBASE_PROJECT:
-            # Lakebase Project — mint via raw REST so we work across SDK versions
-            # (older bundles in serverless notebook envs lack `w.postgres.*`).
-            endpoint = (
-                f"projects/{config.LAKEBASE_PROJECT}"
-                f"/branches/{config.LAKEBASE_BRANCH}"
-                f"/endpoints/primary"
-            )
-            resp = config.w().api_client.do(
-                "POST", "/api/2.0/postgres/credentials",
-                body={"endpoint": endpoint},
-            )
-            kwargs["password"] = resp["token"]
-        else:
-            cred = config.w().database.generate_database_credential(
-                instance_names=[config.LAKEBASE_INSTANCE]
-            )
-            kwargs["password"] = cred.token
+        # Mint via raw REST so we work across SDK versions (older bundles in
+        # serverless notebook envs lack the `w.postgres.*` helper).
+        endpoint = (
+            f"projects/{config.LAKEBASE_PROJECT}"
+            f"/branches/{config.LAKEBASE_BRANCH}"
+            f"/endpoints/primary"
+        )
+        resp = config.w().api_client.do(
+            "POST", "/api/2.0/postgres/credentials",
+            body={"endpoint": endpoint},
+        )
+        kwargs["password"] = resp["token"]
         return super().connect(conninfo, **kwargs)
 
 
@@ -56,7 +48,7 @@ def _build_conninfo() -> str:
     return (
         f"dbname={config.PGDATABASE} "
         f"user={user} "
-        f"host={config.PGHOST} "
+        f"host={config.pg_host()} "
         f"port={config.PGPORT} "
         f"sslmode={config.PGSSLMODE}"
     )

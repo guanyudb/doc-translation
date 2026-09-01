@@ -7,6 +7,7 @@ import { api, PairDetail, PairSummary, Paragraph } from "@/api";
 import { DocPane, FeedbackMeta } from "@/components/review/DocPane";
 import { ActiveParagraphPanel } from "@/components/review/ActiveParagraphPanel";
 import { UploadDialog } from "@/components/review/UploadDialog";
+import { ProcessingPanel } from "@/components/review/ProcessingPanel";
 
 export function ReviewView({
   activePair,
@@ -38,15 +39,62 @@ export function ReviewView({
     loadPairs();
   }, [loadPairs]);
 
+  // Auto-refresh the pair list while anything is still going through the
+  // pipeline. Uploading only writes to raw_documents/ — translation takes
+  // 1–3 min, so refreshing at upload time (which is all we used to do) always
+  // came back before the pair existed and the new document never showed up
+  // until you hit refresh manually. Poll /api/documents; while any file is
+  // QUEUED or TRANSLATING, re-pull the pairs so the document appears on its
+  // own the moment translation finishes. Stops polling once everything settles.
+  const [pipelineBusy, setPipelineBusy] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      try {
+        const r = await api.documents();
+        const inflight = r.documents.some(
+          (d) => d.status === "QUEUED" || d.status === "TRANSLATING"
+        );
+        if (cancelled) return;
+        setPipelineBusy(inflight);
+        if (inflight) {
+          loadPairs();
+          timer = window.setTimeout(poll, 10000);
+        }
+      } catch {
+        /* transient — try again on the next cycle */
+        if (!cancelled) timer = window.setTimeout(poll, 15000);
+      }
+    };
+    poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [loadPairs]);
+
   const loadDetail = useCallback((id: string) => {
     setLoading(true);
     setError(null);
-    Promise.all([api.pair(id), api.preview(id, "original"), api.preview(id, "translated")])
-      .then(([d, o, t]) => {
+    // The pair detail is required; the two HTML previews are secondary — a
+    // failed preview should leave that pane empty, not blank the whole view.
+    api
+      .pair(id)
+      .then(async (d) => {
         setDetail(d);
-        setOrigHtml(o);
-        setTranHtml(t);
         setActiveIdx(null);
+        const [o, t] = await Promise.allSettled([
+          api.preview(id, "original"),
+          api.preview(id, "translated"),
+        ]);
+        setOrigHtml(o.status === "fulfilled" ? o.value : "");
+        setTranHtml(t.status === "fulfilled" ? t.value : "");
+        if (o.status === "rejected" || t.status === "rejected") {
+          setError("A document preview failed to render; review actions still work.");
+        }
       })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
@@ -202,6 +250,9 @@ export function ReviewView({
 
   return (
     <div className="space-y-4">
+      {/* In-flight uploads: queued / translating docs, above the toolbar */}
+      <ProcessingPanel onSettled={loadPairs} />
+
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-3">
         <Select
@@ -225,6 +276,12 @@ export function ReviewView({
         <Button variant="ghost" size="icon-sm" onClick={loadPairs} title="Refresh list">
           <RefreshCw />
         </Button>
+        {pipelineBusy && (
+          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" />
+            translating — this list updates automatically
+          </span>
+        )}
 
         {detail && (
           <>
