@@ -19,6 +19,7 @@
 
 import datetime
 import hashlib
+import json
 import os
 import re
 import uuid
@@ -82,6 +83,20 @@ try:
     spark.sql(f"ALTER TABLE {bronze_fqn} ADD COLUMNS (source_language STRING)")
 except Exception:
     pass  # column already present, or table doesn't exist yet (created below)
+# Migration for tables created before per-document prompt selection existed.
+try:
+    spark.sql(f"""
+        ALTER TABLE {bronze_fqn} ADD COLUMNS (
+            selected_prompt_id BIGINT, selected_prompt_name STRING, prompt_text_used STRING
+        )
+    """)
+except Exception:
+    pass  # columns already present, or table doesn't exist yet (created below)
+# Migration for tables created before per-user attribution existed.
+try:
+    spark.sql(f"ALTER TABLE {bronze_fqn} ADD COLUMNS (submitted_by STRING)")
+except Exception:
+    pass  # column already present, or table doesn't exist yet (created below)
 spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {bronze_fqn} (
         document_id              STRING,
@@ -99,7 +114,11 @@ spark.sql(f"""
         translator_run_id        STRING,
         model_endpoint           STRING,
         target_language          STRING,
-        source_language          STRING
+        source_language          STRING,
+        selected_prompt_id       BIGINT,
+        selected_prompt_name     STRING,
+        prompt_text_used         STRING,
+        submitted_by             STRING
     )
     USING DELTA
     COMMENT 'Every .docx landing in raw_documents/; orchestration audit + translation status'
@@ -146,6 +165,45 @@ def _target_for(fs_path: str) -> str:
         pass
     return target_language
 
+
+def _prompt_for(fs_path: str) -> dict:
+    """Per-file prompt snapshot. The app writes a `<name>.docx.prompt` sidecar
+    containing JSON {prompt_id, name, body} — the frozen text of the prompt the
+    reviewer chose at upload. Returns {} when there's no sidecar (e.g. a file
+    dropped straight into the Volume), in which case the inner notebook falls
+    back to its built-in TRANSLATE_SYSTEM."""
+    sidecar = fs_path + ".prompt"
+    try:
+        if os.path.exists(sidecar):
+            with open(sidecar, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and (data.get("body") or "").strip():
+                return {
+                    "id": data.get("prompt_id"),
+                    "name": (data.get("name") or "").strip(),
+                    "body": data["body"],
+                }
+    except Exception:
+        pass
+    return {}
+
+
+def _submitted_by_for(fs_path: str) -> str | None:
+    """Per-file uploader identity. The app writes a `<name>.docx.user` sidecar
+    carrying the signed-in reviewer's email (from X-Forwarded-Email) at upload.
+    Returns None for files dropped straight into the Volume (no sidecar), which
+    then have a NULL submitted_by and won't show in any user's status view."""
+    sidecar = fs_path + ".user"
+    try:
+        if os.path.exists(sidecar):
+            with open(sidecar, "r", encoding="utf-8") as fh:
+                val = fh.read().strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return None
+
 raw_files = []
 for entry in dbutils.fs.ls(raw_dir):
     name = entry.name.rstrip("/")
@@ -174,7 +232,9 @@ for f in raw_files:
     if os.path.exists(expected_out):
         continue
     unpaired.append({**f, "expected_output": expected_out, "stem": stem,
-                     "target_language": file_target})
+                     "target_language": file_target,
+                     "prompt": _prompt_for(f["path"]),
+                     "submitted_by": _submitted_by_for(f["path"])})
 
 print(f"raw files   : {len(raw_files)}")
 print(f"already done: {len(raw_files) - len(unpaired)}")
@@ -212,6 +272,23 @@ for f in unpaired:
     file_target = f.get("target_language") or target_language
     file_target_sql = file_target.replace("'", "''")
 
+    # Per-document prompt snapshot (frozen at upload). Empty dict → NULLs, and
+    # the inner notebook falls back to its built-in TRANSLATE_SYSTEM.
+    prompt = f.get("prompt") or {}
+    prompt_body = prompt.get("body") or ""
+
+    def _sql_str(v: str) -> str:
+        # Spark SQL string literals interpret backslash escapes by default, so
+        # escape backslashes before single quotes to preserve the text verbatim.
+        return "'" + v.replace("\\", "\\\\").replace("'", "''") + "'"
+
+    prompt_id_sql = str(int(prompt["id"])) if prompt.get("id") is not None else "CAST(NULL AS BIGINT)"
+    prompt_name_sql = _sql_str(prompt["name"]) if prompt.get("name") else "CAST(NULL AS STRING)"
+    prompt_body_sql = _sql_str(prompt_body) if prompt_body else "CAST(NULL AS STRING)"
+
+    submitted_by = f.get("submitted_by")
+    submitted_by_sql = _sql_str(submitted_by) if submitted_by else "CAST(NULL AS STRING)"
+
     # Bronze upsert: TRANSLATING
     spark.sql(f"""
         MERGE INTO {bronze_fqn} AS t
@@ -226,7 +303,11 @@ for f in unpaired:
             'TRANSLATING' AS translation_status,
             current_timestamp() AS translation_started_at,
             '{model_endpoint}' AS model_endpoint,
-            '{file_target_sql}' AS target_language
+            '{file_target_sql}' AS target_language,
+            {prompt_id_sql} AS selected_prompt_id,
+            {prompt_name_sql} AS selected_prompt_name,
+            {prompt_body_sql} AS prompt_text_used,
+            {submitted_by_sql} AS submitted_by
         ) AS s
         ON t.document_id = s.document_id
         WHEN MATCHED THEN UPDATE SET
@@ -235,15 +316,20 @@ for f in unpaired:
             translation_error      = NULL,
             translation_ended_at   = NULL,
             model_endpoint         = s.model_endpoint,
-            target_language        = s.target_language
+            target_language        = s.target_language,
+            selected_prompt_id     = s.selected_prompt_id,
+            selected_prompt_name   = s.selected_prompt_name,
+            prompt_text_used       = s.prompt_text_used
         WHEN NOT MATCHED THEN INSERT (
             document_id, file_name, input_path, input_hash_sha256, input_size_bytes,
             landed_at, first_seen_at, translation_status, translation_started_at,
-            model_endpoint, target_language
+            model_endpoint, target_language,
+            selected_prompt_id, selected_prompt_name, prompt_text_used, submitted_by
         ) VALUES (
             s.document_id, s.file_name, s.input_path, s.input_hash_sha256, s.input_size_bytes,
             s.landed_at, s.first_seen_at, s.translation_status, s.translation_started_at,
-            s.model_endpoint, s.target_language
+            s.model_endpoint, s.target_language,
+            s.selected_prompt_id, s.selected_prompt_name, s.prompt_text_used, s.submitted_by
         )
     """)
 
@@ -264,6 +350,7 @@ for f in unpaired:
                 "max_pages":              max_pages,
                 "skip_if_already_target": "true",
                 "glossary_delta_table":   glossary_delta_table,
+                "custom_system_prompt":   prompt_body,
             },
         )
         out_path = f["expected_output"]

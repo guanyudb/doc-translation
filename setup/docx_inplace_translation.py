@@ -57,6 +57,8 @@ dbutils.widgets.dropdown("skip_if_already_target", "true", ["true", "false"],
                         "Skip paragraphs already in target language")
 dbutils.widgets.text("glossary_delta_table", "",
                      "FQN of translation_glossary Delta mirror (empty = disabled)")
+dbutils.widgets.text("custom_system_prompt", "",
+                     "Custom system prompt (empty = built-in default)")
 
 input_path = dbutils.widgets.get("input_path").strip()
 output_dir = dbutils.widgets.get("output_dir").strip().rstrip("/")
@@ -66,6 +68,9 @@ max_workers = int(dbutils.widgets.get("max_workers"))
 max_pages = int(dbutils.widgets.get("max_pages"))
 skip_if_already_target = dbutils.widgets.get("skip_if_already_target").lower() == "true"
 glossary_delta_table = dbutils.widgets.get("glossary_delta_table").strip()
+# Not .strip() — a custom prompt's leading/trailing whitespace could be
+# intentional; only treat it as "unset" when it's blank.
+custom_system_prompt = dbutils.widgets.get("custom_system_prompt")
 
 print(f"Input:     {input_path}")
 print(f"Output:    {output_dir}")
@@ -374,6 +379,10 @@ def _record_llm_bad(text: str) -> None:
             "snippet": (text[:80] + "…") if len(text) > 80 else text,
         })
 
+# Built-in fallback prompt, used when no per-document custom prompt is supplied
+# (e.g. a file dropped straight into the Volume rather than uploaded via the app).
+# Mirrors server/prompts.py:DEFAULT_PROMPT_BODY and the postdeploy seed — keep the
+# three in sync. `{lang}` is substituted per-call in _system_prompt_for().
 TRANSLATE_SYSTEM = (
     "You are a professional medical and clinical document translator working on FDA "
     "regulatory submissions. Translate the user's text to {lang}.\n"
@@ -386,6 +395,16 @@ TRANSLATE_SYSTEM = (
     "6. If the input is empty, whitespace, or only punctuation/numbers, return it unchanged.\n"
     "7. Do not add or remove leading/trailing whitespace beyond what the source has."
 )
+
+# A per-document prompt (chosen by the reviewer at upload, frozen into a sidecar,
+# passed through by the watcher) fully replaces the built-in prompt. Glossary
+# injection still appends afterward in _system_prompt_for().
+if custom_system_prompt.strip():
+    TRANSLATE_SYSTEM = custom_system_prompt
+    print("  [prompt] using custom per-document system prompt "
+          f"({len(custom_system_prompt)} chars)")
+else:
+    print("  [prompt] using built-in default system prompt")
 
 # ---- Glossary prompt injection (Aho-Corasick, retrieval-based) --------------
 #
@@ -469,7 +488,9 @@ def glossary_matches(text: str) -> list[tuple[str, str]]:
 
 def _system_prompt_for(text: str) -> str:
     """Base system prompt + any glossary rules relevant to this segment."""
-    base = TRANSLATE_SYSTEM.format(lang=target_language)
+    # str.replace (not str.format): a custom prompt may contain literal '{'/'}'
+    # (e.g. JSON examples) that would raise KeyError/ValueError under .format.
+    base = TRANSLATE_SYSTEM.replace("{lang}", target_language)
     matches = glossary_matches(text)
     if not matches:
         return base

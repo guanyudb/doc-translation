@@ -2,31 +2,55 @@ import { Languages } from "lucide-react";
 import { ModeToggle } from "@/components/apx/mode-toggle";
 import { cn } from "@/lib/utils";
 
-export type Tab = "review" | "glossary" | "audit";
+export type Tab = "review" | "glossary" | "instructions" | "audit";
 
 export function Navbar({
   active,
   onNavigate,
   subtitle,
+  title = "Doc Translation Review",
+  logoUrl = null,
+  logoAlt = null,
+  logoWidth = null,
+  logoHeight = null,
 }: {
   active: Tab;
   onNavigate: (t: Tab) => void;
   subtitle?: React.ReactNode;
+  title?: string;
+  logoUrl?: string | null;
+  logoAlt?: string | null;
+  logoWidth?: number | null;
+  logoHeight?: number | null;
 }) {
   const tabs: { id: Tab; label: string }[] = [
     { id: "review", label: "Review" },
     { id: "glossary", label: "Glossary" },
+    { id: "instructions", label: "Instructions" },
     { id: "audit", label: "Audit" },
   ];
   return (
     <header className="sticky top-0 z-50 border-b bg-background/80 backdrop-blur-sm">
       <div className="mx-auto flex h-14 w-full max-w-[1920px] items-center gap-4 px-4 sm:px-6 lg:px-8">
         <div className="flex items-center gap-2.5">
-          <div className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
-            <Languages className="size-4" />
-          </div>
+          {logoUrl ? (
+            <img
+              src={logoUrl}
+              alt={logoAlt ?? title}
+              title={logoAlt ?? title}
+              className="rounded-md object-contain"
+              style={{
+                width: logoWidth ?? undefined,
+                height: logoHeight ?? undefined,
+              }}
+            />
+          ) : (
+            <div className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
+              <Languages className="size-4" />
+            </div>
+          )}
           <div className="flex flex-col leading-tight">
-            <span className="text-sm font-semibold">Doc Translation Review</span>
+            <span className="text-sm font-semibold">{title}</span>
             {subtitle && <span className="text-xs text-muted-foreground">{subtitle}</span>}
           </div>
         </div>

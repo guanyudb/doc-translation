@@ -7,6 +7,7 @@ import { api, PairDetail, PairSummary, Paragraph } from "@/api";
 import { DocPane, FeedbackMeta } from "@/components/review/DocPane";
 import { ActiveParagraphPanel } from "@/components/review/ActiveParagraphPanel";
 import { UploadDialog } from "@/components/review/UploadDialog";
+import { ProcessingPanel } from "@/components/review/ProcessingPanel";
 
 export function ReviewView({
   activePair,
@@ -239,6 +240,9 @@ export function ReviewView({
 
   return (
     <div className="space-y-4">
+      {/* In-flight uploads: queued / translating docs, above the toolbar */}
+      <ProcessingPanel onSettled={loadPairs} />
+
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-3">
         <Select

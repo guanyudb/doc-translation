@@ -17,6 +17,7 @@ env/
 .idea/
 .vscode/
 *.swp
+.isaac
 
 # Streamlit secrets
 .streamlit/secrets.toml
@@ -25,6 +26,7 @@ env/
 .env
 .env.*
 !.env.example
+uv.lock
 
 # Build artifacts
 build/
@@ -35,6 +37,9 @@ dist/
 # committed so the bundle can ship it without a Node runtime.
 frontend/node_modules/
 frontend/.vite/
+
+# customer custom images
+frontend/public/*.png
 
 # Databricks CLI sync metadata. variable-overrides.json holds per-workspace
 # values + identities → never commit.

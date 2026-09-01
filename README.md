@@ -125,6 +125,16 @@ Approved entries are mirrored to a Delta table and read by the translation pipel
 
 ---
 
+## Prompt management (Instructions)
+
+The system prompt sent to the translation model is no longer hard-coded — the **Instructions** tab is a full CRUD library of named prompts (view / create / clone / edit / delete), stored in the `translation_prompts` Lakebase table. Each prompt's body **replaces** the model's base system prompt at translation time; glossary terms are still appended per-segment afterward, so prompt management and the glossary loop compose. Prompts are **seeded-editable** — the editor opens pre-filled with the built-in default (including the `{lang}` token, which is substituted with the document's target language via `str.replace`, so a custom prompt may safely contain literal `{`/`}`).
+
+**Selection is required at upload.** The upload dialog has a prompt dropdown; the Upload button stays disabled until one is chosen. A built-in `Medical / clinical (default)` prompt is seeded on first deploy (and on app startup if the table is empty) so the list is never empty.
+
+**The chosen prompt is snapshotted, not referenced.** At upload the full prompt text is frozen into a `<file>.docx.prompt` JSON sidecar (`{prompt_id, name, body}`) next to the raw file — mirroring the `.lang` sidecar. The watcher reads it (`_prompt_for`), records `selected_prompt_id` / `selected_prompt_name` / `prompt_text_used` on `bronze_documents`, and passes the body to the inner notebook as the `custom_system_prompt` job argument. **Editing or deleting a prompt afterward never changes what a past document was translated with** — the snapshot is the compliance record of what actually ran. Because the text is frozen at upload, prompts (unlike the glossary) are **not** mirrored to Delta; the notebook needs no lookup. Every prompt mutation emits a `PROMPT_CREATED/UPDATED/DELETED/CLONED` audit event. A file dropped straight into the Volume (bypassing the app) has no sidecar and falls back to the notebook's built-in default prompt.
+
+---
+
 ## Compliance & traceability
 
 - **Append-only** `audit_events` Delta table — INSERT-only ACL for the app SP, 7-year retention (`delta.deletedFileRetentionDuration = 'interval 2557 days'`)
@@ -144,7 +154,8 @@ Approved entries are mirrored to a Delta table and read by the translation pipel
 | Storage (files) | Original / translated / reviewed / golden `.docx` | UC Volume `<uc_catalog>.<uc_schema>.<uc_volume_name>` (from your `variable-overrides.json`) |
 | Storage (state) | Live review state — pairs, feedback, edits, audit, glossary, confidence | Lakebase Postgres (Project or Provisioned), schema `<pg_schema>` |
 | Storage (archive) | Long-term audit + publication archive | Delta tables in `<uc_catalog>.<uc_schema>` |
-| Translation | In-place OOXML translation per paragraph | FMAPI endpoint (default `databricks-claude-sonnet-4-6`, configurable via `translation_model_endpoint`) |
+| Translation | In-place OOXML translation per paragraph, with a per-document selectable system prompt | FMAPI endpoint (default `databricks-claude-sonnet-4-6`, configurable via `translation_model_endpoint`) |
+| Prompts | Named translation-prompt library; one is chosen per document at upload (frozen snapshot) | Lakebase `translation_prompts` + Instructions tab; `server/prompts.py` |
 | Orchestration | File-arrival → translation pipeline | Lakeflow Job `doc-translation · auto-translate pipeline` (bundle-managed) |
 | Review UI | Two-region layout (side-by-side DOCX HTML preview + paragraph action rail), certify/edit/publish/promote, glossary admin, audit | React SPA (Vite + TS + Tailwind) served by FastAPI on Databricks Apps |
 | Auth | Reviewer identity via `X-Forwarded-Email`, App SP for system actions | Databricks Apps SSO + Service Principal |
@@ -171,8 +182,9 @@ doc-translation-app/
 │       ├── App.tsx                 # tab shell: Review / Glossary / Audit
 │       ├── api.ts                  # typed client for /api/*
 │       └── components/
-│           ├── review/             # ReviewView, PreviewPane, ParagraphCard
+│           ├── review/             # ReviewView, PreviewPane, ParagraphCard, UploadDialog
 │           ├── glossary/GlossaryView.tsx
+│           ├── instructions/InstructionsView.tsx   # prompt-management CRUD
 │           └── audit/AuditView.tsx
 ├── static/                        # PREBUILT SPA (committed; served by FastAPI)
 ├── legacy/
@@ -197,6 +209,7 @@ doc-translation-app/
 │   ├── delta_sync.py               # Lakebase → Delta mirror (review state + glossary)
 │   ├── docx_render.py              # DOCX → HTML via sentinel markers + lxml
 │   ├── glossary.py                 # Mine + ingest + prompt-format glossary entries
+│   ├── prompts.py                  # translation_prompts CRUD + audit + default seed
 │   ├── store.py                    # Lakebase CRUD + audit emits + lifecycle
 │   ├── styles.py                   # (legacy Streamlit CSS)
 │   └── volume.py                   # UC Volume listing, DOCX read, golden promotion
@@ -304,7 +317,7 @@ After `./deploy.sh`, you'll have a Lakeflow job called `doc-translation · auto-
   - `setup/auto_translate_watcher.py` — scans for unpaired files, writes `bronze_documents` audit rows, invokes the translator once per file
   - `setup/docx_inplace_translation.py` — translates paragraph-by-paragraph via the configured Foundation Model API endpoint, in-place at the OOXML level (preserves layout, charts, headers/footers, SmartArt)
 
-To kick a translation: just upload a `.docx` to `raw_documents/`. The job fires automatically; the translated file appears in `translated_inplace/`; the reviewer app's sidebar picks up the new pair.
+To kick a translation: upload a `.docx` through the app's Upload dialog (choosing a target language **and** a translation prompt), or drop one straight into `raw_documents/` (which uses the built-in default prompt). The job fires automatically; the translated file appears in `translated_inplace/`; the reviewer app's sidebar picks up the new pair.
 
 Configuration knobs (set in `variable-overrides.json`):
 - `translation_model_endpoint` (default `databricks-claude-sonnet-4-6`)

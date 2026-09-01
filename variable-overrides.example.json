@@ -15,5 +15,9 @@
   "translation_model_endpoint":  "databricks-claude-sonnet-4-6",
   "translation_target_language": "English",
   "translation_max_workers":     "8",
-  "translation_max_pages":       "0"
+  "translation_max_pages":       "0",
+  "_branding_comment": "Optional top-left branding. Leave app_logo_url blank to keep the built-in icon. To use a custom logo, drop the image in frontend/public/ (e.g. frontend/public/brand-logo.png) and set app_logo_url to its served path (/brand-logo.png); a logo/asset change needs a rebuild (FORCE_BUILD=1 ./deploy.sh).",
+  "app_title":                   "Doc Translation Review",
+  "app_logo_url":                "",
+  "app_logo_alt":                ""
 }

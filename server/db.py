@@ -22,6 +22,7 @@ Pool lifecycle:
   they don't need to know about the indirection.
 """
 import threading
+import uuid
 import psycopg
 from psycopg_pool import ConnectionPool
 from . import config
@@ -44,8 +45,12 @@ class OAuthConnection(psycopg.Connection):
             )
             kwargs["password"] = resp["token"]
         else:
+            # request_id (idempotency key) is required by newer SDK/runtime
+            # builds of GenerateDatabaseCredential and ignored by older ones —
+            # always pass a fresh UUID for cross-version safety.
             cred = config.w().database.generate_database_credential(
-                instance_names=[config.LAKEBASE_INSTANCE]
+                request_id=str(uuid.uuid4()),
+                instance_names=[config.LAKEBASE_INSTANCE],
             )
             kwargs["password"] = cred.token
         return super().connect(conninfo, **kwargs)
@@ -56,7 +61,7 @@ def _build_conninfo() -> str:
     return (
         f"dbname={config.PGDATABASE} "
         f"user={user} "
-        f"host={config.PGHOST} "
+        f"host={config.pg_host()} "
         f"port={config.PGPORT} "
         f"sslmode={config.PGSSLMODE}"
     )
