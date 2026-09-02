@@ -229,6 +229,11 @@ export const api = {
       j<{ output_path: string; edits_applied: number; version: number }>
     ),
 
+  // Same-origin GET (carries the app SSO cookie); the response is an attachment,
+  // so navigating an anchor to it downloads the translated file with edits applied.
+  translatedDownloadUrl: (id: string) =>
+    `/api/pairs/${encodeURIComponent(id)}/download/translated`,
+
   promote: (id: string) =>
     fetch(`/api/pairs/${encodeURIComponent(id)}/promote`, { method: "POST" }).then(
       j<{ ok: boolean; delta_synced: boolean; message: string }>

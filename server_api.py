@@ -30,7 +30,7 @@ import time
 from collections import OrderedDict
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Body, Path, Request, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from server import config, volume, store, docx_render, auth, delta_sync
@@ -397,6 +397,31 @@ def preview(pair_id: str, side: str):
         if edits:
             html = docx_render.apply_edits_overlay(html, edits)
     return HTMLResponse(html)
+
+
+@app.get("/api/pairs/{pair_id}/download/translated")
+def download_translated(pair_id: str):
+    """Download the translated document with the current reviewer edits applied,
+    generated on demand (no need to publish first). PDF pairs → a layout-
+    preserving translated PDF; DOCX pairs → the translated .docx."""
+    match = _resolve(pair_id)
+    edits = store.get_edits(pair_id)
+    lang = (match.get("target_lang") or "tr").lower()
+    if _is_pdf_pair(match):
+        raw_pdf = volume.read_docx(f"{config.RAW_DIR}/{pair_id}.pdf")
+        artifact = _load_artifact(match["translated_path"])
+        data = pdf_layout.apply_edits_to_pdf(raw_pdf, artifact, edits)
+        media = "application/pdf"
+        fname = f"{pair_id}_translated_{lang}.pdf"
+    else:
+        tran_bytes = volume.read_docx(match["translated_path"])
+        data, _ = docx_render.apply_edits_to_docx(tran_bytes, edits)
+        media = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        fname = f"{pair_id}_translated_{lang}.docx"
+    return Response(
+        content=data, media_type=media,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 def _para_response(pair_id: str, idx: int) -> dict:
