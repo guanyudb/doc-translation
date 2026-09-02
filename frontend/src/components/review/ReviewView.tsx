@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, ScrollText, UploadCloud, Award, Loader2, FilePlus2, RefreshCw } from "lucide-react";
+import { CheckCircle2, ScrollText, UploadCloud, Award, Loader2, FilePlus2, RefreshCw, Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/input";
@@ -320,6 +320,21 @@ export function ReviewView({
               onClick={() => act("publish", () => api.publish(detail.pair_id), true)}
             >
               {busy === "publish" ? <Loader2 className="animate-spin" /> : <UploadCloud />} Publish
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              title="Download the translated document with your edits applied"
+              onClick={() => {
+                const a = document.createElement("a");
+                a.href = api.translatedDownloadUrl(detail.pair_id);
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+              }}
+            >
+              <Download />
+              {detail.translated_path.endsWith(".pdf.json") ? "Download PDF" : "Download .docx"}
             </Button>
             <Button
               variant="default"

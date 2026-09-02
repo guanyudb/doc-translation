@@ -8,4 +8,6 @@ psycopg[binary,pool]>=3.2
 databricks-sdk>=0.40
 mammoth>=1.8
 lxml>=5.3
+# PDF workflow: layout-preserving translated-PDF export (redact + retypeset).
+pymupdf>=1.24
 streamlit>=1.40

@@ -105,9 +105,9 @@ export function UploadDialog({
         <DialogHeader>
           <DialogTitle>Upload a document for translation</DialogTitle>
           <DialogDescription>
-            Drop a source <code>.docx</code>. It's translated automatically on arrival and
-            appears in the review list when done (usually 1–3 min). Source language is
-            auto-detected.
+            Drop a source <code>.docx</code> or <code>.pdf</code>. It's translated
+            automatically and appears in the review list when done (usually 1–3 min).
+            Source language is auto-detected.
           </DialogDescription>
         </DialogHeader>
 
@@ -131,13 +131,13 @@ export function UploadDialog({
             ) : (
               <>
                 <UploadCloud className="size-6" />
-                <span>Click or drag a .docx here</span>
+                <span>Click or drag a .docx or .pdf here</span>
               </>
             )}
             <input
               ref={inputRef}
               type="file"
-              accept=".docx"
+              accept=".docx,.pdf"
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0];
