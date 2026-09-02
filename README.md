@@ -1,14 +1,21 @@
 # Doc Translation Review Platform
 
 A compliance-grade, end-to-end pipeline + reviewer app for translating
-clinical/regulated `.docx` documents on Databricks.
+clinical/regulated **`.docx` and `.pdf`** documents on Databricks.
 
-A submitter drops a Japanese (or any source-language) `.docx` into a Unity
-Catalog Volume. A file-arrival-triggered Lakeflow job translates it in-place
-at the OOXML level with Foundation Model API. Reviewers certify it
-paragraph-by-paragraph in a React app (FastAPI backend). Once 100% certified,
-the document is atomically promoted to a "golden" Volume location, locked
-read-only, and mirrored to Delta for long-term archive.
+A submitter drops a Japanese (or any source-language) `.docx` or `.pdf` into a
+Unity Catalog Volume. Two ingestion paths converge on one review experience:
+
+- **DOCX** — a file-arrival-triggered Lakeflow job translates it in-place at the
+  OOXML level with Foundation Model API.
+- **PDF** — an in-app pipeline parses it with `ai_parse_document`, translates the
+  extracted elements (FMAPI), and can re-render a **layout-preserving translated
+  PDF**.
+
+Reviewers certify either format paragraph-by-paragraph in a React app (FastAPI
+backend) — the UI is format-agnostic. Once 100% certified, the document is
+atomically promoted to a "golden" Volume location, locked read-only, and
+mirrored to Delta for long-term archive.
 
 Every action is audited. Every certified document is content-addressed.
 Once locked, writes are refused with an explicit `PairLockedError` (which is
@@ -50,6 +57,35 @@ itself audited).
 - **Delta Lake** — long-term archive and BI surface (append-only audit, 7-year retention)
 
 Data flows from Lakebase → Delta only at promotion time, so the hot path stays fast and the cold path stays compliance-grade.
+
+---
+
+## Two ingestion workflows, one review experience
+
+The platform is a **hybrid**: DOCX and PDF are ingested by separate pipelines,
+but both emit the identical review contract (HTML with per-element `data-pidx` /
+`data-page` anchors + index-aligned paragraphs), so the review / edit / certify /
+publish UI is completely format-agnostic — reviewers can't tell a PDF pair from a
+DOCX pair.
+
+| | **DOCX** | **PDF** |
+|---|---|---|
+| Where it runs | File-arrival **Lakeflow job** (async) | **In-app** background thread (FastAPI) |
+| Parse | python-docx walks OOXML paragraphs | `ai_parse_document` (SQL on the warehouse) → typed elements + bbox |
+| Translate | FMAPI + glossary, in-place OOXML | FMAPI + glossary over parsed elements (whole-table cross-cell context) |
+| Intermediate | the translated `.docx` itself | a JSON artifact `*_translated_<lang>.pdf.json` (elements: `id`, `type`, `page`, `bbox`, `source`, `target`; tables as HTML) |
+| Export / download | translated `.docx` (edits applied) | **layout-preserving translated PDF** — redact source text by bbox + retypeset the translation with PyMuPDF |
+
+The PDF **intermediate is structured JSON, not markdown** — deliberately, because
+the workflow needs `bbox` (for the layout-preserving export), stable element ids
+(review state is keyed by `paragraph_idx`), and per-element type (drives both the
+review HTML and the export styling). HTML is derived from it for review; PDF is
+derived for export. It's an "IR → re-typeset" design.
+
+Both formats offer **"Download translated"** in the review toolbar — an on-demand
+`GET /api/pairs/{id}/download/translated` that applies the current reviewer edits
+(no need to publish first): a layout-preserving PDF for PDF pairs, the translated
+`.docx` for DOCX pairs.
 
 ---
 
@@ -154,9 +190,10 @@ The system prompt sent to the translation model is no longer hard-coded — the 
 | Storage (files) | Original / translated / reviewed / golden `.docx` | UC Volume `<uc_catalog>.<uc_schema>.<uc_volume_name>` (from your `variable-overrides.json`) |
 | Storage (state) | Live review state — pairs, feedback, edits, audit, glossary, confidence | Lakebase Postgres (Autoscaling Project), schema `<pg_schema>` |
 | Storage (archive) | Long-term audit + publication archive | Delta tables in `<uc_catalog>.<uc_schema>` |
-| Translation | In-place OOXML translation per paragraph, with a per-document selectable system prompt | FMAPI endpoint (default `databricks-claude-sonnet-4-6`, configurable via `translation_model_endpoint`) |
+| Translation (DOCX) | In-place OOXML translation per paragraph, with a per-document selectable system prompt | FMAPI endpoint (default `databricks-claude-sonnet-4-6`, configurable via `translation_model_endpoint`) |
+| Translation (PDF) | In-app parse (`ai_parse_document`) + element translation + layout-preserving PDF export | `server/pdf_translate.py`, `server/pdf_render.py`, `server/pdf_layout.py` (PyMuPDF) |
 | Prompts | Named translation-prompt library; one is chosen per document at upload (frozen snapshot) | Lakebase `translation_prompts` + Instructions tab; `server/prompts.py` |
-| Orchestration | File-arrival → translation pipeline | Lakeflow Job `doc-translation · auto-translate pipeline` (bundle-managed) |
+| Orchestration | File-arrival → DOCX translation pipeline (PDF translates in-app, no job) | Lakeflow Job `doc-translation · auto-translate pipeline` (bundle-managed) |
 | Review UI | Two-region layout (side-by-side DOCX HTML preview + paragraph action rail), certify/edit/publish/promote, glossary admin, audit | React SPA (Vite + TS + Tailwind) served by FastAPI on Databricks Apps |
 | Auth | Reviewer identity via `X-Forwarded-Email`, App SP for system actions | Databricks Apps SSO + Service Principal |
 
@@ -173,7 +210,7 @@ doc-translation-app/
 ├── build.sh                        # builds the React frontend → static/ (run before deploy)
 ├── server_api.py                   # FastAPI backend: JSON review API + serves the SPA
 ├── app.yaml                        # Databricks Apps runtime config (uvicorn server_api:app)
-├── requirements.txt                # fastapi, uvicorn, psycopg[binary,pool], databricks-sdk, mammoth, lxml
+├── requirements.txt                # fastapi, uvicorn, psycopg[binary,pool], databricks-sdk, mammoth, lxml, pymupdf
 ├── pyproject.toml
 ├── frontend/                       # React SPA source (Vite + TS + Tailwind); NOT deployed
 │   ├── package.json
@@ -208,11 +245,14 @@ doc-translation-app/
 │   ├── db.py                       # Lakebase psycopg pool, lazy-init proxy
 │   ├── delta_sync.py               # Lakebase → Delta mirror (review state + glossary)
 │   ├── docx_render.py              # DOCX → HTML via sentinel markers + lxml
+│   ├── pdf_translate.py            # PDF: ai_parse_document (warehouse) + FMAPI translate → JSON artifact
+│   ├── pdf_render.py               # PDF artifact → review HTML (same data-pidx contract as docx_render)
+│   ├── pdf_layout.py               # PDF: layout-preserving translated-PDF export (PyMuPDF redact + retypeset)
 │   ├── glossary.py                 # Mine + ingest + prompt-format glossary entries
 │   ├── prompts.py                  # translation_prompts CRUD + audit + default seed
 │   ├── store.py                    # Lakebase CRUD + audit emits + lifecycle
 │   ├── styles.py                   # (legacy Streamlit CSS)
-│   └── volume.py                   # UC Volume listing, DOCX read, golden promotion
+│   └── volume.py                   # UC Volume listing, DOCX/PDF read, pairing, golden promotion
 └── docs/
     ├── architecture.png            # Architecture diagram (PNG)
     ├── architecture.svg            # Architecture diagram (SVG)
@@ -232,17 +272,17 @@ Your target workspace needs:
 
 1. **Unity Catalog access** — a catalog where you can `CREATE SCHEMA` and `CREATE VOLUME`
 2. **A Lakebase Autoscaling Project** — get the project name + branch (Provisioned Lakebase is retired). List with `databricks postgres list-projects`.
-3. **A SQL warehouse** for the Delta archive. Any serverless 2X-Small works.
-4. **Foundation Model API** with access to `databricks-claude-sonnet-4-6` (or another Claude model you specify in the inner translation notebook).
-5. **Databricks CLI** v0.220+ authenticated to the target workspace.
+3. **A SQL warehouse** — **must be Serverless or Pro and support `ai_parse_document` (DBR 17.3+)**; the PDF workflow runs `ai_parse_document` on it, and it also drives the Delta archive sync. A Classic warehouse will not work for PDF.
+4. **Foundation Model API** with access to `databricks-claude-sonnet-4-6` (or another Claude model you specify) — the app service principal needs `CAN QUERY` on it.
+5. **Databricks CLI** v0.220+ authenticated to the target workspace, plus **Node.js** locally (the deploy step builds the React SPA).
 
 ### One-time setup
 
 ```bash
-# 1. Clone + check out this branch
+# 1. Clone (main is the deployable branch — includes both DOCX + PDF workflows)
 git clone git@github.com:guanyudb/doc-translation.git
 cd doc-translation
-git checkout customer-deployable
+git checkout main
 
 # 2. Create the variable-overrides file. Its presence is what enables the
 #    "Deploy bundle" button in the Workspace UI AND what `./deploy.sh` reads.
@@ -310,7 +350,9 @@ After `./deploy.sh`, you'll have a Lakeflow job called `doc-translation · auto-
   - `setup/auto_translate_watcher.py` — scans for unpaired files, writes `bronze_documents` audit rows, invokes the translator once per file
   - `setup/docx_inplace_translation.py` — translates paragraph-by-paragraph via the configured Foundation Model API endpoint, in-place at the OOXML level (preserves layout, charts, headers/footers, SmartArt)
 
-To kick a translation: upload a `.docx` through the app's Upload dialog (choosing a target language **and** a translation prompt), or drop one straight into `raw_documents/` (which uses the built-in default prompt). The job fires automatically; the translated file appears in `translated_inplace/`; the reviewer app's sidebar picks up the new pair.
+To kick a **DOCX** translation: upload a `.docx` through the app's Upload dialog (choosing a target language **and** a translation prompt), or drop one straight into `raw_documents/` (which uses the built-in default prompt). The job fires automatically; the translated file appears in `translated_inplace/`; the reviewer app's sidebar picks up the new pair.
+
+**PDF** uploads translate **in-app** (no Lakeflow job): the FastAPI backend runs `ai_parse_document` on the warehouse, translates the parsed elements via FMAPI, and writes a `*_translated_<lang>.pdf.json` artifact to `translated_inplace/` — usually within ~10–60s. The reviewer app renders it identically to a DOCX pair.
 
 Configuration knobs (set in `variable-overrides.json`):
 - `translation_model_endpoint` (default `databricks-claude-sonnet-4-6`)
@@ -427,7 +469,7 @@ with `.venv/bin/streamlit run legacy/streamlit_app.py` against the same env vars
 ## What's deferred
 
 - **Paragraph/sentence-level correction learning** — semantic retrieval (Databricks Vector Search) over past (original, revised) paragraph pairs, injected as few-shot examples. Complements the term-level glossary; gated on classifying reviewer feedback as term- vs sentence-level first.
-- **PDF support** — designed but not built; would need `pymupdf` extraction + an "overlay vs. in-place" writeback choice per document
+- **PDF: text baked inside figure images** — chart axis labels etc. embedded in a bitmap stay in the source language (only the separate `caption` element is translated). Would need in-image OCR + image editing. (Core PDF support — parse, translate, review, layout-preserving export — is **built**; see "Two ingestion workflows" above.)
 - **Two-eyes / multi-reviewer attestation** before promotion
 - **AI/BI dashboards** on the Delta tables (pipeline health, review backlog, SLA breach)
 - **Lakeflow alerts** on `FAILED_TRANSLATION` / `DELTA_SYNC_FAILED` events
