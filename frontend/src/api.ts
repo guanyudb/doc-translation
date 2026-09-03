@@ -66,6 +66,7 @@ export interface GlossaryEntry {
 
 export interface AppConfig {
   reviewer: string;
+  is_admin: boolean;
   target_language: string;
   model_endpoint: string;
   is_configured: boolean;
@@ -233,6 +234,15 @@ export const api = {
   // so navigating an anchor to it downloads the translated file with edits applied.
   translatedDownloadUrl: (id: string) =>
     `/api/pairs/${encodeURIComponent(id)}/download/translated`,
+
+  // Re-translate a pair with a different Instruction (prompt), in place. Resets
+  // the document's review state; open to reviewers.
+  retranslate: (id: string, promptId: number) =>
+    fetch(`/api/pairs/${encodeURIComponent(id)}/retranslate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt_id: promptId }),
+    }).then(j<{ ok: boolean; kind: string; message: string }>),
 
   promote: (id: string) =>
     fetch(`/api/pairs/${encodeURIComponent(id)}/promote`, { method: "POST" }).then(

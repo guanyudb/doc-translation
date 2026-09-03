@@ -86,3 +86,9 @@ resources:
             scope:      ${var.secret_scope}
             key:        app_logo_alt
             permission: READ
+        # ---- Admin gate: emails allowed to change Settings (deployer by default)
+        - name: admin_emails
+          secret:
+            scope:      ${var.secret_scope}
+            key:        admin_emails
+            permission: READ

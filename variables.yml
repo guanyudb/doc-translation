@@ -96,6 +96,16 @@ variables:
     description: Databricks App name. Becomes the public URL prefix.
     default: doc-translation
 
+  # ---- Admin gate ----
+  app_admin_emails:
+    description: |
+      Comma-separated emails allowed to change app Settings (model endpoint,
+      target language, branding). Blank → defaults to the deploying user
+      (workspace_user_email) at deploy time, so only the deployer is admin. The
+      translation/review workflow (upload, prompts, glossary, certify, promote)
+      stays open to all reviewers regardless.
+    default: ""
+
   # ---- Secrets ----
   secret_scope:
     description: |

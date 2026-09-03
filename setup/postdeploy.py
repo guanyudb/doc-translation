@@ -41,6 +41,7 @@ dbutils.widgets.text("lakebase_database_slug", "databricks-postgres", "lakebase_
 dbutils.widgets.text("warehouse_id",           "", "warehouse_id")
 dbutils.widgets.text("app_name",               "doc-translation", "app_name")
 dbutils.widgets.text("secret_scope",           "doc_translation_config", "secret_scope")
+dbutils.widgets.text("app_admin_emails",       "", "app_admin_emails")
 dbutils.widgets.dropdown("enable_seed_glossary", "false", ["true", "false"],
                          "Load the shipped clinical seed glossary")
 
@@ -54,6 +55,7 @@ lakebase_db_slug  = dbutils.widgets.get("lakebase_database_slug").strip()
 warehouse_id      = dbutils.widgets.get("warehouse_id").strip()
 app_name          = dbutils.widgets.get("app_name").strip()
 secret_scope      = dbutils.widgets.get("secret_scope").strip() or "doc_translation_config"
+app_admin_emails  = dbutils.widgets.get("app_admin_emails").strip()
 enable_seed_glossary = dbutils.widgets.get("enable_seed_glossary").lower() == "true"
 
 for k, v in [("uc_catalog", uc_catalog), ("warehouse_id", warehouse_id),
@@ -93,6 +95,9 @@ print(f"app SP UUID: {sp_uuid}")
 # seeding ever wrote a wrong value (Python put_secret has no shell-quoting
 # hazards).
 vol_root_value = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume_name}"
+# Admins allowed to change Settings. Explicit override wins; else default to the
+# deploying user (this job runs AS them), so a fresh deploy is gated to the deployer.
+admin_emails_value = app_admin_emails or (w.current_user.me().user_name or "")
 app_config_secrets = {
     "pg_schema":         pg_schema,
     "lakebase_project":  lakebase_project,
@@ -100,6 +105,7 @@ app_config_secrets = {
     "volume_root":       vol_root_value,
     "delta_catalog":     uc_catalog,
     "delta_schema":      uc_schema,
+    "admin_emails":      admin_emails_value,
 }
 for k, v in app_config_secrets.items():
     w.secrets.put_secret(scope=secret_scope, key=k, string_value=(v or ""))

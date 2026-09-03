@@ -272,6 +272,7 @@ def get_config():
     s = settings_mod.load()
     return {
         "reviewer": auth.reviewer(),
+        "is_admin": auth.is_admin(),
         "target_language": s["target_language"],
         "model_endpoint": s["model_endpoint"],
         "is_configured": s["is_configured"],
@@ -295,10 +296,20 @@ def get_settings():
     return settings_mod.load(force=True)
 
 
+def _require_admin() -> None:
+    """403 unless the signed-in user is an app admin (deployer). Used to gate
+    app-configuration endpoints; the translation/review workflow stays open to
+    all reviewers."""
+    if not auth.is_admin():
+        raise HTTPException(403, "Only the app's admin (the deploying user) can change Settings.")
+
+
 @app.put("/api/settings")
 def put_settings(patch: dict = Body(...)):
     """Persist a partial settings update and mark the app configured. Accepts
-    any of: model_endpoint, target_language, app_title, logo_url, logo_alt."""
+    any of: model_endpoint, target_language, app_title, logo_url, logo_alt.
+    Admin-only (deployer) — app configuration, not part of the review workflow."""
+    _require_admin()
     if not isinstance(patch, dict):
         raise HTTPException(400, "body must be a JSON object")
     return settings_mod.save(patch, actor=auth.reviewer())
@@ -424,6 +435,90 @@ def download_translated(pair_id: str):
     )
 
 
+def _pipeline_job_id_for_deployment() -> int | None:
+    """Resolve THIS deployment's pipeline job. The job name isn't unique across
+    deployments sharing a workspace, so match on the task's `raw_dir` parameter
+    (== config.RAW_DIR). Falls back to the sole name match — the normal
+    single-deployment customer case (where the name is unambiguous)."""
+    try:
+        candidates = [j.job_id for j in config.w().jobs.list()
+                      if j.settings and j.settings.name == PIPELINE_JOB_NAME]
+    except Exception:
+        log.exception("retranslate(docx): could not list jobs")
+        return None
+    for jid in candidates:
+        try:
+            j = config.w().jobs.get(jid)
+            for t in (j.settings.tasks or []):
+                nb = getattr(t, "notebook_task", None)
+                bp = (getattr(nb, "base_parameters", None) or {}) if nb else {}
+                if bp.get("raw_dir") == config.RAW_DIR:
+                    return jid
+        except Exception:
+            continue
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _retranslate_docx(pair_id: str, match: dict, prompt: dict) -> dict:
+    """Rewrite the `.prompt` sidecar with the chosen instruction, drop the old
+    translated output (so the watcher treats the doc as unpaired), and run THIS
+    deployment's pipeline job. The watcher then re-translates the unpaired doc
+    with the new instruction.
+
+    We resolve the job by `raw_dir` (not by name, which isn't unique across
+    deployments) and run it directly — re-touching the raw file wouldn't work
+    because a same-path overwrite doesn't re-fire the file-arrival trigger."""
+    snapshot = json.dumps({
+        "prompt_id": prompt["prompt_id"], "name": prompt["name"], "body": prompt["body"],
+    })
+    volume.upload_docx(f"{config.RAW_DIR}/{pair_id}.docx.prompt", snapshot.encode("utf-8"))
+    try:
+        config.w().files.delete(match["translated_path"])
+    except Exception:
+        log.exception("retranslate(docx): couldn't delete old output %s", match["translated_path"])
+    job_id = _pipeline_job_id_for_deployment()
+    if job_id is None:
+        raise HTTPException(500, "could not resolve this deployment's translation pipeline job")
+    config.w().jobs.run_now(job_id=job_id)
+    return {"ok": True, "kind": "docx",
+            "message": "Re-translating via the pipeline — the updated translation appears when the job completes (usually 1–3 min)."}
+
+
+@app.post("/api/pairs/{pair_id}/retranslate")
+def retranslate(pair_id: str, prompt_id: int = Body(..., embed=True)):
+    """Re-translate a pair with a different Instruction, in place. Resets this
+    document's review state (certifications + edits) — the translation is
+    regenerated, so prior attestations no longer apply. Open to all reviewers;
+    refused on locked/published pairs. Target language is unchanged (re-upload
+    to change it)."""
+    match = _resolve(pair_id)
+    if store.is_locked(pair_id):
+        raise HTTPException(409, "This document is published/locked — re-translation isn't allowed.")
+    prompt = prompts_mod.get_prompt(prompt_id)
+    if prompt is None:
+        raise HTTPException(400, f"unknown prompt_id: {prompt_id}")
+    model_endpoint = settings_mod.load().get("model_endpoint") or "databricks-claude-sonnet-4-6"
+    target_language = match.get("target_lang") or "English"
+
+    # Reset review state — prior certifications/edits were against the old translation.
+    try:
+        store.delete_pair_state(pair_id)
+    except Exception:
+        log.exception("retranslate: couldn't reset review state for %s", pair_id)
+
+    if _is_pdf_pair(match):
+        threading.Thread(
+            target=_run_pdf_retranslate_bg,
+            kwargs=dict(pdf_name=f"{pair_id}.pdf", artifact_path=match["translated_path"],
+                        target_language=target_language, prompt_body=prompt["body"],
+                        model_endpoint=model_endpoint),
+            daemon=True,
+        ).start()
+        return {"ok": True, "kind": "pdf",
+                "message": "Re-translating (in-app) — the updated translation will appear shortly."}
+    return _retranslate_docx(pair_id, match, prompt)
+
+
 def _para_response(pair_id: str, idx: int) -> dict:
     """Re-read one paragraph's review row for the client after a mutation."""
     fb = {r["paragraph_idx"]: r for r in store.get_feedback(pair_id)}
@@ -545,6 +640,40 @@ def _run_pdf_translation_bg(*, pdf_path: str, name: str, target_language: str,
             _pdf_inflight.discard(name)
 
 
+def _run_pdf_retranslate_bg(*, pdf_name: str, artifact_path: str, target_language: str,
+                            prompt_body: str, model_endpoint: str) -> None:
+    """Re-translate an existing PDF artifact in place with a new instruction —
+    no re-parse. The old artifact stays visible until the new one is written;
+    `_pdf_inflight` makes the status read TRANSLATING meanwhile."""
+    stem = pdf_name[: -len(".pdf")]
+    err_path = f"{config.RAW_DIR}/{pdf_name}.error"
+    with _pdf_inflight_lock:
+        _pdf_inflight.add(pdf_name)
+    try:
+        old_artifact = _load_artifact(artifact_path)
+        new_artifact = pdf_translate.retranslate_artifact(
+            old_artifact, target_lang=target_language,
+            base_prompt=prompt_body, model_endpoint=model_endpoint,
+        )
+        volume.upload_docx(
+            artifact_path, json.dumps(new_artifact, ensure_ascii=False).encode("utf-8")
+        )
+        _pdf_artifact_path.pop(stem, None)
+        try:
+            config.w().files.delete(err_path)
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception("pdf re-translate failed: %s", artifact_path)
+        try:
+            volume.upload_docx(err_path, str(e).encode("utf-8"))
+        except Exception:
+            pass
+    finally:
+        with _pdf_inflight_lock:
+            _pdf_inflight.discard(pdf_name)
+
+
 def _pdf_status_rows(*, only_user: str | None = None) -> list[dict]:
     """Processing-view rows for PDFs (no bronze table — status is derived from
     Volume state): `.error` sidecar → FAILED, artifact present → TRANSLATED,
@@ -559,8 +688,13 @@ def _pdf_status_rows(*, only_user: str | None = None) -> list[dict]:
         stem = name[: -len(".pdf")]
         if only_user is not None and volume.read_text(f"{config.RAW_DIR}/{name}.user") != only_user:
             continue
+        with _pdf_inflight_lock:
+            inflight = name in _pdf_inflight
         err = volume.read_text(f"{config.RAW_DIR}/{name}.error")
-        if err:
+        if inflight:
+            # covers a re-translate in progress even though the old artifact still exists
+            status = "TRANSLATING"
+        elif err:
             status = "FAILED_TRANSLATION"
         elif volume.find_pdf_artifact(stem):
             status = "TRANSLATED"

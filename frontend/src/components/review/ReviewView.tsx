@@ -7,6 +7,7 @@ import { api, PairDetail, PairSummary, Paragraph } from "@/api";
 import { DocPane, FeedbackMeta } from "@/components/review/DocPane";
 import { ActiveParagraphPanel } from "@/components/review/ActiveParagraphPanel";
 import { UploadDialog } from "@/components/review/UploadDialog";
+import { RetranslateDialog } from "@/components/review/RetranslateDialog";
 import { ProcessingPanel } from "@/components/review/ProcessingPanel";
 
 export function ReviewView({
@@ -21,6 +22,7 @@ export function ReviewView({
   defaultTarget: string;
 }) {
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [retranslateOpen, setRetranslateOpen] = useState(false);
   const [pairs, setPairs] = useState<PairSummary[]>([]);
   const [detail, setDetail] = useState<PairDetail | null>(null);
   const [origHtml, setOrigHtml] = useState("");
@@ -317,6 +319,15 @@ export function ReviewView({
               variant="outline"
               size="sm"
               disabled={locked || busy !== null}
+              title="Re-translate this document with a different Instruction (clears its review state)"
+              onClick={() => setRetranslateOpen(true)}
+            >
+              <RefreshCw /> Re-translate
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={locked || busy !== null}
               onClick={() => act("publish", () => api.publish(detail.pair_id), true)}
             >
               {busy === "publish" ? <Loader2 className="animate-spin" /> : <UploadCloud />} Publish
@@ -461,6 +472,12 @@ export function ReviewView({
         </div>
       )}
 
+      <RetranslateDialog
+        open={retranslateOpen}
+        onOpenChange={setRetranslateOpen}
+        pairId={detail?.pair_id ?? null}
+        onStarted={loadPairs}
+      />
       <UploadDialog
         open={uploadOpen}
         onOpenChange={setUploadOpen}

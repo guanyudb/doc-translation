@@ -84,6 +84,9 @@ pairs = [
     ("app_title",         d.get("app_title","Doc Translation Review")),
     ("app_logo_url",      d.get("app_logo_url","")),
     ("app_logo_alt",      d.get("app_logo_alt","")),
+    # Admins who may change Settings — the deploying user by default; set
+    # `app_admin_emails` (comma-separated) in overrides to add more.
+    ("admin_emails",      d.get("app_admin_emails") or d.get("workspace_user_email","")),
 ]
 for k, v in pairs:
     print(f"{k}={v}")'
