@@ -34,6 +34,7 @@ export default function App() {
           active={tab}
           onNavigate={setTab}
           showTabs={!needsSetup}
+          isAdmin={cfg?.is_admin ?? false}
           title={cfg?.title ?? "Doc Translation Review"}
           logoUrl={cfg?.logo_url ?? null}
           logoAlt={cfg?.logo_alt ?? null}
@@ -68,7 +69,7 @@ export default function App() {
               {tab === "glossary" && <GlossaryView deltaSyncEnabled={cfg?.delta_sync_enabled ?? false} />}
               {tab === "instructions" && <InstructionsView />}
               {tab === "audit" && <AuditView pairId={activePair} />}
-              {tab === "settings" && <SettingsView onSaved={() => refreshConfig()} />}
+              {tab === "settings" && cfg?.is_admin && <SettingsView onSaved={() => refreshConfig()} />}
             </>
           )}
         </main>

@@ -14,6 +14,7 @@ export function Navbar({
   logoWidth = null,
   logoHeight = null,
   showTabs = true,
+  isAdmin = true,
 }: {
   active: Tab;
   onNavigate: (t: Tab) => void;
@@ -24,13 +25,15 @@ export function Navbar({
   logoWidth?: number | null;
   logoHeight?: number | null;
   showTabs?: boolean;
+  isAdmin?: boolean;
 }) {
   const tabs: { id: Tab; label: string }[] = [
     { id: "review", label: "Review" },
     { id: "glossary", label: "Glossary" },
     { id: "instructions", label: "Instructions" },
     { id: "audit", label: "Audit" },
-    { id: "settings", label: "Settings" },
+    // Settings is app configuration — admin (deployer) only.
+    ...(isAdmin ? [{ id: "settings" as Tab, label: "Settings" }] : []),
   ];
   return (
     <header className="sticky top-0 z-50 border-b bg-background/80 backdrop-blur-sm">

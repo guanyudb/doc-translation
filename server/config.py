@@ -49,6 +49,11 @@ APP_TITLE    = _maybe("APP_TITLE") or "Doc Translation Review"
 APP_LOGO_URL = _maybe("APP_LOGO_URL")  # e.g. "/brand-logo.png"; None → lucide icon
 APP_LOGO_ALT = _maybe("APP_LOGO_ALT")  # image label / alt text; None → falls back to title
 
+# Comma-separated admin emails (the deploying user by default, seeded as the
+# `admin_emails` secret). Only these users may change app Settings — enforced in
+# server_api via auth.is_admin(). Unset/blank → admin is OPEN (see auth.is_admin).
+APP_ADMIN_EMAILS = _maybe("APP_ADMIN_EMAILS")
+
 
 def _maybe_int(name: str) -> int | None:
     """Positive integer from an optional env var, else None (unset / blank /

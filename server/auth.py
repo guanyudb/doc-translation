@@ -11,6 +11,7 @@ Either way, `reviewer()` returns the email or a safe local-dev default.
 """
 from __future__ import annotations
 import contextvars
+import os
 
 # Set per-request by the FastAPI middleware. Empty dict when unset.
 _request_headers: contextvars.ContextVar[dict] = contextvars.ContextVar(
@@ -50,3 +51,24 @@ def reviewer() -> str:
         pass
 
     return "local-dev@unknown"
+
+
+def _admin_set() -> set[str]:
+    """Configured admin emails, lowercased. Sourced from APP_ADMIN_EMAILS
+    (the `admin_emails` secret — the deployer by default), comma/semicolon
+    separated."""
+    raw = os.environ.get("APP_ADMIN_EMAILS") or ""
+    return {e.strip().lower() for e in raw.replace(";", ",").split(",") if e.strip()}
+
+
+def is_admin() -> bool:
+    """Whether the signed-in reviewer is an app admin (may change Settings).
+
+    Admin is gated to APP_ADMIN_EMAILS. When it's unset/blank, admin is OPEN —
+    so pre-existing deployments and local dev aren't locked out before the
+    `admin_emails` secret is seeded. Fresh deploys seed it to the deploying
+    user, so they're gated to the deployer by default."""
+    admins = _admin_set()
+    if not admins:
+        return True
+    return reviewer().strip().lower() in admins

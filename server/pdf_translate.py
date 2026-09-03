@@ -20,6 +20,7 @@ The warehouse executor (`delta_sync._execute`) and glossary reader
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -44,9 +45,15 @@ _TAG_RE = re.compile(r"<[^>]+>")
 # so we style headings ourselves — the model must not add markdown or quotes.
 _MD_HEADER_RE = re.compile(r"^\s*#{1,6}\s+")
 
-# Process-local translation cache (language|text -> translation). Bounds cost of
-# repeated boilerplate within and across documents in one app instance.
+# Process-local translation cache (language|prompt|text -> translation). Bounds
+# cost of repeated boilerplate within and across documents in one app instance.
 _TRANSLATE_CACHE: dict[str, str] = {}
+
+
+def _prompt_fp(base_prompt: str) -> str:
+    """Short fingerprint of the system prompt, for cache-key isolation across
+    different instructions."""
+    return hashlib.md5((base_prompt or "").encode("utf-8")).hexdigest()[:12]
 
 
 def slug_for(target_lang: str) -> str:
@@ -150,7 +157,9 @@ def _translate_text(text: str, base_prompt: str, target_lang: str,
                     glossary_pairs: list[tuple[str, str]], model_endpoint: str) -> str:
     if not text or not text.strip():
         return text
-    key = f"{target_lang}|{text}"
+    # Key includes a prompt fingerprint so a re-translate with a DIFFERENT
+    # instruction (same language + text) doesn't return the cached old output.
+    key = f"{target_lang}|{_prompt_fp(base_prompt)}|{text}"
     cached = _TRANSLATE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -181,7 +190,7 @@ def _translate_table(html: str, base_prompt: str, target_lang: str,
     something that isn't a table."""
     if not html or "<t" not in html.lower():
         return html
-    key = f"{target_lang}|TABLE|{html}"
+    key = f"{target_lang}|TABLE|{_prompt_fp(base_prompt)}|{html}"
     cached = _TRANSLATE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -288,3 +297,44 @@ def run(pdf_path: str, *, target_lang: str, base_prompt: str, model_endpoint: st
     volume.upload_docx(ap, json.dumps(artifact, ensure_ascii=False).encode("utf-8"))
     log.info("pdf translate: wrote artifact %s (%d elements)", ap, len(artifact["elements"]))
     return ap
+
+
+def retranslate_artifact(artifact: dict, *, target_lang: str, base_prompt: str,
+                         model_endpoint: str) -> dict:
+    """Re-translate an existing artifact's SOURCE elements with a new prompt,
+    without re-parsing the PDF (the source layout/text never changed — only the
+    instruction does). Preserves each element's id / type / page / bbox / source
+    and replaces only `target`. Returns a fresh artifact dict."""
+    elements_in = artifact.get("elements", []) or []
+    src_lang = (artifact.get("source_lang") or "").strip() or docx_render.detect_lang(
+        [{"text": e.get("source", "")} for e in elements_in]
+    )
+    try:
+        glossary_pairs = glossary_mod.glossary_for_prompt(
+            source_lang=src_lang, target_lang=(target_lang or "").lower(), top_n=200
+        )
+    except Exception:
+        log.warning("pdf retranslate: glossary lookup failed; continuing without", exc_info=True)
+        glossary_pairs = []
+
+    def _one(el: dict) -> dict:
+        etype = el.get("type", "text")
+        src = el.get("source", "")
+        if etype == "table":
+            tgt = _translate_table(src, base_prompt, target_lang, glossary_pairs, model_endpoint)
+        elif _is_translatable(src):
+            tgt = _translate_text(src, base_prompt, target_lang, glossary_pairs, model_endpoint)
+        else:
+            tgt = src
+        return {**el, "target": tgt}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        elements = list(ex.map(_one, elements_in))
+    elements.sort(key=lambda e: int(e["id"]))
+    return {
+        "source_lang": src_lang,
+        "target_lang": target_lang,
+        "pages": artifact.get("pages", max((e.get("page", 1) for e in elements), default=1)),
+        "model_endpoint": model_endpoint,
+        "elements": elements,
+    }

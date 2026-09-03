@@ -51,3 +51,7 @@ env:
     valueFrom: app_logo_url
   - name: APP_LOGO_ALT
     valueFrom: app_logo_alt
+
+  # ---- Admin gate: comma-separated emails allowed to change Settings ----
+  - name: APP_ADMIN_EMAILS
+    valueFrom: admin_emails
