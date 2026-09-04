@@ -299,10 +299,20 @@ CREATE TABLE IF NOT EXISTS {pg_schema}.translation_glossary (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     approved            BOOLEAN NOT NULL DEFAULT TRUE,
     source              TEXT NOT NULL DEFAULT 'tenant',
+    list_name           TEXT,
     UNIQUE (source_lang, target_lang, model_phrase, correction)
 );
 ALTER TABLE {pg_schema}.translation_glossary
     ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tenant';
+ALTER TABLE {pg_schema}.translation_glossary
+    ADD COLUMN IF NOT EXISTS list_name TEXT;
+UPDATE {pg_schema}.translation_glossary
+    SET list_name = CASE source
+        WHEN 'seed'   THEN 'Seed — ICH clinical'
+        WHEN 'tenant' THEN 'Mined from reviews'
+        ELSE 'Imported'
+    END
+    WHERE list_name IS NULL OR list_name = '';
 
 CREATE TABLE IF NOT EXISTS {pg_schema}.translation_prompts (
     prompt_id    BIGSERIAL PRIMARY KEY,

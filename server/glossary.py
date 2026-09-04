@@ -93,9 +93,9 @@ def mine_glossary(
                 )
                 INSERT INTO {s}.translation_glossary
                     (source_lang, target_lang, model_phrase, correction,
-                     occurrences, distinct_reviewers, last_seen_at, approved, source)
+                     occurrences, distinct_reviewers, last_seen_at, approved, source, list_name)
                 SELECT source_lang, target_lang, model_phrase, correction,
-                       occurrences, distinct_reviewers, last_seen_at, TRUE, 'tenant'
+                       occurrences, distinct_reviewers, last_seen_at, TRUE, 'tenant', 'Mined from reviews'
                 FROM agg
                 ON CONFLICT (source_lang, target_lang, model_phrase, correction) DO UPDATE SET
                     occurrences        = EXCLUDED.occurrences,
@@ -114,11 +114,13 @@ def list_glossary(
     target_lang: str | None = None,
     approved_only: bool = True,
     source: str | None = None,
+    list_name: str | None = None,
     limit: int = MAX_ENTRIES,
 ) -> list[dict]:
     """Return glossary entries. Sorted by occurrences DESC so the most
     confident/frequent corrections come first — useful when truncating to fit
-    a prompt-injection budget. `source` filters to 'tenant'/'seed'/'customer'."""
+    a prompt-injection budget. `source` filters to 'tenant'/'seed'/'customer';
+    `list_name` filters to one named list."""
     s = config.PGSCHEMA
     clauses: list[str] = []
     params: list = []
@@ -128,6 +130,8 @@ def list_glossary(
         clauses.append("target_lang = %s"); params.append(target_lang)
     if source is not None:
         clauses.append("source = %s"); params.append(source)
+    if list_name is not None:
+        clauses.append("list_name = %s"); params.append(list_name)
     if approved_only:
         clauses.append("approved = TRUE")
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
@@ -138,7 +142,7 @@ def list_glossary(
                 SELECT entry_id, source_lang, target_lang,
                        model_phrase, correction,
                        occurrences, distinct_reviewers,
-                       last_seen_at, created_at, approved, source
+                       last_seen_at, created_at, approved, source, list_name
                 FROM {s}.translation_glossary
                 {where}
                 ORDER BY occurrences DESC, last_seen_at DESC
@@ -148,21 +152,28 @@ def list_glossary(
             return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+# Default list names per source, when the caller doesn't supply one.
+_DEFAULT_LIST = {"seed": "Seed — ICH clinical", "tenant": "Mined from reviews"}
+
+
 def ingest_glossary_rows(
     rows: list[dict],
     *,
     source: str = "customer",
     approved: bool = True,
+    list_name: str | None = None,
 ) -> int:
-    """Upsert bilingual glossary pairs. Each row needs source_lang,
-    target_lang, model_phrase (source-language phrase), correction
+    """Upsert bilingual glossary pairs into a named list. Each row needs
+    source_lang, target_lang, model_phrase (source-language phrase), correction
     (required target-language term). Returns rows touched.
 
     Used for both the shipped seed file (source='seed') and customer CSV
-    imports (source='customer'). On conflict with an existing entry the
-    original `source` is kept — a customer import never silently demotes
-    a mined tenant entry, and re-importing the seed is a no-op."""
+    imports (source='customer'). On conflict with an existing entry the original
+    `source` and `list_name` are kept — a customer import never silently demotes
+    a mined tenant entry or re-homes an existing term into a different list; only
+    brand-new phrases land in the given list."""
     s = config.PGSCHEMA
+    lname = (list_name or "").strip() or _DEFAULT_LIST.get(source, "Imported")
     clean: list[tuple] = []
     for r in rows:
         sl = (r.get("source_lang") or "").strip().lower()
@@ -180,12 +191,12 @@ def ingest_glossary_rows(
             cur.executemany(f"""
                 INSERT INTO {s}.translation_glossary
                     (source_lang, target_lang, model_phrase, correction,
-                     occurrences, distinct_reviewers, approved, source)
-                VALUES (%s, %s, %s, %s, 1, 1, %s, %s)
+                     occurrences, distinct_reviewers, approved, source, list_name)
+                VALUES (%s, %s, %s, %s, 1, 1, %s, %s, %s)
                 ON CONFLICT (source_lang, target_lang, model_phrase, correction) DO UPDATE SET
                     last_seen_at = now(),
                     approved     = EXCLUDED.approved
-            """, [(sl, tl, mp, co, approved, source) for sl, tl, mp, co in clean])
+            """, [(sl, tl, mp, co, approved, source, lname) for sl, tl, mp, co in clean])
         conn.commit()
     return len(clean)
 
@@ -195,13 +206,14 @@ def ingest_glossary_csv(
     *,
     source: str = "customer",
     approved: bool = True,
+    list_name: str | None = None,
 ) -> int:
-    """Parse a glossary CSV and upsert its rows. Expected header (order-free):
-    source_lang, target_lang, model_phrase (or source_phrase),
-    correction (or target_phrase). Extra columns are ignored."""
+    """Parse a glossary CSV and upsert its rows into a named list. Expected
+    header (order-free): source_lang, target_lang, model_phrase (or
+    source_phrase), correction (or target_phrase). Extra columns are ignored."""
     text = data.decode("utf-8-sig") if isinstance(data, bytes) else data
     reader = csv.DictReader(io.StringIO(text))
-    return ingest_glossary_rows(list(reader), source=source, approved=approved)
+    return ingest_glossary_rows(list(reader), source=source, approved=approved, list_name=list_name)
 
 
 def toggle_approval(entry_id: int, approved: bool) -> None:
@@ -214,6 +226,108 @@ def toggle_approval(entry_id: int, approved: bool) -> None:
                 (approved, entry_id),
             )
         conn.commit()
+
+
+def set_approval_batch(*, entry_ids: list[int] | None = None,
+                       list_name: str | None = None, approved: bool) -> int:
+    """Approve/unapprove many entries at once — by explicit ids or by list.
+    Returns the number of rows updated."""
+    s = config.PGSCHEMA
+    if list_name is not None:
+        where, param = "list_name = %s", list_name
+    elif entry_ids:
+        where, param = "entry_id = ANY(%s)", list(entry_ids)
+    else:
+        return 0
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {s}.translation_glossary SET approved = %s WHERE {where}",
+                (approved, param),
+            )
+            n = cur.rowcount
+        conn.commit()
+    return n
+
+
+def delete_list(list_name: str) -> int:
+    """Delete an entire named list (all its entries). Returns rows removed."""
+    s = config.PGSCHEMA
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {s}.translation_glossary WHERE list_name = %s", (list_name,)
+            )
+            n = cur.rowcount
+        conn.commit()
+    return n
+
+
+def rename_list(old_name: str, new_name: str) -> int:
+    """Rename a named list. Returns rows touched."""
+    s = config.PGSCHEMA
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("new list name is required")
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {s}.translation_glossary SET list_name = %s WHERE list_name = %s",
+                (new_name, old_name),
+            )
+            n = cur.rowcount
+        conn.commit()
+    return n
+
+
+def list_summary() -> list[dict]:
+    """One row per named list: name, predominant source, entry counts, and the
+    distinct language pairs it spans."""
+    s = config.PGSCHEMA
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    COALESCE(list_name, '(unnamed)')          AS list_name,
+                    MIN(source)                               AS source,
+                    COUNT(*)::int                             AS total,
+                    COUNT(*) FILTER (WHERE approved)::int     AS approved_count,
+                    string_agg(DISTINCT source_lang, ',')     AS source_langs,
+                    string_agg(DISTINCT target_lang, ',')     AS target_langs,
+                    MAX(last_seen_at)                         AS last_seen_at
+                FROM {s}.translation_glossary
+                GROUP BY COALESCE(list_name, '(unnamed)')
+                ORDER BY MIN(source), list_name
+            """)
+            cols = [d.name for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def conflicting_entry_ids() -> set[int]:
+    """Entry ids that conflict: the SAME source phrase (source_lang, target_lang,
+    model_phrase) mapped to more than one distinct correction among APPROVED
+    entries — the injector would feed the model contradictory rules. Surfaced in
+    the UI so the reviewer can disable the loser."""
+    s = config.PGSCHEMA
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                WITH conf AS (
+                    SELECT source_lang, target_lang, model_phrase
+                    FROM {s}.translation_glossary
+                    WHERE approved
+                    GROUP BY source_lang, target_lang, model_phrase
+                    HAVING COUNT(DISTINCT correction) > 1
+                )
+                SELECT g.entry_id
+                FROM {s}.translation_glossary g
+                JOIN conf c
+                  ON c.source_lang = g.source_lang
+                 AND c.target_lang = g.target_lang
+                 AND c.model_phrase = g.model_phrase
+                WHERE g.approved
+            """)
+            return {r[0] for r in cur.fetchall()}
 
 
 def glossary_for_prompt(

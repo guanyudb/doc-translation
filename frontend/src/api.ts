@@ -61,7 +61,19 @@ export interface GlossaryEntry {
   distinct_reviewers: number;
   approved: boolean;
   source: string;
+  list_name: string;
+  conflict: boolean;
   last_seen_at: string;
+}
+
+export interface GlossaryList {
+  list_name: string;
+  source: string;
+  total: number;
+  approved_count: number;
+  source_langs: string;
+  target_langs: string;
+  last_seen_at: string | null;
 }
 
 export interface AppConfig {
@@ -252,13 +264,19 @@ export const api = {
   audit: (id: string) =>
     fetch(`/api/pairs/${encodeURIComponent(id)}/audit`).then(j<AuditEvent[]>),
 
-  glossary: (opts?: { source?: string; approved?: boolean }) => {
+  glossary: (opts?: { source?: string; approved?: boolean; list_name?: string }) => {
     const q = new URLSearchParams();
     if (opts?.source) q.set("source", opts.source);
     if (opts?.approved !== undefined) q.set("approved", String(opts.approved));
+    if (opts?.list_name) q.set("list_name", opts.list_name);
     const qs = q.toString();
     return fetch(`/api/glossary${qs ? `?${qs}` : ""}`).then(j<GlossaryEntry[]>);
   },
+
+  glossaryLists: () =>
+    fetch("/api/glossary/lists").then(
+      j<{ lists: GlossaryList[]; conflict_count: number }>
+    ),
 
   approveGlossary: (id: number, approved: boolean) =>
     fetch(`/api/glossary/${id}/approve`, {
@@ -267,11 +285,32 @@ export const api = {
       body: JSON.stringify({ approved }),
     }).then(j<GlossaryEntry>),
 
-  importGlossary: (file: File) => {
+  // Approve/unapprove many at once — by explicit ids or a whole list.
+  approveGlossaryBatch: (opts: { approved: boolean; entry_ids?: number[]; list_name?: string }) =>
+    fetch("/api/glossary/approve-batch", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(opts),
+    }).then(j<{ updated: number }>),
+
+  deleteGlossaryList: (name: string) =>
+    fetch(`/api/glossary/lists/${encodeURIComponent(name)}`, { method: "DELETE" }).then(
+      j<{ deleted: number }>
+    ),
+
+  renameGlossaryList: (name: string, newName: string) =>
+    fetch(`/api/glossary/lists/${encodeURIComponent(name)}/rename`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ new_name: newName }),
+    }).then(j<{ renamed: number }>),
+
+  importGlossary: (file: File, listName?: string) => {
     const fd = new FormData();
     fd.append("file", file);
+    if (listName) fd.append("list_name", listName);
     return fetch("/api/glossary/import", { method: "POST", body: fd }).then(
-      j<{ imported: number }>
+      j<{ imported: number; list_name: string }>
     );
   },
 
