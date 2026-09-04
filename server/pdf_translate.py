@@ -114,9 +114,29 @@ def _clean_translation(out: str, source: str) -> str:
     return cleaned or source
 
 
-def _fmapi_chat(model_endpoint: str, system: str, user: str) -> str:
-    """Call an FMAPI chat endpoint via the SDK REST client (version-robust —
-    same api_client.do pattern used elsewhere). Returns the assistant text."""
+def _is_uc_gateway_endpoint(endpoint: str) -> bool:
+    """UC AI Gateway endpoints are 3-part Unity Catalog names
+    (catalog.schema.name) served via the Responses API. Plain serving-endpoint
+    names never contain dots, so the dot count disambiguates the two call paths."""
+    return (endpoint or "").count(".") >= 2
+
+
+def _content_to_text(content) -> str:
+    """A chat message's content is usually a string, but some models (e.g.
+    Gemini) return a list of content blocks [{type, text}]. Normalize to text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") in ("text", "output_text")
+        )
+    return ""
+
+
+def _serving_chat(model_endpoint: str, system: str, user: str) -> str:
+    """Serving-endpoint chat/completions path (Claude FM API, provisioned
+    throughput, custom endpoints)."""
     resp = config.w().api_client.do(
         "POST",
         f"/serving-endpoints/{model_endpoint}/invocations",
@@ -131,8 +151,46 @@ def _fmapi_chat(model_endpoint: str, system: str, user: str) -> str:
     )
     choices = (resp or {}).get("choices") or []
     if not choices:
-        raise RuntimeError(f"FMAPI returned no choices: {str(resp)[:200]}")
-    return (choices[0].get("message", {}).get("content") or "").strip()
+        raise RuntimeError(f"serving endpoint returned no choices: {str(resp)[:200]}")
+    return _content_to_text(choices[0].get("message", {}).get("content")).strip()
+
+
+def _uc_gateway_responses(model: str, system: str, user: str) -> str:
+    """Unity Catalog AI Gateway path (OpenAI Responses API):
+    POST /ai-gateway/mlflow/v1/responses with {model, instructions, input}."""
+    resp = config.w().api_client.do(
+        "POST",
+        "/ai-gateway/mlflow/v1/responses",
+        body={
+            "model": model,
+            "instructions": system,
+            "input": user,
+            "max_output_tokens": MAX_TOKENS,
+        },
+    )
+    txt = (resp or {}).get("output_text")
+    if txt:
+        return txt.strip()
+    # Raw JSON has no output_text convenience field — parse the output items.
+    parts = [
+        _content_to_text(it.get("content"))
+        for it in ((resp or {}).get("output") or [])
+        if it.get("type") == "message"
+    ]
+    out = "".join(parts).strip()
+    if not out:
+        raise RuntimeError(f"UC gateway returned no text: {str(resp)[:200]}")
+    return out
+
+
+def _fmapi_chat(model_endpoint: str, system: str, user: str) -> str:
+    """Call the configured LLM and return the assistant text. Routes by endpoint
+    form: a 3-part UC name → UC AI Gateway Responses API; otherwise a serving
+    endpoint's chat/invocations API. (Both go through the SDK REST client, so
+    the app SP's auth is handled the same way.)"""
+    if _is_uc_gateway_endpoint(model_endpoint):
+        return _uc_gateway_responses(model_endpoint, system, user)
+    return _serving_chat(model_endpoint, system, user)
 
 
 def _system_prompt(base: str, target_lang: str,

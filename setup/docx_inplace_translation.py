@@ -313,6 +313,54 @@ def detect_document_language(sample_texts: list[str]) -> tuple[str, str]:
 _w = WorkspaceClient()
 _oai = _w.serving_endpoints.get_open_ai_client()
 
+# A 3-part UC name (catalog.schema.name) is a Unity Catalog AI Gateway endpoint,
+# called via the Responses API (/ai-gateway/mlflow/v1/responses); a plain
+# serving-endpoint name (no dots) uses the OpenAI-compatible chat client above.
+_IS_UC_GATEWAY = model_endpoint.count(".") >= 2
+
+
+def _content_to_text(content) -> str:
+    """Normalize a message's content (string, or a list of {type,text} blocks
+    as some models like Gemini return) to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") in ("text", "output_text"):
+                out.append(b.get("text", ""))
+            else:
+                out.append(getattr(b, "text", "") or "")
+        return "".join(out)
+    return content or ""
+
+
+def _model_complete(system: str, user: str) -> str:
+    """Call the configured LLM, routing UC AI Gateway endpoints to the Responses
+    API and serving endpoints to chat/completions. Returns the assistant text."""
+    if _IS_UC_GATEWAY:
+        resp = _w.api_client.do(
+            "POST", "/ai-gateway/mlflow/v1/responses",
+            body={"model": model_endpoint, "instructions": system,
+                  "input": user, "max_output_tokens": 8192},
+        )
+        txt = (resp or {}).get("output_text")
+        if txt:
+            return txt
+        return "".join(
+            _content_to_text(it.get("content"))
+            for it in ((resp or {}).get("output") or [])
+            if it.get("type") == "message"
+        )
+    resp = _oai.chat.completions.create(
+        model=model_endpoint,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        temperature=0.0,
+        max_tokens=8192,
+    )
+    return _content_to_text(resp.choices[0].message.content)
+
 # XML 1.0 character validity. Strip anything not in the legal ranges so we
 # never crash lxml on a stray control byte from the LLM. Allowed: \t \n \r,
 # \x20-\uD7FF, \uE000-\uFFFD. Disallowed: C0 controls (except \t\n\r), DEL,
@@ -548,16 +596,8 @@ def llm_translate(text: str) -> str:
         return text_for_llm
 
     try:
-        resp = _oai.chat.completions.create(
-            model=model_endpoint,
-            messages=[
-                {"role": "system", "content": _system_prompt_for(text_for_llm)},
-                {"role": "user", "content": text_for_llm},
-            ],
-            temperature=0.0,
-            max_tokens=8192,
-        )
-        raw_out = (resp.choices[0].message.content or text_for_llm).strip()
+        raw_out = (_model_complete(_system_prompt_for(text_for_llm), text_for_llm)
+                   or text_for_llm).strip()
         # Audit: did the LLM emit any XML-illegal characters?
         _record_llm_bad(raw_out)
         out = sanitize_for_xml(raw_out)
