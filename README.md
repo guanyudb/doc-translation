@@ -21,6 +21,16 @@ Every action is audited. Every certified document is content-addressed.
 Once locked, writes are refused with an explicit `PairLockedError` (which is
 itself audited).
 
+**Key capabilities**
+- **DOCX + PDF** translation with a shared, format-agnostic review UI.
+- **Per-paragraph certify / edit**, page/bulk certify, and heuristic confidence scoring.
+- **Re-translate** a document in place with a different instruction (no re-upload).
+- **Pluggable model endpoint** — set it in Settings: any chat serving endpoint or a **Unity Catalog AI Gateway** endpoint.
+- **Glossary** as managed named lists — batch enable/disable, conflict detection, import/mine.
+- **Instructions** — a library of named translation prompts, one chosen (and frozen) per document.
+- **Admin gate** — only the deploying user can change Settings; reviewers do everything else.
+- **Compliance** — golden promotion, content addressing, an append-only audit trail, and a Delta mirror.
+
 ---
 
 ## Architecture at a glance
@@ -261,10 +271,62 @@ doc-translation-app/
 
 ---
 
+## How to deploy (step by step)
+
+A checklist for standing up the app in a workspace end to end. The section after
+this one documents each step in more depth.
+
+**0. Confirm the workspace has:**
+- A **Unity Catalog** you can `CREATE SCHEMA` + `CREATE VOLUME` in.
+- A **Lakebase Autoscaling Project** (+ branch, usually `production`).
+- A **Serverless or Pro SQL warehouse** that supports `ai_parse_document` (DBR 17.3+).
+- **Foundation Model API** access to a Claude (or other chat) endpoint.
+- On your laptop: **Databricks CLI v1.15+**, **Node.js**, **git**, and a CLI profile authenticated to the workspace (`databricks auth login --host <url> --profile <p>`).
+
+**1. Clone and select the branch**
+```bash
+git clone <repo-url> && cd doc-translation-app
+git checkout main
+```
+
+**2. Discover the workspace values**
+```bash
+databricks postgres list-projects --profile <p>                       # project id
+databricks postgres list-branches projects/<project> --profile <p>    # branch (usually 'production')
+databricks postgres list-databases projects/<project>/branches/<branch> --profile <p>  # db slug
+databricks warehouses list --profile <p>                              # warehouse id
+```
+
+**3. Fill in the config**
+```bash
+cp variable-overrides.example.json .databricks/bundle/prod/variable-overrides.json
+# edit it: workspace_user_email, uc_catalog, lakebase_project, lakebase_branch,
+#          lakebase_database_slug, warehouse_id, app_name, (optional) app_admin_emails
+```
+
+**4. Deploy**
+```bash
+./deploy.sh prod --profile <p>
+# If you hit a Terraform GPG "key expired" error, export these first and re-run:
+#   export DATABRICKS_TF_EXEC_PATH=$(which terraform) DATABRICKS_TF_VERSION=1.5.7
+```
+The app URL prints at the end.
+
+**5. First-run setup** — open the URL (Databricks SSO), complete **Settings** (model endpoint + target language). Only the deploying user (or anyone in `app_admin_emails`) can change Settings; reviewers use everything else.
+
+**6. Smoke test** — upload a `.docx` and a `.pdf` from the Upload dialog. Each appears in the review list once translated (DOCX ~1–3 min via the Lakeflow job; PDF ~10–60 s in-app). Certify a few paragraphs, then **Download** the translated file.
+
+**7. (Optional) governed model endpoint** — in **Settings**, point `model_endpoint` at the customer's own serving endpoint or a Unity Catalog **AI Gateway** endpoint (a 3-part `catalog.schema.name`), and grant the app's service principal access to it. No redeploy needed.
+
+**Re-deploys / updates:** re-run `./deploy.sh prod --profile <p>` — idempotent, and requires **CLI v1.15+** (older versions fail the app update with `Invalid update mask`).
+
+---
+
 ## Deploying to your own workspace (Databricks Asset Bundle)
 
-This branch is set up as a portable Databricks Asset Bundle (DAB). One
-`./deploy.sh` from a clean clone, after a one-time config file edit.
+This repo is a portable Databricks Asset Bundle (DAB): one `./deploy.sh` from a
+clean clone of `main`, after a one-time config-file edit. A step-by-step runbook
+is in [**How to deploy (step by step)**](#how-to-deploy-step-by-step) below.
 
 ### Prerequisites
 
@@ -274,7 +336,8 @@ Your target workspace needs:
 2. **A Lakebase Autoscaling Project** — get the project name + branch (Provisioned Lakebase is retired). List with `databricks postgres list-projects`.
 3. **A SQL warehouse** — **must be Serverless or Pro and support `ai_parse_document` (DBR 17.3+)**; the PDF workflow runs `ai_parse_document` on it, and it also drives the Delta archive sync. A Classic warehouse will not work for PDF.
 4. **Foundation Model API** with access to `databricks-claude-sonnet-4-6` (or another Claude model you specify) — the app service principal needs `CAN QUERY` on it.
-5. **Databricks CLI** v0.220+ authenticated to the target workspace, plus **Node.js** locally (the deploy step builds the React SPA).
+5. **Databricks CLI v1.15+** authenticated to the target workspace — earlier versions fail to *re-deploy* an existing app with an `Invalid update mask` error (`brew upgrade databricks`). Plus **Node.js** locally (the deploy step builds the React SPA).
+6. **(Optional) A model endpoint** other than the default — the app can point at any chat serving endpoint or a Unity Catalog AI Gateway endpoint; set it in the app's **Settings** after deploy (no redeploy needed).
 
 ### One-time setup
 
@@ -296,6 +359,7 @@ cp variable-overrides.example.json .databricks/bundle/prod/variable-overrides.js
 #   - lakebase_database_slug:  databricks-postgres               [usually]
 #   - warehouse_id:            <your SQL warehouse ID>
 #   - pg_schema:               doc_translation                   [Postgres schema name]
+#   - app_admin_emails:        ""   [optional: comma-separated emails allowed to change Settings; blank = only the deployer]
 ```
 
 > **The workspace host comes from your Databricks CLI profile**, not this file. Bundle variables can't be referenced from `workspace.host` (auth resolves before variable substitution). Either run with `--profile <name>` or set `DATABRICKS_HOST` in your environment.
@@ -306,12 +370,13 @@ cp variable-overrides.example.json .databricks/bundle/prod/variable-overrides.js
 ./deploy.sh
 ```
 
-This runs the 4-step deploy in order:
+This runs the 5-step deploy in order:
 
-1. **Seed secrets** — reads `variable-overrides.json`, creates the scope, puts the config + branding secrets (`pg_schema`, `lakebase_project`, `lakebase_branch`, `volume_root`, `delta_catalog`, `delta_schema`, `app_title`, `app_logo_url`, `app_logo_alt`). Idempotent.
-2. `bundle deploy` — creates UC schema + volume + app (with secret + postgres + warehouse bindings) + postdeploy job, syncs code to the workspace.
-3. `bundle run postdeploy_setup` — Lakebase DDL, GRANTs the App SP `USAGE + CREATE on public` and table/sequence perms, creates the Delta mirror tables, pre-creates Volume subdirectories.
-4. `bundle run doc_translation_app` — pushes the source from the bundle's workspace files into the App runtime and starts it.
+1. **Build the React SPA** into `static/` (skipped if already built; `FORCE_BUILD=1` to rebuild).
+2. **Seed secrets** — reads `variable-overrides.json`, creates the scope, puts the config + branding secrets (`pg_schema`, `lakebase_project`, `lakebase_branch`, `volume_root`, `delta_catalog`, `delta_schema`, `admin_emails`, `app_title`, `app_logo_url`, `app_logo_alt`). Idempotent.
+3. `bundle deploy` — creates UC schema + volume + app (with secret + postgres + warehouse bindings) + jobs, syncs code to the workspace.
+4. `bundle run postdeploy_setup` — Lakebase DDL (from the shared `server/schema.sql`), GRANTs the App SP `USAGE + CREATE on public` and table/sequence perms, attaches the file-arrival trigger, creates the Delta mirror tables, pre-creates Volume subdirectories.
+5. `bundle run doc_translation_app` — pushes the source into the App runtime and starts it — then grants the App SP `CAN_MANAGE_RUN` on the pipeline job so it can trigger re-translation.
 
 The app URL prints at the end. First boot takes ~30 seconds.
 
@@ -392,19 +457,19 @@ The Lakebase Project itself stays (other things may use it); to also drop the Po
 
 ### Troubleshooting cross-references
 
-The hardest-to-find issues during initial customer deploys, in the order we hit them:
+Common issues during a deploy and their fixes:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Invalid secret resource pg_schema: Secret … does not exist` (bundle deploy 404) | Apps validates secret bindings eagerly at app create/update — secrets must exist before the bundle deploy | `deploy.sh` step 1 seeds secrets first; CLI is required for the very first deploy |
+| `Invalid update mask` when re-deploying an existing app | Databricks CLI older than v1.15 | Upgrade the CLI (`brew upgrade databricks`). First (create) deploys are unaffected. |
+| `Invalid secret resource pg_schema: Secret … does not exist` (bundle deploy 404) | Apps validates secret bindings eagerly at app create/update — secrets must exist before the bundle deploy | `deploy.sh` seeds secrets first; the CLI is required for the very first deploy |
 | App boots, sidebar empty, log says `failed to resolve host 'None'` or `${var.lakebase_project}` literal | DAB does NOT substitute `${var.X}` inside `app.yaml` — values must come via `valueFrom:` to secret bindings | All env vars use `valueFrom:`; `deploy.sh` + postdeploy seed the secret values |
 | `Endpoint 'projects/<proj>/branches/<br>/endpoints/primary' not found` | Lakebase Project's default branch is `production` (not `main`) on new Projects | Set `lakebase_branch: production` in `variable-overrides.json` |
 | Inner translator crashes with `AttributeError: 'ServingEndpointsAPI' object has no attribute 'get_open_ai_client'` | Workspace default serverless env is v1 with an old `databricks-sdk` | `resources/jobs/translation_pipeline.yml` pins `client: "5"` so the watcher + inner notebook get a modern SDK |
 | Sidebar warning "Couldn't read some Volume paths" + listing 404s with malformed path | Secret values shifted by one slot due to a shell-quoting bug | Re-run the postdeploy job — it re-seeds secrets defensively |
 | App SP can't list Volume even though grants look right | `USE CATALOG`/`USE SCHEMA` granted but `READ VOLUME` missing | postdeploy job now grants `READ VOLUME, WRITE VOLUME` explicitly |
 | `pool has already been opened/closed and cannot be reused` | psycopg-pool 3.2+ is strict; multi-session Apps races on the module-level pool | `server/db.py` proxies a lazy-built pool that rebuilds on `closed` |
-
-More general DAB+Apps gotchas live in [`~/.claude/memory/dab_apps_workspace_deploy_guide.md`](../../.claude/memory/dab_apps_workspace_deploy_guide.md).
+| DOCX re-translate returns 500 (`does not have Manage Run`) | App SP lacks run permission on the pipeline job | `deploy.sh` step 5 grants it; re-run `./deploy.sh` |
 
 ### Legacy: deploying just the app (no bundle)
 
@@ -424,10 +489,12 @@ databricks apps deploy doc-translation \
 
 ## Schema migrations
 
-DDL runs as the table owner (not the SP, which has only INSERT/UPDATE/DELETE on the data tables):
+The Lakebase (Postgres) schema is defined in exactly one place — **`server/schema.sql`** (idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER … ADD COLUMN IF NOT EXISTS`). Both the postdeploy job and `server/store.py` read it, so `./deploy.sh` applies any change automatically. **To add a column or table, edit `server/schema.sql` only.**
+
+To apply it manually (runs as the table owner — the SP has only INSERT/UPDATE/DELETE on the data tables):
 
 ```bash
-DATABRICKS_PROFILE=<profile> PGHOST=... \
+DATABRICKS_PROFILE=<profile> \
   LAKEBASE_PROJECT=<project> LAKEBASE_BRANCH=production \
   PGDATABASE=databricks_postgres PGSSLMODE=require PGSCHEMA=doc_translation \
   VOLUME_ROOT=... \
