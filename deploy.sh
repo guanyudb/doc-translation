@@ -117,4 +117,46 @@ databricks bundle run -t "$TARGET" doc_translation_postdeploy_setup $EXTRA_FLAGS
 echo "==> step 4: deploy + start app"
 databricks bundle run -t "$TARGET" doc_translation_app $EXTRA_FLAGS
 
+# Step 5 — grant the app SP CAN_MANAGE_RUN on the translation pipeline job.
+# The app triggers this job to re-translate a DOCX (POST /retranslate); without
+# run permission that fails. `bundle deploy` (step 2) resets job permissions, so
+# this MUST run after it. Best-effort — a failure here only affects DOCX
+# re-translate, not the core deploy.
+echo "==> step 5: grant app SP run permission on the translation pipeline job"
+OVR="$OVERRIDES" FLAGS="$EXTRA_FLAGS" python3 <<'PYGRANT' || echo "    (grant step failed — DOCX re-translate may need a manual grant)"
+import json, os, subprocess, sys
+d = json.load(open(os.environ["OVR"]))
+flags = os.environ.get("FLAGS", "").split()
+app = d.get("app_name", "doc-translation")
+raw_dir = (f"/Volumes/{d.get('uc_catalog','')}/{d.get('uc_schema','doc_translation')}"
+           f"/{d.get('uc_volume_name','doc-translation')}/raw_documents")
+
+def cli(*args):
+    return subprocess.run(["databricks", *args, *flags], capture_output=True, text=True)
+
+r = cli("apps", "get", app, "-o", "json")
+sp = (json.loads(r.stdout).get("service_principal_client_id")
+      if r.returncode == 0 and r.stdout.strip() else None)
+if not sp:
+    print("    [warn] could not resolve app SP; skipping"); sys.exit(0)
+jobs = json.loads(cli("jobs", "list", "-o", "json").stdout or "[]")
+job_id = None
+for j in jobs:
+    if (j.get("settings") or {}).get("name") != "doc-translation · auto-translate pipeline":
+        continue
+    full = json.loads(cli("jobs", "get", str(j["job_id"]), "-o", "json").stdout or "{}")
+    for t in ((full.get("settings") or {}).get("tasks") or []):
+        bp = (t.get("notebook_task") or {}).get("base_parameters") or {}
+        if bp.get("raw_dir") == raw_dir:
+            job_id = j["job_id"]; break
+    if job_id:
+        break
+if not job_id:
+    print("    [warn] pipeline job not found by raw_dir; skipping"); sys.exit(0)
+acl = {"access_control_list": [{"service_principal_name": sp, "permission_level": "CAN_MANAGE_RUN"}]}
+r = cli("permissions", "update", "jobs", str(job_id), "--json", json.dumps(acl))
+print(f"    granted app SP CAN_MANAGE_RUN on pipeline job {job_id}" if r.returncode == 0
+      else f"    [warn] grant failed: {r.stderr[:200]}")
+PYGRANT
+
 echo "==> done. App URL is in the output above."

@@ -472,14 +472,22 @@ def _retranslate_docx(pair_id: str, match: dict, prompt: dict) -> dict:
         "prompt_id": prompt["prompt_id"], "name": prompt["name"], "body": prompt["body"],
     })
     volume.upload_docx(f"{config.RAW_DIR}/{pair_id}.docx.prompt", snapshot.encode("utf-8"))
+    job_id = _pipeline_job_id_for_deployment()
+    if job_id is None:
+        raise HTTPException(500, "could not resolve this deployment's translation pipeline job")
+    # Trigger BEFORE destroying anything — if run_now raises (e.g. the app SP
+    # lacks Manage Run on the job), the existing translation + review state stay
+    # intact rather than leaving the pair stranded (404). Only after the run is
+    # accepted do we reset state + drop the old output so the watcher re-translates.
+    config.w().jobs.run_now(job_id=job_id)
+    try:
+        store.delete_pair_state(pair_id)
+    except Exception:
+        log.exception("retranslate(docx): couldn't reset review state for %s", pair_id)
     try:
         config.w().files.delete(match["translated_path"])
     except Exception:
         log.exception("retranslate(docx): couldn't delete old output %s", match["translated_path"])
-    job_id = _pipeline_job_id_for_deployment()
-    if job_id is None:
-        raise HTTPException(500, "could not resolve this deployment's translation pipeline job")
-    config.w().jobs.run_now(job_id=job_id)
     return {"ok": True, "kind": "docx",
             "message": "Re-translating via the pipeline — the updated translation appears when the job completes (usually 1–3 min)."}
 
@@ -500,13 +508,13 @@ def retranslate(pair_id: str, prompt_id: int = Body(..., embed=True)):
     model_endpoint = settings_mod.load().get("model_endpoint") or "databricks-claude-sonnet-4-6"
     target_language = match.get("target_lang") or "English"
 
-    # Reset review state — prior certifications/edits were against the old translation.
-    try:
-        store.delete_pair_state(pair_id)
-    except Exception:
-        log.exception("retranslate: couldn't reset review state for %s", pair_id)
-
     if _is_pdf_pair(match):
+        # PDF: the artifact is overwritten only on success (kept on failure), so
+        # resetting review state up front is safe.
+        try:
+            store.delete_pair_state(pair_id)
+        except Exception:
+            log.exception("retranslate: couldn't reset review state for %s", pair_id)
         threading.Thread(
             target=_run_pdf_retranslate_bg,
             kwargs=dict(pdf_name=f"{pair_id}.pdf", artifact_path=match["translated_path"],
@@ -516,6 +524,8 @@ def retranslate(pair_id: str, prompt_id: int = Body(..., embed=True)):
         ).start()
         return {"ok": True, "kind": "pdf",
                 "message": "Re-translating (in-app) — the updated translation will appear shortly."}
+    # DOCX resets review state + drops the old output itself, only after the job
+    # run is accepted (crash-safe — see _retranslate_docx).
     return _retranslate_docx(pair_id, match, prompt)
 
 

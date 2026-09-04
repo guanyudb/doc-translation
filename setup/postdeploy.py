@@ -111,6 +111,39 @@ for k, v in app_config_secrets.items():
     w.secrets.put_secret(scope=secret_scope, key=k, string_value=(v or ""))
     print(f"  re-seeded {secret_scope}/{k} = {v!r}")
 
+# Grant the app SP CAN_MANAGE_RUN on the translation pipeline job so the app can
+# trigger a re-translate (POST /api/pairs/{id}/retranslate for DOCX runs the
+# job). The job's name isn't unique across deployments in a shared workspace, so
+# match on the notebook task's raw_dir parameter to find THIS deployment's job.
+_PIPELINE_JOB_NAME = "doc-translation · auto-translate pipeline"
+_raw_dir = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume_name}/raw_documents"
+try:
+    _pipeline_job_id = None
+    for _j in w.jobs.list():
+        if not (_j.settings and _j.settings.name == _PIPELINE_JOB_NAME):
+            continue
+        _full = w.jobs.get(_j.job_id)
+        for _t in (_full.settings.tasks or []):
+            _nb = getattr(_t, "notebook_task", None)
+            _bp = (getattr(_nb, "base_parameters", None) or {}) if _nb else {}
+            if _bp.get("raw_dir") == _raw_dir:
+                _pipeline_job_id = _j.job_id
+                break
+        if _pipeline_job_id:
+            break
+    if _pipeline_job_id:
+        w.api_client.do(
+            "PATCH", f"/api/2.0/permissions/jobs/{_pipeline_job_id}",
+            body={"access_control_list": [
+                {"service_principal_name": sp_uuid, "permission_level": "CAN_MANAGE_RUN"}
+            ]},
+        )
+        print(f"  granted app SP CAN_MANAGE_RUN on pipeline job {_pipeline_job_id}")
+    else:
+        print("  [warn] pipeline job not found by raw_dir — skipped SP run grant")
+except Exception as _e:
+    print(f"  [warn] could not grant SP run perm on pipeline job: {_e}")
+
 # COMMAND ----------
 
 # MAGIC %md
