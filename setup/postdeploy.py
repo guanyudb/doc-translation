@@ -188,143 +188,31 @@ import psycopg
 pg_user = w.current_user.me().user_name
 conninfo = f"dbname={pg_db} user={pg_user} host={pg_host} port=5432 sslmode=require"
 
-# We can't import server/store.py here (different runtime); inline the DDL.
-DDL = f"""
-CREATE SCHEMA IF NOT EXISTS {pg_schema};
+# The schema DDL is the shared server/schema.sql (single source of truth, also
+# read by server/store.py) — read it from the bundle-synced workspace files
+# rather than duplicating it here.
+def _read_schema_sql(schema_name):
+    import os
+    candidates = []
+    try:
+        nb = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+        root = os.path.dirname(os.path.dirname(nb))  # <bundle>/files
+        candidates += ["/Workspace" + root + "/server/schema.sql", root + "/server/schema.sql"]
+    except Exception:
+        pass
+    candidates += [
+        os.path.join(os.getcwd(), "server", "schema.sql"),
+        os.path.join(os.getcwd(), "..", "server", "schema.sql"),
+    ]
+    for cp in candidates:
+        try:
+            with open(cp) as fh:
+                return fh.read().replace("{schema}", schema_name)
+        except Exception:
+            continue
+    raise SystemExit("postdeploy: could not read server/schema.sql — is the bundle synced?")
 
-CREATE TABLE IF NOT EXISTS {pg_schema}.review_pairs (
-    pair_id          TEXT PRIMARY KEY,
-    original_path    TEXT NOT NULL,
-    translated_path  TEXT NOT NULL,
-    source_lang      TEXT,
-    target_lang      TEXT,
-    total_paragraphs INT,
-    created_at       TIMESTAMPTZ DEFAULT now(),
-    finalized_at     TIMESTAMPTZ,
-    lifecycle_state  TEXT NOT NULL DEFAULT 'UNDER_REVIEW'
-                      CHECK (lifecycle_state IN ('UNDER_REVIEW','PROMOTING','PUBLISHED','ARCHIVED')),
-    locked_at        TIMESTAMPTZ,
-    original_hash    TEXT,
-    translated_hash  TEXT
-);
-
-CREATE TABLE IF NOT EXISTS {pg_schema}.review_feedback (
-    pair_id        TEXT REFERENCES {pg_schema}.review_pairs(pair_id) ON DELETE CASCADE,
-    paragraph_idx  INT  NOT NULL,
-    status         TEXT DEFAULT 'pending' CHECK (status IN ('pending','certified','flagged')),
-    comment        TEXT,
-    reviewer       TEXT,
-    updated_at     TIMESTAMPTZ DEFAULT now(),
-    edited_text    TEXT,
-    last_published_text TEXT,
-    PRIMARY KEY (pair_id, paragraph_idx)
-);
-CREATE INDEX IF NOT EXISTS review_feedback_status_idx ON {pg_schema}.review_feedback (pair_id, status);
-
-CREATE TABLE IF NOT EXISTS {pg_schema}.review_edit_history (
-    edit_id        BIGSERIAL PRIMARY KEY,
-    pair_id        TEXT NOT NULL REFERENCES {pg_schema}.review_pairs(pair_id) ON DELETE CASCADE,
-    paragraph_idx  INT  NOT NULL,
-    previous_text  TEXT,
-    new_text       TEXT,
-    reviewer       TEXT,
-    edited_at      TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS review_edit_history_pair_idx
-ON {pg_schema}.review_edit_history (pair_id, paragraph_idx, edited_at DESC);
-
-CREATE TABLE IF NOT EXISTS {pg_schema}.review_publish_log (
-    publish_id      BIGSERIAL PRIMARY KEY,
-    pair_id         TEXT NOT NULL REFERENCES {pg_schema}.review_pairs(pair_id) ON DELETE CASCADE,
-    output_path     TEXT NOT NULL,
-    edits_applied   INT  NOT NULL DEFAULT 0,
-    published_by    TEXT,
-    published_at    TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS {pg_schema}.audit_events (
-    event_id        BIGSERIAL PRIMARY KEY,
-    pair_id         TEXT,
-    event_type      TEXT NOT NULL,
-    actor           TEXT NOT NULL,
-    actor_type      TEXT NOT NULL DEFAULT 'human',
-    paragraph_idx   INT,
-    before_value    JSONB,
-    after_value     JSONB,
-    correlation_id  TEXT,
-    client_ip       TEXT,
-    client_ua       TEXT,
-    event_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS audit_events_pair_idx ON {pg_schema}.audit_events (pair_id, event_at DESC);
-
-CREATE TABLE IF NOT EXISTS {pg_schema}.golden_publications (
-    publication_id          BIGSERIAL PRIMARY KEY,
-    pair_id                 TEXT NOT NULL UNIQUE REFERENCES {pg_schema}.review_pairs(pair_id),
-    golden_original_path    TEXT NOT NULL,
-    golden_translated_path  TEXT NOT NULL,
-    golden_original_hash    TEXT NOT NULL,
-    golden_translated_hash  TEXT NOT NULL,
-    total_paragraphs        INT  NOT NULL,
-    certified_paragraphs    INT  NOT NULL,
-    edits_applied           INT  NOT NULL DEFAULT 0,
-    distinct_reviewers      JSONB NOT NULL DEFAULT '[]'::jsonb,
-    published_by            TEXT NOT NULL,
-    published_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-    delta_synced_at         TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS {pg_schema}.paragraph_confidence (
-    pair_id          TEXT NOT NULL REFERENCES {pg_schema}.review_pairs(pair_id) ON DELETE CASCADE,
-    paragraph_idx    INT  NOT NULL,
-    length_ratio     REAL,
-    untranslated_pct REAL,
-    repeated_ngrams  INT,
-    confidence       REAL NOT NULL,
-    computed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    source_lang      TEXT,
-    target_lang      TEXT,
-    PRIMARY KEY (pair_id, paragraph_idx)
-);
-
-CREATE TABLE IF NOT EXISTS {pg_schema}.translation_glossary (
-    entry_id            BIGSERIAL PRIMARY KEY,
-    source_lang         TEXT,
-    target_lang         TEXT,
-    model_phrase        TEXT NOT NULL,
-    correction          TEXT NOT NULL,
-    occurrences         INT  NOT NULL DEFAULT 1,
-    distinct_reviewers  INT  NOT NULL DEFAULT 1,
-    last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    approved            BOOLEAN NOT NULL DEFAULT TRUE,
-    source              TEXT NOT NULL DEFAULT 'tenant',
-    list_name           TEXT,
-    UNIQUE (source_lang, target_lang, model_phrase, correction)
-);
-ALTER TABLE {pg_schema}.translation_glossary
-    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tenant';
-ALTER TABLE {pg_schema}.translation_glossary
-    ADD COLUMN IF NOT EXISTS list_name TEXT;
-UPDATE {pg_schema}.translation_glossary
-    SET list_name = CASE source
-        WHEN 'seed'   THEN 'Seed — ICH clinical'
-        WHEN 'tenant' THEN 'Mined from reviews'
-        ELSE 'Imported'
-    END
-    WHERE list_name IS NULL OR list_name = '';
-
-CREATE TABLE IF NOT EXISTS {pg_schema}.translation_prompts (
-    prompt_id    BIGSERIAL PRIMARY KEY,
-    name         TEXT NOT NULL UNIQUE,
-    body         TEXT NOT NULL,
-    description  TEXT,
-    created_by   TEXT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_by   TEXT,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
+DDL = _read_schema_sql(pg_schema)
 
 GRANTS_SQL = f"""
 GRANT CONNECT ON DATABASE {pg_db} TO "{sp_uuid}";
