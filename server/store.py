@@ -214,6 +214,7 @@ def ensure_schema() -> None:
                     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
                     approved            BOOLEAN NOT NULL DEFAULT TRUE,
                     source              TEXT NOT NULL DEFAULT 'tenant',
+                    list_name           TEXT,
                     UNIQUE (source_lang, target_lang, model_phrase, correction)
                 )
             """)
@@ -221,6 +222,22 @@ def ensure_schema() -> None:
             cur.execute(f"""
                 ALTER TABLE {s}.translation_glossary
                 ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'tenant'
+            """)
+            # `list_name` groups entries into named lists (separate ingestions the
+            # reviewer manages as units). Backfill existing rows from `source` so
+            # every entry belongs to a list.
+            cur.execute(f"""
+                ALTER TABLE {s}.translation_glossary
+                ADD COLUMN IF NOT EXISTS list_name TEXT
+            """)
+            cur.execute(f"""
+                UPDATE {s}.translation_glossary
+                SET list_name = CASE source
+                    WHEN 'seed'   THEN 'Seed — ICH clinical'
+                    WHEN 'tenant' THEN 'Mined from reviews'
+                    ELSE 'Imported'
+                END
+                WHERE list_name IS NULL OR list_name = ''
             """)
             cur.execute(f"""
                 CREATE INDEX IF NOT EXISTS translation_glossary_lookup_idx

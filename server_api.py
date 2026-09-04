@@ -1192,12 +1192,14 @@ def audit(pair_id: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/glossary")
-def glossary_list(source: str | None = None, approved: bool | None = None):
+def glossary_list(source: str | None = None, approved: bool | None = None,
+                  list_name: str | None = None):
     entries = glossary_mod.list_glossary(
-        source=source,
+        source=source, list_name=list_name,
         approved_only=bool(approved) if approved else False,
-        limit=2000,
+        limit=5000,
     )
+    conflicts = glossary_mod.conflicting_entry_ids()
     return [{
         "entry_id": e["entry_id"],
         "source_lang": e["source_lang"],
@@ -1208,8 +1210,52 @@ def glossary_list(source: str | None = None, approved: bool | None = None):
         "distinct_reviewers": e["distinct_reviewers"],
         "approved": e["approved"],
         "source": e.get("source") or "tenant",
+        "list_name": e.get("list_name") or "(unnamed)",
+        "conflict": e["entry_id"] in conflicts,
         "last_seen_at": str(e["last_seen_at"]),
     } for e in entries]
+
+
+@app.get("/api/glossary/lists")
+def glossary_lists():
+    """Per-list summary for the 2-layer glossary UI, plus a global conflict count."""
+    summaries = glossary_mod.list_summary()
+    return {
+        "lists": [{
+            "list_name": s["list_name"],
+            "source": s["source"],
+            "total": s["total"],
+            "approved_count": s["approved_count"],
+            "source_langs": s.get("source_langs") or "",
+            "target_langs": s.get("target_langs") or "",
+            "last_seen_at": str(s["last_seen_at"]) if s.get("last_seen_at") else None,
+        } for s in summaries],
+        "conflict_count": len(glossary_mod.conflicting_entry_ids()),
+    }
+
+
+@app.post("/api/glossary/approve-batch")
+def glossary_approve_batch(
+    approved: bool = Body(..., embed=True),
+    entry_ids: list[int] | None = Body(None, embed=True),
+    list_name: str | None = Body(None, embed=True),
+):
+    """Approve/unapprove many entries at once — by explicit ids or a whole list."""
+    n = glossary_mod.set_approval_batch(entry_ids=entry_ids, list_name=list_name, approved=approved)
+    return {"updated": n}
+
+
+@app.delete("/api/glossary/lists/{name}")
+def glossary_delete_list(name: str):
+    return {"deleted": glossary_mod.delete_list(name)}
+
+
+@app.post("/api/glossary/lists/{name}/rename")
+def glossary_rename_list(name: str, new_name: str = Body(..., embed=True)):
+    try:
+        return {"renamed": glossary_mod.rename_list(name, new_name)}
+    except ValueError as ex:
+        raise HTTPException(400, str(ex))
 
 
 @app.post("/api/glossary/{entry_id}/approve")
@@ -1229,12 +1275,14 @@ def glossary_approve(entry_id: int, approved: bool = Body(..., embed=True)):
 
 
 @app.post("/api/glossary/import")
-def glossary_import(file: UploadFile = File(...)):
+def glossary_import(file: UploadFile = File(...), list_name: str = Form("")):
     # Sync endpoint (ingest does blocking DB work) → runs in the threadpool;
-    # read via the underlying sync file object.
+    # read via the underlying sync file object. The CSV lands in a named list
+    # (defaults to "Imported" when the caller doesn't provide one).
     data = file.file.read()
-    n = glossary_mod.ingest_glossary_csv(data, source="customer", approved=True)
-    return {"imported": n}
+    n = glossary_mod.ingest_glossary_csv(
+        data, source="customer", approved=True, list_name=(list_name or None))
+    return {"imported": n, "list_name": (list_name or "Imported")}
 
 
 @app.post("/api/glossary/mine")
