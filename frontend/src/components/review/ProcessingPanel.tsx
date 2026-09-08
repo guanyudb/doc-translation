@@ -3,7 +3,11 @@ import { Loader2, Clock, AlertCircle, FileText } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { api, ProcessingDocument } from "@/api";
 
-const POLL_MS = 5000;
+// Poll fast while something is in flight; back off when idle. The endpoint hits
+// the SQL warehouse, so an empty panel polling every few seconds keeps waking it
+// for nothing — hence the slower idle cadence.
+const ACTIVE_MS = 5000;
+const IDLE_MS = 20000;
 
 /** Documents still in flight — everything else drops off the panel. */
 const ACTIVE = new Set(["QUEUED", "TRANSLATING"]);
@@ -96,33 +100,42 @@ export function ProcessingPanel({ onSettled }: { onSettled?: () => void }) {
 
   useEffect(() => {
     let cancelled = false;
+    let timer: number | undefined;
 
-    const tick = () =>
-      api
-        .processingStatus()
-        .then((r) => {
-          if (cancelled) return;
-          const active = r.documents.filter((d) => ACTIVE.has(d.status));
-          const activeNames = new Set(active.map((d) => d.file_name));
-          // A name that was active last poll but isn't now has settled.
-          let settled = false;
-          for (const name of prevActive.current) {
-            if (!activeNames.has(name)) {
-              settled = true;
-              break;
-            }
+    // Chain polls with setTimeout (schedule the next only after the current
+    // resolves) so slow responses can't pile up the way setInterval would; a
+    // failed poll keeps the last-known docs and just retries on schedule, so a
+    // transient error no longer leaves the panel stuck until a manual refresh.
+    const tick = async () => {
+      let hadActive = false;
+      try {
+        const r = await api.processingStatus();
+        if (cancelled) return;
+        const active = r.documents.filter((d) => ACTIVE.has(d.status));
+        const activeNames = new Set(active.map((d) => d.file_name));
+        // A name that was active last poll but isn't now has settled.
+        let settled = false;
+        for (const name of prevActive.current) {
+          if (!activeNames.has(name)) {
+            settled = true;
+            break;
           }
-          prevActive.current = activeNames;
-          setDocs(active);
-          if (settled) onSettledRef.current?.();
-        })
-        .catch(() => {});
+        }
+        prevActive.current = activeNames;
+        setDocs(active);
+        hadActive = active.length > 0;
+        if (settled) onSettledRef.current?.();
+      } catch {
+        // keep the last-known docs; retry on the next scheduled tick
+      }
+      if (cancelled) return;
+      timer = window.setTimeout(tick, hadActive ? ACTIVE_MS : IDLE_MS);
+    };
 
-    tick(); // immediately, then poll
-    const id = setInterval(tick, POLL_MS);
+    tick(); // immediately, then self-schedule
     return () => {
       cancelled = true;
-      clearInterval(id);
+      if (timer) window.clearTimeout(timer);
     };
   }, []);
 

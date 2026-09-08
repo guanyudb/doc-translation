@@ -65,11 +65,16 @@ class DeltaSyncError(RuntimeError):
     to roll back the calling transaction or just log + audit."""
 
 
-def _execute(statement: str, *, timeout_s: float = 60.0) -> dict:
+def _execute(statement: str, *, timeout_s: float = 60.0, wait_timeout: str = "30s") -> dict:
     """Run a single SQL statement against the configured warehouse. Polls
     asynchronously and returns the final response when terminal. Raises
     DeltaSyncError on FAILED/CANCELED/CLOSED so callers don't see partial
-    successes."""
+    successes.
+
+    `timeout_s` bounds the total client wait; `wait_timeout` is the per-call
+    server-side wait (Databricks accepts "5s"–"50s"). Latency-sensitive,
+    best-effort readers (e.g. the processing panel) pass a small pair of both
+    so a cold/slow warehouse fails fast to their fallback instead of blocking."""
     if not enabled():
         raise DeltaSyncError("DATABRICKS_WAREHOUSE_ID not configured")
 
@@ -77,7 +82,7 @@ def _execute(statement: str, *, timeout_s: float = 60.0) -> dict:
     resp = client.statement_execution.execute_statement(
         statement=statement,
         warehouse_id=WAREHOUSE_ID,
-        wait_timeout="30s",  # max server-side wait per call
+        wait_timeout=wait_timeout,  # max server-side wait per call
     )
     deadline = time.monotonic() + timeout_s
     while True:

@@ -189,13 +189,25 @@ def _list_pairs() -> list[dict]:
     return pairs
 
 
+_tb_cache: tuple[float, set[str]] | None = None  # (fetched_at, basenames)
+_TB_TTL = 5.0
+
+
 def _translated_basenames() -> set[str]:
     """Basenames of raw files that already have a translated output (a pair
     exists). Such docs are DONE — the `raw file not in bronze → QUEUED` fallback
     below must not relabel them 'Queued'. Reads the Volume via _list_pairs(), so
     it stays correct even when the SQL warehouse (which backs the bronze status
     read) is unavailable — e.g. reaped — or when a doc was translated >24h ago
-    and so falls outside the bronze status query's recency window."""
+    and so falls outside the bronze status query's recency window.
+
+    Cached for a few seconds: this runs on every processing-status poll and the
+    pair set changes slowly, so the cache spares repeated Volume listings (a big
+    part of the poll's cost) without meaningfully delaying a 'done' transition."""
+    global _tb_cache
+    now = time.time()
+    if _tb_cache is not None and now - _tb_cache[0] < _TB_TTL:
+        return _tb_cache[1]
     names: set[str] = set()
     try:
         for p in _list_pairs():
@@ -204,6 +216,7 @@ def _translated_basenames() -> set[str]:
                 names.add(op.rsplit("/", 1)[-1])
     except Exception:
         log.exception("_translated_basenames: could not list pairs")
+    _tb_cache = (now, names)
     return names
 
 
@@ -1030,7 +1043,11 @@ def processing_status():
         # unscoped query that would leak other users' documents) — the sidecar
         # path below still surfaces this user's freshly-uploaded files.
         try:
-            out = delta_sync._execute(q)
+            # This polls every few seconds and is best-effort: a short server
+            # wait + client deadline means a cold/reaped warehouse fails fast to
+            # the Volume fallback below (which still shows fresh QUEUED uploads)
+            # instead of blocking the panel for up to a minute.
+            out = delta_sync._execute(q, timeout_s=8.0, wait_timeout="5s")
             data = (out.get("result") or {}).get("data_array") or []
             for r in data:
                 name = r[0]
@@ -1070,9 +1087,13 @@ def processing_status():
         pass
 
     rows += _pdf_status_rows(only_user=user)  # this user's in-app PDF jobs
+    # `pipeline` is part of the response contract but no client reads it, so we
+    # skip the per-poll Jobs API calls _pipeline_status() would make (a needless
+    # round-trip on a 5s poll). The workspace-wide /api/documents view is where
+    # pipeline activity would be surfaced if ever needed.
     return {
         "user": user,
-        "pipeline": _pipeline_status(),
+        "pipeline": {"job_id": None, "active": False, "started_at_ms": None, "elapsed_seconds": None},
         "documents": rows,
         "warehouse_configured": delta_sync.enabled(),
     }
