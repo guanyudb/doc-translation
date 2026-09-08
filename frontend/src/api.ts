@@ -247,6 +247,13 @@ export const api = {
   translatedDownloadUrl: (id: string) =>
     `/api/pairs/${encodeURIComponent(id)}/download/translated`,
 
+  // Admin-only: permanently remove a document (raw + translated + sidecars +
+  // review state). Rejected server-side (409) for promoted/published pairs.
+  deletePair: (id: string) =>
+    fetch(`/api/pairs/${encodeURIComponent(id)}`, { method: "DELETE" }).then(
+      j<{ pair_id: string; files_deleted: string[]; state_rows: Record<string, number> }>
+    ),
+
   // Re-translate a pair with a different Instruction (prompt), in place. Resets
   // the document's review state; open to reviewers.
   retranslate: (id: string, promptId: number) =>

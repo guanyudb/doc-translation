@@ -522,6 +522,77 @@ def download_translated(pair_id: str):
     )
 
 
+@app.delete("/api/pairs/{pair_id}")
+def delete_pair(pair_id: str):
+    """Admin-only: permanently remove a document — its raw source, translated
+    output, per-file sidecars, and Lakebase review state — so it drops off the
+    review list. Promoted/published (locked) reviews are refused to protect the
+    signed-off record. The Delta mirror (audit_events / golden_publications) is
+    an append-only compliance archive and is deliberately NOT touched; the
+    deletion itself is recorded as a DOCUMENT_DELETED audit event."""
+    _require_admin()
+    match = _resolve(pair_id)  # 404 if unknown
+
+    state = (store.get_pair(pair_id) or {}).get("lifecycle_state") or "UNDER_REVIEW"
+    if state in ("PUBLISHED", "PROMOTING"):
+        raise HTTPException(
+            409, f"'{pair_id}' is {state} (signed off) and cannot be deleted. "
+                 "Promoted/published documents are protected.")
+
+    actor = auth.reviewer()
+    orig = match["original_path"]
+    tran = match["translated_path"]
+    # Raw source + translated output + every sidecar written at upload time.
+    targets = [orig, tran,
+               f"{orig}.user", f"{orig}.lang", f"{orig}.prompt", f"{orig}.error"]
+    deleted_files: list[str] = []
+    for p in targets:
+        try:
+            config.w().files.delete(p)
+            deleted_files.append(p)
+        except Exception:
+            pass  # missing/already gone — best-effort
+
+    # Purge the bronze status row (DOCX) so the workspace Documents view doesn't
+    # keep a ghost. Best-effort + fail-fast so a cold warehouse can't block delete.
+    name = orig.rsplit("/", 1)[-1]
+    if delta_sync.enabled() and not _is_pdf_pair(match):
+        try:
+            fqn = f"{delta_sync.DELTA_CATALOG}.{delta_sync.DELTA_SCHEMA}.bronze_documents"
+            delta_sync._execute(
+                f"DELETE FROM {fqn} WHERE file_name = {delta_sync._esc(name)}",
+                timeout_s=8.0, wait_timeout="5s")
+        except Exception:
+            log.warning("delete_pair: could not purge bronze row for %s", name, exc_info=True)
+
+    # Lakebase review state (review_pairs + cascades + golden_publications + audit).
+    try:
+        counts = store.delete_pair_state(pair_id)
+    except Exception:
+        log.exception("delete_pair: delete_pair_state failed for %s", pair_id)
+        raise HTTPException(500, "review state could not be cleared")
+
+    # Record the deletion AFTER clearing state (delete_pair_state wipes this
+    # pair's prior audit rows). audit_events has no FK, so a row for a now-gone
+    # pair is fine and leaves the required trail of who removed what.
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                store._emit_audit(cur, pair_id=pair_id, event_type="DOCUMENT_DELETED",
+                                  actor=actor,
+                                  after={"lifecycle_state": state, "deleted_files": deleted_files})
+            conn.commit()
+    except Exception:
+        log.warning("delete_pair: could not write deletion audit for %s", pair_id, exc_info=True)
+
+    # Invalidate caches so the document drops off the list/panel immediately.
+    global _tb_cache
+    _tb_cache = None
+    _pdf_artifact_path.pop(pair_id, None)
+
+    return {"pair_id": pair_id, "files_deleted": deleted_files, "state_rows": counts}
+
+
 def _pipeline_job_id_for_deployment() -> int | None:
     """Resolve THIS deployment's pipeline job. The job name isn't unique across
     deployments sharing a workspace, so match on the task's `raw_dir` parameter

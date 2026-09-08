@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, ScrollText, UploadCloud, Award, Loader2, FilePlus2, RefreshCw, Download } from "lucide-react";
+import { CheckCircle2, ScrollText, UploadCloud, Award, Loader2, FilePlus2, RefreshCw, Download, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/input";
@@ -8,6 +8,7 @@ import { DocPane, FeedbackMeta } from "@/components/review/DocPane";
 import { ActiveParagraphPanel } from "@/components/review/ActiveParagraphPanel";
 import { UploadDialog } from "@/components/review/UploadDialog";
 import { RetranslateDialog } from "@/components/review/RetranslateDialog";
+import { DeleteDocumentDialog } from "@/components/review/DeleteDocumentDialog";
 import { ProcessingPanel } from "@/components/review/ProcessingPanel";
 
 export function ReviewView({
@@ -15,14 +16,17 @@ export function ReviewView({
   setActivePair,
   onOpenAudit,
   defaultTarget,
+  isAdmin = false,
 }: {
   activePair: string | null;
   setActivePair: (id: string | null) => void;
   onOpenAudit: (id: string) => void;
   defaultTarget: string;
+  isAdmin?: boolean;
 }) {
   const [uploadOpen, setUploadOpen] = useState(false);
   const [retranslateOpen, setRetranslateOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const [pairs, setPairs] = useState<PairSummary[]>([]);
   const [detail, setDetail] = useState<PairDetail | null>(null);
   const [origHtml, setOrigHtml] = useState("");
@@ -358,6 +362,22 @@ export function ReviewView({
             <Button variant="ghost" size="sm" onClick={() => onOpenAudit(detail.pair_id)}>
               <ScrollText /> Audit
             </Button>
+            {isAdmin && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                disabled={busy !== null || locked}
+                title={
+                  locked
+                    ? "Promoted/published documents are protected and can't be deleted"
+                    : "Permanently delete this document (admin)"
+                }
+                onClick={() => setDeleteOpen(true)}
+              >
+                <Trash2 /> Delete
+              </Button>
+            )}
           </>
         )}
       </div>
@@ -483,6 +503,15 @@ export function ReviewView({
         onOpenChange={setUploadOpen}
         defaultTarget={defaultTarget}
         onUploaded={loadPairs}
+      />
+      <DeleteDocumentDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        pairId={detail?.pair_id ?? null}
+        onDeleted={() => {
+          setActivePair(null); // the document is gone — clear the selection
+          loadPairs();
+        }}
       />
     </div>
   );
