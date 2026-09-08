@@ -297,11 +297,11 @@ databricks postgres list-databases projects/<project>/branches/<branch> --profil
 databricks warehouses list --profile <p>                              # warehouse id
 ```
 
-**3. Fill in the config**
+**3. Create + fill in the config** (gitignored — one per workspace, so a fresh clone doesn't have it)
 ```bash
-cp variable-overrides.example.json .databricks/bundle/prod/variable-overrides.json
-# edit it: workspace_user_email, uc_catalog, lakebase_project, lakebase_branch,
-#          lakebase_database_slug, warehouse_id, app_name, (optional) app_admin_emails
+./init.sh prod   # creates .databricks/bundle/prod/variable-overrides.json from the template
+# then edit that file: workspace_user_email, uc_catalog, lakebase_project, lakebase_branch,
+#                      lakebase_database_slug, warehouse_id, app_name, (optional) app_admin_emails
 ```
 
 **4. Deploy**
@@ -347,11 +347,11 @@ git clone git@github.com:guanyudb/doc-translation.git
 cd doc-translation
 git checkout main
 
-# 2. Create the variable-overrides file. Its presence is what enables the
-#    "Deploy bundle" button in the Workspace UI AND what `./deploy.sh` reads.
-mkdir -p .databricks/bundle/prod
-cp variable-overrides.example.json .databricks/bundle/prod/variable-overrides.json
-# Edit .databricks/bundle/prod/variable-overrides.json:
+# 2. Create the variable-overrides file (gitignored, per-workspace). Its presence
+#    is what enables the "Deploy bundle" button in the Workspace UI AND what
+#    `./deploy.sh` reads. `./init.sh` copies it from the template:
+./init.sh prod
+# Then edit .databricks/bundle/prod/variable-overrides.json:
 #   - workspace_user_email:    your-email@org.com  (deploying user + Lakebase admin)
 #   - uc_catalog:              <catalog you can CREATE SCHEMA on>
 #   - lakebase_project:        <your Lakebase Project name>
