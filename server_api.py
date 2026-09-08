@@ -189,6 +189,24 @@ def _list_pairs() -> list[dict]:
     return pairs
 
 
+def _translated_basenames() -> set[str]:
+    """Basenames of raw files that already have a translated output (a pair
+    exists). Such docs are DONE — the `raw file not in bronze → QUEUED` fallback
+    below must not relabel them 'Queued'. Reads the Volume via _list_pairs(), so
+    it stays correct even when the SQL warehouse (which backs the bronze status
+    read) is unavailable — e.g. reaped — or when a doc was translated >24h ago
+    and so falls outside the bronze status query's recency window."""
+    names: set[str] = set()
+    try:
+        for p in _list_pairs():
+            op = p.get("original_path") or ""
+            if op:
+                names.add(op.rsplit("/", 1)[-1])
+    except Exception:
+        log.exception("_translated_basenames: could not list pairs")
+    return names
+
+
 def _resolve(pair_id: str) -> dict:
     """Return {pair_id, original_path, translated_path, target_lang}. Prefer the
     Lakebase row (canonical); fall back to a Volume scan + self-healing upsert."""
@@ -905,9 +923,13 @@ def list_documents():
                 continue
 
     # Raw files not yet in bronze → QUEUED (uploaded, waiting on the trigger).
+    # Skip any that already have a translated output — those are done, not queued,
+    # even if bronze can't be read (warehouse down) or the row aged out of the
+    # status query's 24h window.
     try:
+        done = _translated_basenames()
         for f in volume.list_docx(config.RAW_DIR):
-            if f["name"] not in bronze_names:
+            if f["name"] not in bronze_names and f["name"] not in done:
                 rows.append({
                     "file_name": f["name"], "status": "QUEUED", "target_language": None,
                     "source_language": None, "started_at": None, "ended_at": None,
@@ -1028,10 +1050,13 @@ def processing_status():
             pass
 
     # Raw files not yet in bronze → QUEUED, but only the ones THIS user uploaded
-    # (attributed via the `.user` sidecar written at upload time).
+    # (attributed via the `.user` sidecar written at upload time). Skip any that
+    # already have a translated output — those are done, not queued, even if
+    # bronze can't be read (warehouse down) or the row aged out of the 24h window.
     try:
+        done = _translated_basenames()
         for f in volume.list_docx(config.RAW_DIR):
-            if f["name"] in bronze_names:
+            if f["name"] in bronze_names or f["name"] in done:
                 continue
             owner = volume.read_text(f"{config.RAW_DIR}/{f['name']}.user")
             if owner != user:
