@@ -144,10 +144,11 @@ export function SettingsView({
         </div>
         <div>
           <label className="mb-1 block text-xs text-muted-foreground">Logo URL (optional)</label>
-          <Input value={logoUrl} onChange={(e) => setLogoUrl(e.target.value)} placeholder="/brand-logo.png" />
+          <Input value={logoUrl} onChange={(e) => setLogoUrl(e.target.value)} placeholder="/Volumes/…/logo.png" />
           <p className="mt-1 text-xs text-muted-foreground">
-            A served path (drop an image in <code>frontend/public/</code>, e.g.{" "}
-            <code>/brand-logo.png</code>) or a full URL. Blank keeps the built-in icon.
+            A UC Volume path (<code>/Volumes/&lt;catalog&gt;/&lt;schema&gt;/&lt;volume&gt;/logo.png</code>, served
+            by the app), a full <code>https://</code> URL, a <code>data:</code> URI, or a bundled path
+            (<code>/brand-logo.png</code> from <code>frontend/public/</code>). Blank keeps the built-in icon.
           </p>
         </div>
         <div>
