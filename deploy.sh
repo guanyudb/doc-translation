@@ -32,10 +32,7 @@ echo "==> deploying target: $TARGET"
 OVERRIDES=".databricks/bundle/$TARGET/variable-overrides.json"
 if [[ ! -f "$OVERRIDES" ]]; then
     echo "ERROR: $OVERRIDES is missing."
-    echo "       Copy variable-overrides.example.json into place and fill in your values:"
-    echo "         mkdir -p $(dirname "$OVERRIDES")"
-    echo "         cp variable-overrides.example.json $OVERRIDES"
-    echo "         # then edit it"
+    echo "       Run  ./init.sh $TARGET  to create it from the template, then edit it and re-run."
     exit 1
 fi
 
