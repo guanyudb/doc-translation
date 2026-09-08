@@ -60,6 +60,7 @@ export default function App() {
                   activePair={activePair}
                   setActivePair={setActivePair}
                   defaultTarget={cfg?.target_language ?? "English"}
+                  isAdmin={cfg?.is_admin ?? false}
                   onOpenAudit={(id) => {
                     setActivePair(id);
                     setTab("audit");
