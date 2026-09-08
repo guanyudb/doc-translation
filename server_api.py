@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
 import threading
 import time
@@ -296,11 +297,64 @@ def _confidence_flags(c: dict) -> list[str]:
 # Config
 # ---------------------------------------------------------------------------
 
+def _is_volume_path(s: str | None) -> bool:
+    """A UC Volume filesystem path — not something a browser can fetch."""
+    return bool(s) and s.startswith("/Volumes/")
+
+
+def _guess_image_type(path: str) -> str:
+    ct, _ = mimetypes.guess_type(path)
+    if ct and ct.startswith("image/"):
+        return ct
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return {
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp",
+        "ico": "image/x-icon", "bmp": "image/bmp",
+    }.get(ext, "application/octet-stream")
+
+
+# path -> (fetched_at, bytes, content_type). The logo loads once per page load,
+# not per poll, but a small TTL cache keeps it off the Files API across viewers.
+_logo_cache: dict[str, tuple[float, bytes, str]] = {}
+_LOGO_TTL = 600.0
+
+
+@app.get("/api/branding/logo")
+def branding_logo():
+    """Serve a logo stored in a UC Volume. A Volume path (`/Volumes/...`) can't
+    be loaded by an <img> in the browser, so when `logo_url` is one, /api/config
+    rewrites it to this route and the app streams the bytes here (read via the
+    app SP's Volume access). http(s):// and data: logos pass through /api/config
+    unchanged and never reach this route."""
+    path = settings_mod.load().get("logo_url")
+    if not _is_volume_path(path):
+        raise HTTPException(404, "no Volume-backed logo configured")
+    now = time.time()
+    hit = _logo_cache.get(path)
+    if hit and now - hit[0] < _LOGO_TTL:
+        _, data, ct = hit
+    else:
+        try:
+            data = volume.read_docx(path)  # generic byte download; any path
+        except Exception:
+            raise HTTPException(404, f"logo not found in Volume: {path}")
+        ct = _guess_image_type(path)
+        _logo_cache[path] = (now, data, ct)
+    return Response(content=data, media_type=ct,
+                    headers={"Cache-Control": "public, max-age=3600"})
+
+
 @app.get("/api/config")
 def get_config():
     # Runtime settings (Volume-backed) override the deploy-time env defaults for
     # branding / target language / model, and carry the first-run gate flag.
     s = settings_mod.load()
+    # A Volume-path logo can't be fetched by the browser directly — point the
+    # navbar <img> at the streaming route instead. http(s)/data URLs pass through.
+    logo_url = s["logo_url"]
+    if _is_volume_path(logo_url):
+        logo_url = "/api/branding/logo"
     return {
         "reviewer": auth.reviewer(),
         "is_admin": auth.is_admin(),
@@ -309,7 +363,7 @@ def get_config():
         "is_configured": s["is_configured"],
         "delta_sync_enabled": delta_sync.enabled(),
         "title": s["app_title"],
-        "logo_url": s["logo_url"],
+        "logo_url": logo_url,
         "logo_alt": s["logo_alt"],
         "logo_width": config.APP_LOGO_WIDTH,
         "logo_height": config.APP_LOGO_HEIGHT,
@@ -343,7 +397,9 @@ def put_settings(patch: dict = Body(...)):
     _require_admin()
     if not isinstance(patch, dict):
         raise HTTPException(400, "body must be a JSON object")
-    return settings_mod.save(patch, actor=auth.reviewer())
+    saved = settings_mod.save(patch, actor=auth.reviewer())
+    _logo_cache.clear()  # a changed logo path/file should take effect at once
+    return saved
 
 
 # ---------------------------------------------------------------------------
