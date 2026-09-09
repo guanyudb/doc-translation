@@ -44,7 +44,13 @@ export function Navbar({
               src={logoUrl}
               alt={logoAlt ?? title}
               title={logoAlt ?? title}
-              className="rounded-md object-contain"
+              className={cn(
+                "rounded-md object-contain",
+                // With no explicit dimensions, cap the logo to the navbar height
+                // (and a sane max width) so a large source image doesn't blow up
+                // the header. Admin-set width/height below override this.
+                logoWidth == null && logoHeight == null && "max-h-9 w-auto max-w-[220px]"
+              )}
               style={{
                 width: logoWidth ?? undefined,
                 height: logoHeight ?? undefined,
