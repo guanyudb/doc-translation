@@ -247,6 +247,24 @@ export function ReviewView({
     [alignFrom]
   );
 
+  // After an edit/revert, the paragraph JSON + rail update via patchPara, but the
+  // translated PANE is a separate rendered HTML string — re-fetch just that pane
+  // (the preview endpoint bakes in the current edits) so the change shows without
+  // a manual page refresh. Preserve the scroll position across the re-render.
+  const refreshTranslatedPane = useCallback(async () => {
+    if (!activePair) return;
+    const keep = tranBody.current?.scrollTop ?? 0;
+    try {
+      const t = await api.preview(activePair, "translated");
+      setTranHtml(t);
+      requestAnimationFrame(() => {
+        if (tranBody.current) tranBody.current.scrollTop = keep;
+      });
+    } catch {
+      /* transient preview failure — leave the pane as-is */
+    }
+  }, [activePair]);
+
   const stepActive = (dir: 1 | -1) => {
     if (!detail || !detail.paragraphs.length) return;
     const cur = activeIdx ?? (dir === 1 ? -1 : detail.paragraphs.length);
@@ -482,9 +500,10 @@ export function ReviewView({
             }
             onEdit={(text) =>
               activePara &&
-              act(`edit-${activePara.idx}`, async () =>
-                patchPara(await api.setEdit(detail.pair_id, activePara.idx, text))
-              )
+              act(`edit-${activePara.idx}`, async () => {
+                patchPara(await api.setEdit(detail.pair_id, activePara.idx, text));
+                await refreshTranslatedPane(); // reflect the edit in the pane, no refresh needed
+              })
             }
             onPrev={() => stepActive(-1)}
             onNext={() => stepActive(1)}
