@@ -1,542 +1,170 @@
 # Doc Translation Review Platform
 
-A compliance-grade, end-to-end pipeline + reviewer app for translating
-clinical/regulated **`.docx` and `.pdf`** documents on Databricks.
+A compliance-grade platform for translating and reviewing clinical/regulated
+**`.docx` and `.pdf`** documents on Databricks — deployed inside your own
+workspace and Unity Catalog.
 
-A submitter drops a Japanese (or any source-language) `.docx` or `.pdf` into a
-Unity Catalog Volume. Two ingestion paths converge on one review experience:
+A submitter uploads a source-language document; it's translated automatically;
+reviewers certify it paragraph-by-paragraph in a web app; and once fully
+certified it's promoted to an immutable "golden" copy with a complete audit
+trail. It runs entirely on Databricks primitives — Unity Catalog Volumes,
+Lakebase Postgres, Foundation Model API / AI Gateway, Lakeflow, and Databricks
+Apps.
 
-- **DOCX** — a file-arrival-triggered Lakeflow job translates it in-place at the
-  OOXML level with Foundation Model API.
-- **PDF** — an in-app pipeline parses it with `ai_parse_document`, translates the
-  extracted elements (FMAPI), and can re-render a **layout-preserving translated
-  PDF**.
+## What it does
 
-Reviewers certify either format paragraph-by-paragraph in a React app (FastAPI
-backend) — the UI is format-agnostic. Once 100% certified, the document is
-atomically promoted to a "golden" Volume location, locked read-only, and
-mirrored to Delta for long-term archive.
+- **Translate DOCX and PDF through one review experience.** DOCX is translated
+  in place at the document level (layout, tables, headers/footers preserved);
+  PDF is parsed, translated, and can be re-exported as a **layout-preserving
+  translated PDF**. Reviewers can't tell the two apart.
+- **Review paragraph-by-paragraph** — edit the translation, certify, flag, or
+  comment, with page-level and whole-document bulk certify. A heuristic
+  confidence score highlights paragraphs worth a closer look.
+- **Re-translate in place** with a different instruction — no re-upload.
+- **Download** the translated document at any point, with the current edits applied.
+- **Glossary** of approved terminology as managed named lists (batch
+  enable/disable, conflict detection, CSV import). A correction a reviewer makes
+  once is applied automatically to future translations of that term.
+- **Instructions** — a library of named translation prompts; one is chosen (and
+  frozen) per document, so editing a prompt never changes what a past document
+  was translated with.
+- **Choose the model** — any Databricks chat serving endpoint or a Unity Catalog
+  **AI Gateway** endpoint, selected from Settings.
+- **Brand it** — set the app title and logo from Settings (the logo can be an
+  `https://` URL, a `data:` URI, or a UC Volume path the app serves).
+- **Admin controls** — only the deploying user (or a configured admin list) can
+  change Settings or **permanently remove a document**; everyone else reviews.
+  Promoted/published documents are protected from deletion.
+- **Compliance built in** — every action is audited (append-only, 7-year
+  retention), every certified document is content-addressed (SHA-256), and
+  promotion locks the document read-only and mirrors it to Delta for archive.
 
-Every action is audited. Every certified document is content-addressed.
-Once locked, writes are refused with an explicit `PairLockedError` (which is
-itself audited).
-
-**Key capabilities**
-- **DOCX + PDF** translation with a shared, format-agnostic review UI.
-- **Per-paragraph certify / edit**, page/bulk certify, and heuristic confidence scoring.
-- **Re-translate** a document in place with a different instruction (no re-upload).
-- **Pluggable model endpoint** — set it in Settings: any chat serving endpoint or a **Unity Catalog AI Gateway** endpoint.
-- **Glossary** as managed named lists — batch enable/disable, conflict detection, import/mine.
-- **Instructions** — a library of named translation prompts, one chosen (and frozen) per document.
-- **Admin gate** — only the deploying user can change Settings; reviewers do everything else.
-- **Compliance** — golden promotion, content addressing, an append-only audit trail, and a Delta mirror.
-
----
-
-## Architecture at a glance
-
-```
-[Raw Volume]  →  [File-arrival trigger]  →  [Translation Job]  →  [Translated Volume]
-                          │                         │                      │
-                          ▼                         ▼                      ▼
-                  bronze_documents          claude-sonnet-4-6        translated_inplace/
-                  (status=TRANSLATING)      (in-place OOXML edit)    status=TRANSLATED
-                          │                         │                      │
-                          └─────────────────────────┴──────┬───────────────┘
-                                                          ▼
-                                          [ Lakebase Postgres — live review ]
-                                                          │
-                                                          ▼
-                                          [ Reviewer App (Databricks Apps) ]
-                                                          │
-                                              certify ▼ edit ▼ publish
-                                                          │
-                                                          ▼
-                                                [Golden Volume]
-                                              golden_publications
-                                              SHA-256 + immutable
-                                                          │
-                                                          ▼
-                                                [ Delta mirror ]
-                                          audit_events · golden_publications
-                                          silver_review_snapshots · bronze_documents
-```
-
-**Two storage planes:**
-- **Lakebase Postgres** — hot OLTP for the reviewer app (low-latency, transactional)
-- **Delta Lake** — long-term archive and BI surface (append-only audit, 7-year retention)
-
-Data flows from Lakebase → Delta only at promotion time, so the hot path stays fast and the cold path stays compliance-grade.
-
----
-
-## Two ingestion workflows, one review experience
-
-The platform is a **hybrid**: DOCX and PDF are ingested by separate pipelines,
-but both emit the identical review contract (HTML with per-element `data-pidx` /
-`data-page` anchors + index-aligned paragraphs), so the review / edit / certify /
-publish UI is completely format-agnostic — reviewers can't tell a PDF pair from a
-DOCX pair.
-
-| | **DOCX** | **PDF** |
-|---|---|---|
-| Where it runs | File-arrival **Lakeflow job** (async) | **In-app** background thread (FastAPI) |
-| Parse | python-docx walks OOXML paragraphs | `ai_parse_document` (SQL on the warehouse) → typed elements + bbox |
-| Translate | FMAPI + glossary, in-place OOXML | FMAPI + glossary over parsed elements (whole-table cross-cell context) |
-| Intermediate | the translated `.docx` itself | a JSON artifact `*_translated_<lang>.pdf.json` (elements: `id`, `type`, `page`, `bbox`, `source`, `target`; tables as HTML) |
-| Export / download | translated `.docx` (edits applied) | **layout-preserving translated PDF** — redact source text by bbox + retypeset the translation with PyMuPDF |
-
-The PDF **intermediate is structured JSON, not markdown** — deliberately, because
-the workflow needs `bbox` (for the layout-preserving export), stable element ids
-(review state is keyed by `paragraph_idx`), and per-element type (drives both the
-review HTML and the export styling). HTML is derived from it for review; PDF is
-derived for export. It's an "IR → re-typeset" design.
-
-Both formats offer **"Download translated"** in the review toolbar — an on-demand
-`GET /api/pairs/{id}/download/translated` that applies the current reviewer edits
-(no need to publish first): a layout-preserving PDF for PDF pairs, the translated
-`.docx` for DOCX pairs.
-
----
-
-## Lifecycle state machine
-
-| State | Meaning | Allowed transitions |
-|---|---|---|
-| `UNDER_REVIEW` | Default — edits + status changes allowed | `PROMOTING` |
-| `PROMOTING` | Lock-in in flight (file copy + Delta sync) | `PUBLISHED`, `UNDER_REVIEW` (on failure) |
-| `PUBLISHED` | Golden zone copy exists, doc is read-only | `ARCHIVED` |
-| `ARCHIVED` | Retention started, terminal | — |
-
-Writes against `PUBLISHED` docs are rejected at the store layer with `PairLockedError` and audited as `INVALID_WRITE_BLOCKED`.
-
----
-
-## End-to-end workflow (5 phases)
+## How it works
 
 ```
-   UPLOAD              AUTO-TRANSLATE          REVIEW                  PROMOTE                 ARCHIVE
-─────────────       ─────────────────────   ──────────────         ───────────────────     ───────────────────
-Drop .docx into     Job fires via Lakeflow  App sidebar shows      Header chip flips       Certified DOCX in
-raw_documents/      file-arrival trigger    the new pair after     UNDER REVIEW →          golden/<pair>/
-                                            translation lands      PUBLISHED at 100%       + read-only mode
-                                                                   certified
-bronze_documents    claude-sonnet-4-6       OPENED + PARAGRAPH_*   GOLD_PROMOTED event     Delta mirror:
-row inserted        writes in-place OOXML   audit events per       golden_publications     audit_events
-status=TRANSLATING  to translated_inplace/  reviewer action        row (SHA-256 hashed)    golden_publications
-                    status=TRANSLATED                                                      silver_review_snapshots
+[Upload .docx / .pdf]
+      │
+      ├─ DOCX → file-arrival Lakeflow job → in-place OOXML translation
+      └─ PDF  → in-app parse (ai_parse_document) + element translation
+      │
+      ▼
+[ Review app on Databricks Apps ]  ── live state in Lakebase Postgres
+   certify · edit · comment · re-translate · download
+      │
+      ▼  (100% certified, no flags)
+[ Golden Volume ]  SHA-256, read-only  ──►  [ Delta archive ]  audit + publications
 ```
 
----
+Two ingestion paths converge on one format-agnostic review UI. Two storage
+planes keep the hot path fast and the cold path compliance-grade: **Lakebase
+Postgres** holds live review state; **Delta Lake** is the append-only archive,
+written only at promotion time.
 
-## Reviewer workflow (what the user does)
+Documents move through `UNDER_REVIEW → PROMOTING → PUBLISHED → ARCHIVED`. Once
+`PUBLISHED`, writes are refused and the attempt is itself audited — so a full
+history for any document is one SQL query against the Delta tables.
 
-1. **Open the app** → pick a pair from the sidebar dropdown (with live search filter)
-2. **Read the side-by-side panes** (original left, translated right). Click any paragraph to focus it in the right rail.
-3. **For each paragraph** in the rail editor:
-   - Edit the translation if needed → `✏️ Save edit` (writes overlay to Lakebase, appends history row, pane re-renders with the edit highlighted)
-   - Choose `● Pending` / `✓ Certify` / `⚑ Flag`
-   - Optionally add a comment → `Save`
-4. **Bulk-certify** to move faster:
-   - `✓ Certify page · N paragraphs` — current page only
-   - `✓✓ Certify whole doc · N remaining` — everything not yet certified
-   - **`Skip hi-conf (≥ 0.9)`** checkbox — when on, the ←→ nav skips paragraphs that are high-confidence AND already certified
-5. **If any edits**: header shows `⤴ Publish · N edits` → opens dialog → diff preview → writes a versioned `<file>_reviewed_<lang>_v<N>.docx` to `translated_reviewed/` (audited in `review_publish_log`)
-6. **When 100% certified + no flagged + no unpublished edits**: header swaps to `🏅 Promote to Gold` → confirm-by-typing-pair-id → atomically copies both files (with SHA-256) to `/golden/<pair_id>/`, locks the doc, syncs Delta. Read-only thereafter.
-7. **Audit anytime**: sidebar `📜 Audit trail` shows every event with actor + timestamp; `🏅 Golden publication` shows the certified paths + hashes; `📦 Delta mirror synced at …` confirms the long-term archive.
+## Deploy it to your workspace
 
----
+The repo is a portable Databricks Asset Bundle — one `./deploy.sh` from a clean
+clone after a one-time config edit.
 
-## Intelligence (Loop 1)
-
-The platform learns from reviewer behavior in two cheap, no-LLM ways:
-
-**Per-paragraph confidence score** — computed at first render of each pair, persisted to `paragraph_confidence`. Combines:
-- `length_ratio` — target/source length vs. expected band for the language pair
-- `untranslated_pct` — fraction of source-script characters still in the target (catches passthrough)
-- `repeated_ngrams` — 5-token n-grams repeating ≥ 3× (catches model loops)
-
-Combined via weighted geometric mean so any single red flag drags the score down. Surfaced as a colored pill on each paragraph and as `N hi-conf` / `N lo-conf` chips in the header progress strip.
-
-**Glossary mining + injection (the feedback loop)** — the `translation_glossary` table holds terminology entries of three kinds, distinguished by a `source` column:
-- `tenant` — mined by scanning `review_edit_history` for repeated (model output → reviewer correction) patterns across documents and reviewers.
-- `seed` — optional public clinical terminology shipped with the app (`setup/seed_glossary/*.csv`, ~115 ICH/GCP JA→EN terms). Loaded at postdeploy when `enable_seed_glossary=true`.
-- `customer` — bilingual pairs the customer imports via CSV (Glossary tab → Import, or drop a CSV in the `glossary_imports/` Volume folder).
-
-Approved entries are mirrored to a Delta table and read by the translation pipeline at startup, which builds an **Aho-Corasick automaton** over the source-language phrases. For each paragraph the pipeline injects only the glossary entries whose term actually appears in that paragraph into the FMAPI system prompt — so per-call prompt cost is a function of the segment, not the total glossary size, and the design scales to large enterprise glossaries. The result: a correction made once by a reviewer is applied automatically to every future translation of that term.
-
-**Language handling** — the source language is auto-detected per document (`langdetect`) and recorded in `bronze_documents.source_language`; the target language is a selectable setting (`translation_target_language` bundle var, overridable per-run from the Jobs UI). No language pair is hard-coded.
-
-**Confidence is a triage signal, not a quality guarantee.** The reviewer remains the source of truth — the score just helps them prioritize.
-
----
-
-## Prompt management (Instructions)
-
-The system prompt sent to the translation model is no longer hard-coded — the **Instructions** tab is a full CRUD library of named prompts (view / create / clone / edit / delete), stored in the `translation_prompts` Lakebase table. Each prompt's body **replaces** the model's base system prompt at translation time; glossary terms are still appended per-segment afterward, so prompt management and the glossary loop compose. Prompts are **seeded-editable** — the editor opens pre-filled with the built-in default (including the `{lang}` token, which is substituted with the document's target language via `str.replace`, so a custom prompt may safely contain literal `{`/`}`).
-
-**Selection is required at upload.** The upload dialog has a prompt dropdown; the Upload button stays disabled until one is chosen. A built-in `Medical / clinical (default)` prompt is seeded on first deploy (and on app startup if the table is empty) so the list is never empty.
-
-**The chosen prompt is snapshotted, not referenced.** At upload the full prompt text is frozen into a `<file>.docx.prompt` JSON sidecar (`{prompt_id, name, body}`) next to the raw file — mirroring the `.lang` sidecar. The watcher reads it (`_prompt_for`), records `selected_prompt_id` / `selected_prompt_name` / `prompt_text_used` on `bronze_documents`, and passes the body to the inner notebook as the `custom_system_prompt` job argument. **Editing or deleting a prompt afterward never changes what a past document was translated with** — the snapshot is the compliance record of what actually ran. Because the text is frozen at upload, prompts (unlike the glossary) are **not** mirrored to Delta; the notebook needs no lookup. Every prompt mutation emits a `PROMPT_CREATED/UPDATED/DELETED/CLONED` audit event. A file dropped straight into the Volume (bypassing the app) has no sidecar and falls back to the notebook's built-in default prompt.
-
----
-
-## Compliance & traceability
-
-- **Append-only** `audit_events` Delta table — INSERT-only ACL for the app SP, 7-year retention (`delta.deletedFileRetentionDuration = 'interval 2557 days'`)
-- **Content-addressed** golden files — SHA-256 of original + translated stored in `golden_publications`
-- **Locked after publish** — writes refused with `PairLockedError`; the blocked attempt itself emits an `INVALID_WRITE_BLOCKED` event
-- **Every event carries** actor (SSO email or SP id) + timestamp (DB clock) + event_type + before/after JSON + correlation_id + paragraph_idx + client_ip
-- **Lakebase → Delta sync** at promotion: `audit_events`, `golden_publications`, `silver_review_snapshots` mirrored
-
-**"Produce full history for any document in under 5 minutes"** — one SQL query against the four Delta tables, filtered by `pair_id`.
-
----
-
-## Components
-
-| Layer | What | Where |
-|---|---|---|
-| Storage (files) | Original / translated / reviewed / golden `.docx` | UC Volume `<uc_catalog>.<uc_schema>.<uc_volume_name>` (from your `variable-overrides.json`) |
-| Storage (state) | Live review state — pairs, feedback, edits, audit, glossary, confidence | Lakebase Postgres (Autoscaling Project), schema `<pg_schema>` |
-| Storage (archive) | Long-term audit + publication archive | Delta tables in `<uc_catalog>.<uc_schema>` |
-| Translation (DOCX) | In-place OOXML translation per paragraph, with a per-document selectable system prompt | FMAPI endpoint (default `databricks-claude-sonnet-4-6`, configurable via `translation_model_endpoint`) |
-| Translation (PDF) | In-app parse (`ai_parse_document`) + element translation + layout-preserving PDF export | `server/pdf_translate.py`, `server/pdf_render.py`, `server/pdf_layout.py` (PyMuPDF) |
-| Prompts | Named translation-prompt library; one is chosen per document at upload (frozen snapshot) | Lakebase `translation_prompts` + Instructions tab; `server/prompts.py` |
-| Orchestration | File-arrival → DOCX translation pipeline (PDF translates in-app, no job) | Lakeflow Job `doc-translation · auto-translate pipeline` (bundle-managed) |
-| Review UI | Two-region layout (side-by-side DOCX HTML preview + paragraph action rail), certify/edit/publish/promote, glossary admin, audit | React SPA (Vite + TS + Tailwind) served by FastAPI on Databricks Apps |
-| Auth | Reviewer identity via `X-Forwarded-Email`, App SP for system actions | Databricks Apps SSO + Service Principal |
-
----
-
-## Repository layout
-
-```
-doc-translation-app/
-├── databricks.yml                  # DAB bundle root
-├── variables.yml                   # Bundle variable definitions
-├── variable-overrides.example.json # Template customer fills in per workspace
-├── deploy.sh                       # deploy wrapper (build → seed → deploy → postdeploy → app)
-├── build.sh                        # builds the React frontend → static/ (run before deploy)
-├── server_api.py                   # FastAPI backend: JSON review API + serves the SPA
-├── app.yaml                        # Databricks Apps runtime config (uvicorn server_api:app)
-├── requirements.txt                # fastapi, uvicorn, psycopg[binary,pool], databricks-sdk, mammoth, lxml, pymupdf
-├── pyproject.toml
-├── frontend/                       # React SPA source (Vite + TS + Tailwind); NOT deployed
-│   ├── package.json
-│   ├── vite.config.ts              # builds to ../static/
-│   └── src/
-│       ├── App.tsx                 # tab shell: Review / Glossary / Audit
-│       ├── api.ts                  # typed client for /api/*
-│       └── components/
-│           ├── review/             # ReviewView, PreviewPane, ParagraphCard, UploadDialog
-│           ├── glossary/GlossaryView.tsx
-│           ├── instructions/InstructionsView.tsx   # prompt-management CRUD
-│           └── audit/AuditView.tsx
-├── static/                        # PREBUILT SPA (committed; served by FastAPI)
-├── legacy/
-│   └── streamlit_app.py            # previous Streamlit UI, kept for reference/rollback
-├── resources/                      # DAB-managed resources
-│   ├── app.yml                     # App definition + postgres/sql_warehouse/secret bindings
-│   ├── schema.yml                  # UC schema
-│   ├── volumes.yml                 # UC managed volume
-│   └── jobs/
-│       ├── postdeploy_setup.yml    # One-shot job: DDL + GRANTs + Delta tables + secret seed
-│       └── translation_pipeline.yml # File-arrival-triggered translation job
-├── setup/                          # Notebooks bundled into the workspace
-│   ├── postdeploy.py               # Postdeploy notebook (idempotent)
-│   ├── auto_translate_watcher.py   # Watcher: scans raw_documents/, calls translator per file
-│   ├── docx_inplace_translation.py # Per-file translator (FMAPI + lxml + glossary injection)
-│   └── seed_glossary/              # Optional public clinical seed CSVs (source='seed')
-├── server/
-│   ├── auth.py                     # Reviewer from X-Forwarded-Email
-│   ├── config.py                   # env + WorkspaceClient singleton (Lakebase Project)
-│   ├── confidence.py               # Heuristic per-paragraph scoring (no LLM)
-│   ├── db.py                       # Lakebase psycopg pool, lazy-init proxy
-│   ├── delta_sync.py               # Lakebase → Delta mirror (review state + glossary)
-│   ├── docx_render.py              # DOCX → HTML via sentinel markers + lxml
-│   ├── pdf_translate.py            # PDF: ai_parse_document (warehouse) + FMAPI translate → JSON artifact
-│   ├── pdf_render.py               # PDF artifact → review HTML (same data-pidx contract as docx_render)
-│   ├── pdf_layout.py               # PDF: layout-preserving translated-PDF export (PyMuPDF redact + retypeset)
-│   ├── glossary.py                 # Mine + ingest + prompt-format glossary entries
-│   ├── prompts.py                  # translation_prompts CRUD + audit + default seed
-│   ├── store.py                    # Lakebase CRUD + audit emits + lifecycle
-│   ├── styles.py                   # (legacy Streamlit CSS)
-│   └── volume.py                   # UC Volume listing, DOCX/PDF read, pairing, golden promotion
-└── docs/
-    ├── architecture.png            # Architecture diagram (PNG)
-    ├── architecture.svg            # Architecture diagram (SVG)
-    └── pipeline_design.md          # Phase 1+ design doc
-```
-
----
-
-## How to deploy (step by step)
-
-A checklist for standing up the app in a workspace end to end. The section after
-this one documents each step in more depth.
-
-**0. Confirm the workspace has:**
+**Prerequisites (target workspace):**
 - A **Unity Catalog** you can `CREATE SCHEMA` + `CREATE VOLUME` in.
-- A **Lakebase Autoscaling Project** (+ branch, usually `production`).
-- A **Serverless or Pro SQL warehouse** that supports `ai_parse_document` (DBR 17.3+).
+- A **Lakebase Autoscaling Project** (note its name + branch, usually `production`).
+- A **Serverless or Pro SQL warehouse** on **DBR 17.3+** (the PDF workflow uses `ai_parse_document`).
 - **Foundation Model API** access to a Claude (or other chat) endpoint.
-- On your laptop: **Databricks CLI v1.15+**, **Node.js**, **git**, and a CLI profile authenticated to the workspace (`databricks auth login --host <url> --profile <p>`).
+- Locally: **Databricks CLI v1.15+**, **Node.js**, **git**, and a CLI profile authenticated to the workspace.
 
-**1. Clone and select the branch**
-```bash
-git clone <repo-url> && cd doc-translation-app
-git checkout main
-```
+**Steps:**
 
-**2. Discover the workspace values**
 ```bash
-databricks postgres list-projects --profile <p>                       # project id
-databricks postgres list-branches projects/<project> --profile <p>    # branch (usually 'production')
-databricks postgres list-databases projects/<project>/branches/<branch> --profile <p>  # db slug
-databricks warehouses list --profile <p>                              # warehouse id
-```
+# 1. Clone
+git clone <repo-url> && cd doc-translation-app && git checkout main
 
-**3. Create + fill in the config** (gitignored — one per workspace, so a fresh clone doesn't have it)
-```bash
+# 2. Discover your workspace values
+databricks postgres list-projects  --profile <p>
+databricks postgres list-branches  projects/<project> --profile <p>
+databricks postgres list-databases projects/<project>/branches/<branch> --profile <p>
+databricks warehouses list         --profile <p>
+
+# 3. Create the per-workspace config, then fill it in
 ./init.sh prod   # creates .databricks/bundle/prod/variable-overrides.json from the template
-# then edit that file: workspace_user_email, uc_catalog, lakebase_project, lakebase_branch,
-#                      lakebase_database_slug, warehouse_id, app_name, (optional) app_admin_emails
-```
+#   edit: workspace_user_email, uc_catalog, lakebase_project, lakebase_branch,
+#         lakebase_database_slug, warehouse_id, app_name, (optional) app_admin_emails
 
-**4. Deploy**
-```bash
+# 4. Deploy
 ./deploy.sh prod --profile <p>
-# If you hit a Terraform GPG "key expired" error, export these first and re-run:
+#   Terraform GPG "key expired"? Run this once and re-run:
 #   export DATABRICKS_TF_EXEC_PATH=$(which terraform) DATABRICKS_TF_VERSION=1.5.7
 ```
-The app URL prints at the end.
 
-**5. First-run setup** — open the URL (Databricks SSO), complete **Settings** (model endpoint + target language). Only the deploying user (or anyone in `app_admin_emails`) can change Settings; reviewers use everything else.
+`deploy.sh` builds the app, seeds config, deploys the bundle (UC schema + volume
++ app + jobs), runs one-time setup (schema, grants, file-arrival trigger, Delta
+tables), and starts the app. The URL prints at the end. It's idempotent — re-run
+it after any change (re-deploys require CLI v1.15+).
 
-**6. Smoke test** — upload a `.docx` and a `.pdf` from the Upload dialog. Each appears in the review list once translated (DOCX ~1–3 min via the Lakeflow job; PDF ~10–60 s in-app). Certify a few paragraphs, then **Download** the translated file.
+**First run:** open the URL (Databricks SSO) and complete **Settings** — model
+endpoint and default target language. Only the deploying user (or anyone in
+`app_admin_emails`) can change Settings; everyone else reviews.
 
-**7. (Optional) governed model endpoint** — in **Settings**, point `model_endpoint` at the customer's own serving endpoint or a Unity Catalog **AI Gateway** endpoint (a 3-part `catalog.schema.name`), and grant the app's service principal access to it. No redeploy needed.
+**Smoke test:** upload a `.docx` and a `.pdf`. Each appears in the review list
+once translated (DOCX ~1–3 min via the job; PDF ~10–60 s in-app). Certify a few
+paragraphs and **Download** the result.
 
-**Re-deploys / updates:** re-run `./deploy.sh prod --profile <p>` — idempotent, and requires **CLI v1.15+** (older versions fail the app update with `Invalid update mask`).
+> The workspace host comes from your CLI profile, not the config file — always
+> pass `--profile <p>` (or set `DATABRICKS_HOST`).
 
----
+## Using the app
 
-## Deploying to your own workspace (Databricks Asset Bundle)
+**Reviewers** pick a document from the dropdown, read the side-by-side panes
+(source left, translation right), and for each paragraph edit / certify / flag /
+comment — or bulk-certify a page or the whole document. If there are edits,
+**Publish** bakes a versioned reviewed copy. When everything is certified with
+no flags, **Promote to Gold** writes the immutable golden copy and locks the
+document. The **Audit** tab shows the full history any time.
 
-This repo is a portable Databricks Asset Bundle (DAB): one `./deploy.sh` from a
-clean clone of `main`, after a one-time config-file edit. A step-by-step runbook
-is in [**How to deploy (step by step)**](#how-to-deploy-step-by-step) below.
+**Admins** (the deployer, plus anyone in `app_admin_emails`) additionally can:
 
-### Prerequisites
+- Change **Settings** — model endpoint, default language, and branding (title + logo).
+- **Re-translate** a document with a different instruction (resets its review state).
+- **Delete** a document — permanently removes its source, translation, and
+  review state so it drops off the list. Promoted/published documents are
+  protected; the deletion is recorded in the audit trail and the compliance
+  archive is preserved.
 
-Your target workspace needs:
+## Configuration
 
-1. **Unity Catalog access** — a catalog where you can `CREATE SCHEMA` and `CREATE VOLUME`
-2. **A Lakebase Autoscaling Project** — get the project name + branch (Provisioned Lakebase is retired). List with `databricks postgres list-projects`.
-3. **A SQL warehouse** — **must be Serverless or Pro and support `ai_parse_document` (DBR 17.3+)**; the PDF workflow runs `ai_parse_document` on it, and it also drives the Delta archive sync. A Classic warehouse will not work for PDF.
-4. **Foundation Model API** with access to `databricks-claude-sonnet-4-6` (or another Claude model you specify) — the app service principal needs `CAN QUERY` on it.
-5. **Databricks CLI v1.15+** authenticated to the target workspace — earlier versions fail to *re-deploy* an existing app with an `Invalid update mask` error (`brew upgrade databricks`). Plus **Node.js** locally (the deploy step builds the React SPA).
-6. **(Optional) A model endpoint** other than the default — the app can point at any chat serving endpoint or a Unity Catalog AI Gateway endpoint; set it in the app's **Settings** after deploy (no redeploy needed).
+Per-workspace values live in `.databricks/bundle/<target>/variable-overrides.json`
+(created by `./init.sh`, gitignored). Runtime settings are managed in-app from
+**Settings** and change without a redeploy.
 
-### One-time setup
-
-```bash
-# 1. Clone (main is the deployable branch — includes both DOCX + PDF workflows)
-git clone git@github.com:guanyudb/doc-translation.git
-cd doc-translation
-git checkout main
-
-# 2. Create the variable-overrides file (gitignored, per-workspace). Its presence
-#    is what enables the "Deploy bundle" button in the Workspace UI AND what
-#    `./deploy.sh` reads. `./init.sh` copies it from the template:
-./init.sh prod
-# Then edit .databricks/bundle/prod/variable-overrides.json:
-#   - workspace_user_email:    your-email@org.com  (deploying user + Lakebase admin)
-#   - uc_catalog:              <catalog you can CREATE SCHEMA on>
-#   - lakebase_project:        <your Lakebase Project name>
-#   - lakebase_branch:         production                        [check your Project's branch]
-#   - lakebase_database_slug:  databricks-postgres               [usually]
-#   - warehouse_id:            <your SQL warehouse ID>
-#   - pg_schema:               doc_translation                   [Postgres schema name]
-#   - app_admin_emails:        ""   [optional: comma-separated emails allowed to change Settings; blank = only the deployer]
-```
-
-> **The workspace host comes from your Databricks CLI profile**, not this file. Bundle variables can't be referenced from `workspace.host` (auth resolves before variable substitution). Either run with `--profile <name>` or set `DATABRICKS_HOST` in your environment.
-
-### Deploy (CLI — one command, recommended)
-
-```bash
-./deploy.sh
-```
-
-This runs the 5-step deploy in order:
-
-1. **Build the React SPA** into `static/` (skipped if already built; `FORCE_BUILD=1` to rebuild).
-2. **Seed secrets** — reads `variable-overrides.json`, creates the scope, puts the config + branding secrets (`pg_schema`, `lakebase_project`, `lakebase_branch`, `volume_root`, `delta_catalog`, `delta_schema`, `admin_emails`, `app_title`, `app_logo_url`, `app_logo_alt`). Idempotent.
-3. `bundle deploy` — creates UC schema + volume + app (with secret + postgres + warehouse bindings) + jobs, syncs code to the workspace.
-4. `bundle run postdeploy_setup` — Lakebase DDL (from the shared `server/schema.sql`), GRANTs the App SP `USAGE + CREATE on public` and table/sequence perms, attaches the file-arrival trigger, creates the Delta mirror tables, pre-creates Volume subdirectories.
-5. `bundle run doc_translation_app` — pushes the source into the App runtime and starts it — then grants the App SP `CAN_MANAGE_RUN` on the pipeline job so it can trigger re-translation.
-
-The app URL prints at the end. First boot takes ~30 seconds.
-
-> **⚠ Always re-run postdeploy after any `bundle deploy`.** The file-arrival
-> trigger on the translation pipeline is attached by **postdeploy** (via the
-> Jobs API), not by the bundle YAML — `resources/jobs/translation_pipeline.yml`
-> deliberately omits it to avoid a create-time race against the Volume. But
-> every `bundle deploy` re-applies the job from that YAML and **wipes the
-> trigger**. `./deploy.sh` always runs postdeploy (step 3) so the full flow is
-> safe. If you ever run `bundle deploy` on its own (e.g. a quick code push),
-> follow it with `bundle run -t <target> doc_translation_postdeploy_setup` or
-> uploads will land in `raw_documents/` with nothing listening. Symptom: files
-> appear in the Upload dialog's status list stuck on **queued** and never
-> start translating.
-
-### Deploy (Workspace UI button)
-
-The "Deploy bundle" button **alone is not enough.** Apps validates secret resource bindings eagerly at app create/update time, so the bundle deploy will 404 unless the secret values already exist.
-
-To use the UI:
-
-1. **One-time, via CLI**: run `./deploy.sh` once. This seeds the secrets + does the full deploy.
-2. **Subsequent code changes**: now the UI Deploy bundle button works fine (secrets already exist; the bundle just updates the app). After clicking it, also: Workflows → `doc-translation · postdeploy setup` → **Run now** (if your schema/DDL changed), then Apps → your app → **Deploy** (to push the source change to the runtime).
-
-Or always run `./deploy.sh` for iteration — it's idempotent and handles all 4 steps in one command.
-
-If you ever change `variable-overrides.json` values (e.g., point at a different Lakebase Project), re-run `./deploy.sh` so the seeded secrets are updated.
-
-### Translation pipeline
-
-The bundle deploys **both** the reviewer app AND the auto-translation pipeline.
-
-After `./deploy.sh`, you'll have a Lakeflow job called `doc-translation · auto-translate pipeline` with:
-- **A file-arrival trigger** watching `/Volumes/<your-catalog>/<your-schema>/<your-volume>/raw_documents/`. Fires 60s after the last upload (debounce, so a batch upload kicks one run not N).
-- **Two notebooks** that ship with the bundle:
-  - `setup/auto_translate_watcher.py` — scans for unpaired files, writes `bronze_documents` audit rows, invokes the translator once per file
-  - `setup/docx_inplace_translation.py` — translates paragraph-by-paragraph via the configured Foundation Model API endpoint, in-place at the OOXML level (preserves layout, charts, headers/footers, SmartArt)
-
-To kick a **DOCX** translation: upload a `.docx` through the app's Upload dialog (choosing a target language **and** a translation prompt), or drop one straight into `raw_documents/` (which uses the built-in default prompt). The job fires automatically; the translated file appears in `translated_inplace/`; the reviewer app's sidebar picks up the new pair.
-
-**PDF** uploads translate **in-app** (no Lakeflow job): the FastAPI backend runs `ai_parse_document` on the warehouse, translates the parsed elements via FMAPI, and writes a `*_translated_<lang>.pdf.json` artifact to `translated_inplace/` — usually within ~10–60s. The reviewer app renders it identically to a DOCX pair.
-
-Configuration knobs (set in `variable-overrides.json`):
-- `translation_model_endpoint` (default `databricks-claude-sonnet-4-6`)
-- `translation_target_language` (default `English`)
-- `translation_max_workers` (default `8`)
-- `translation_max_pages` (default `0` = whole document)
-
-### Re-deploys
-
-`./deploy.sh` is idempotent. Run it again after code changes; it picks up the diff. Schema migrations in the postdeploy job use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ADD COLUMN IF NOT EXISTS` so re-running is safe.
-
-**Self-healing pattern:** the postdeploy job re-seeds all secret values from its own bundle-variable parameters (no shell-quoting hazards, unlike `deploy.sh`'s step 1). So if `deploy.sh` ever produces wrong secret values, re-running just the postdeploy job from the UI fixes them — no CLI required.
-
-### Tearing down
-
-`bundle destroy` works when the local terraform state matches the remote — which it doesn't if someone else (or another machine) ran `bundle deploy` since you last did. If you hit `Error: lineage mismatch in state files`, fall back to deleting resources directly:
-
-```bash
-# Drop Delta tables first (postdeploy created them, bundle doesn't track them,
-# and the schema delete below fails if it's non-empty).
-for t in audit_events bronze_documents golden_publications silver_review_snapshots; do
-  databricks api post /api/2.0/sql/statements --profile <profile> \
-    --json "{\"statement\":\"DROP TABLE IF EXISTS <catalog>.<schema>.${t}\",\"warehouse_id\":\"<warehouse>\",\"wait_timeout\":\"30s\"}"
-done
-
-# Now delete the actual resources
-databricks apps delete    doc-translation                                            --profile <profile>
-databricks jobs delete    <pipeline-job-id>                                          --profile <profile>
-databricks jobs delete    <postdeploy-job-id>                                        --profile <profile>
-databricks volumes delete <catalog>.<schema>.<volume>                                --profile <profile>
-databricks schemas delete <catalog>.<schema>                                         --profile <profile>
-databricks secrets delete-scope doc_translation_config                               --profile <profile>
-databricks workspace delete /Workspace/Users/<you>/.bundle/doc-translation --recursive --profile <profile>
-```
-
-The Lakebase Project itself stays (other things may use it); to also drop the Postgres schema inside it, run `DROP SCHEMA <pg_schema> CASCADE` against the project's primary endpoint.
-
-### Troubleshooting cross-references
-
-Common issues during a deploy and their fixes:
-
-| Symptom | Cause | Fix |
+| Setting | Where | Notes |
 |---|---|---|
-| `Invalid update mask` when re-deploying an existing app | Databricks CLI older than v1.15 | Upgrade the CLI (`brew upgrade databricks`). First (create) deploys are unaffected. |
-| `Invalid secret resource pg_schema: Secret … does not exist` (bundle deploy 404) | Apps validates secret bindings eagerly at app create/update — secrets must exist before the bundle deploy | `deploy.sh` seeds secrets first; the CLI is required for the very first deploy |
-| App boots, sidebar empty, log says `failed to resolve host 'None'` or `${var.lakebase_project}` literal | DAB does NOT substitute `${var.X}` inside `app.yaml` — values must come via `valueFrom:` to secret bindings | All env vars use `valueFrom:`; `deploy.sh` + postdeploy seed the secret values |
-| `Endpoint 'projects/<proj>/branches/<br>/endpoints/primary' not found` | Lakebase Project's default branch is `production` (not `main`) on new Projects | Set `lakebase_branch: production` in `variable-overrides.json` |
-| Inner translator crashes with `AttributeError: 'ServingEndpointsAPI' object has no attribute 'get_open_ai_client'` | Workspace default serverless env is v1 with an old `databricks-sdk` | `resources/jobs/translation_pipeline.yml` pins `client: "5"` so the watcher + inner notebook get a modern SDK |
-| Sidebar warning "Couldn't read some Volume paths" + listing 404s with malformed path | Secret values shifted by one slot due to a shell-quoting bug | Re-run the postdeploy job — it re-seeds secrets defensively |
-| App SP can't list Volume even though grants look right | `USE CATALOG`/`USE SCHEMA` granted but `READ VOLUME` missing | postdeploy job now grants `READ VOLUME, WRITE VOLUME` explicitly |
-| `pool has already been opened/closed and cannot be reused` | psycopg-pool 3.2+ is strict; multi-session Apps races on the module-level pool | `server/db.py` proxies a lazy-built pool that rebuilds on `closed` |
-| DOCX re-translate returns 500 (`does not have Manage Run`) | App SP lacks run permission on the pipeline job | `deploy.sh` step 5 grants it; re-run `./deploy.sh` |
+| Model endpoint | Settings | Any chat serving endpoint, or a UC AI Gateway endpoint (3-part `catalog.schema.name`) — grant the app's service principal access to it. |
+| Default target language | Settings | Pre-selected at upload; each upload can override. Source language is auto-detected. |
+| Branding (title, logo) | Settings | Logo = `https://` URL, `data:` URI, or a `/Volumes/…` path the app serves. |
+| Admins | `app_admin_emails` (config) | Comma-separated; blank = only the deploying user. |
+| Seed glossary | `enable_seed_glossary` (config) | Loads ~115 ICH/GCP clinical terms on first deploy. |
 
-### Legacy: deploying just the app (no bundle)
+## Operations
 
-For a quick code-only deploy when the workspace is already configured:
+- **Re-deploy / update:** re-run `./deploy.sh <target> --profile <p>`. Idempotent;
+  schema changes (`server/schema.sql`) apply automatically.
+- **Teardown:** `databricks bundle destroy -t <target> --profile <p>`, then drop
+  the Delta tables and the Postgres schema separately (the bundle doesn't track them).
 
-```bash
-databricks sync . /Workspace/Users/<you>/databricks_apps/doc-translation \
-  --full --exclude __pycache__ --exclude .gitignore --exclude .venv \
-  --profile <profile>
+**Common issues:**
 
-databricks apps deploy doc-translation \
-  --source-code-path /Workspace/Users/<you>/databricks_apps/doc-translation \
-  --no-wait --profile <profile>
-```
-
----
-
-## Schema migrations
-
-The Lakebase (Postgres) schema is defined in exactly one place — **`server/schema.sql`** (idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER … ADD COLUMN IF NOT EXISTS`). Both the postdeploy job and `server/store.py` read it, so `./deploy.sh` applies any change automatically. **To add a column or table, edit `server/schema.sql` only.**
-
-To apply it manually (runs as the table owner — the SP has only INSERT/UPDATE/DELETE on the data tables):
-
-```bash
-DATABRICKS_PROFILE=<profile> \
-  LAKEBASE_PROJECT=<project> LAKEBASE_BRANCH=production \
-  PGDATABASE=databricks_postgres PGSSLMODE=require PGSCHEMA=doc_translation \
-  VOLUME_ROOT=... \
-  .venv/bin/python -c "from server import store; from server.db import pool; pool.open(wait=True); store.ensure_schema()"
-```
-
-Delta mirror tables are created by `server/delta_sync.ensure_delta_schema()` (called lazily by the SP via its SQL warehouse).
+| Symptom | Fix |
+|---|---|
+| `Invalid update mask` when re-deploying | Upgrade the Databricks CLI to v1.15+ (first deploys are unaffected). |
+| Uploads stuck on "Queued", never translate | Re-run the postdeploy step — a bare `bundle deploy` resets the file-arrival trigger; `./deploy.sh` always re-attaches it. |
+| PDF upload never finishes | Warehouse must be Serverless/Pro on DBR 17.3+ (needs `ai_parse_document`). |
+| Terraform GPG "key expired" during deploy | `export DATABRICKS_TF_EXEC_PATH=$(which terraform) DATABRICKS_TF_VERSION=1.5.7`, then re-run. |
+| Lakebase endpoint "not found" | Set `lakebase_branch` to your project's actual branch (new projects default to `production`, not `main`). |
 
 ---
 
-## Local development
-
-Requires arm64 Python (x86_64 venv breaks `cryptography`'s `_cffi_backend` import on Apple Silicon).
-
-```bash
-python3.10 -m venv .venv  # /opt/homebrew/bin/python3.10 on macOS
-.venv/bin/pip install -r requirements.txt
-
-# Terminal 1 — FastAPI backend
-DATABRICKS_PROFILE=<profile> \
-PGHOST=<endpoint-host>.database.cloud.databricks.com \
-PGPORT=5432 PGDATABASE=databricks_postgres PGSSLMODE=require \
-PGSCHEMA=doc_translation LAKEBASE_PROJECT=<project> LAKEBASE_BRANCH=production \
-VOLUME_ROOT=/Volumes/.../doc-translation \
-DATABRICKS_WAREHOUSE_ID=<warehouse-id> \
-DELTA_CATALOG=hls_amer_catalog DELTA_SCHEMA=guanyu_chen \
-.venv/bin/uvicorn server_api:app --port 8000 --reload
-
-# Terminal 2 — Vite dev server (proxies /api → localhost:8000)
-cd frontend && npm install && npm run dev   # http://localhost:5173
-```
-
-For a production-shaped local run, `./build.sh` then hit the FastAPI port directly
-(it serves the built SPA from `static/`). The legacy Streamlit UI is still runnable
-with `.venv/bin/streamlit run legacy/streamlit_app.py` against the same env vars.
-
----
-
-## What's deferred
-
-- **Paragraph/sentence-level correction learning** — semantic retrieval (Databricks Vector Search) over past (original, revised) paragraph pairs, injected as few-shot examples. Complements the term-level glossary; gated on classifying reviewer feedback as term- vs sentence-level first.
-- **PDF: text baked inside figure images** — chart axis labels etc. embedded in a bitmap stay in the source language (only the separate `caption` element is translated). Would need in-image OCR + image editing. (Core PDF support — parse, translate, review, layout-preserving export — is **built**; see "Two ingestion workflows" above.)
-- **Two-eyes / multi-reviewer attestation** before promotion
-- **AI/BI dashboards** on the Delta tables (pipeline health, review backlog, SLA breach)
-- **Lakeflow alerts** on `FAILED_TRANSLATION` / `DELTA_SYNC_FAILED` events
+Everything runs inside your Databricks workspace and Unity Catalog, governed by
+your own permissions and service principal.
