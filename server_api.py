@@ -553,15 +553,18 @@ def delete_pair(pair_id: str):
         except Exception:
             pass  # missing/already gone — best-effort
 
-    # Purge the bronze status row (DOCX) so the workspace Documents view doesn't
-    # keep a ghost. Best-effort + fail-fast so a cold warehouse can't block delete.
+    # Purge the bronze status row (DOCX) — it's the record the upload dialog reads
+    # to warn "already exists", so a leftover row makes a re-upload of a deleted
+    # doc wrongly prompt to replace. Unlike the status poll this is a deliberate,
+    # infrequent action, so give the warehouse time to wake and actually delete it
+    # (don't fail-fast) — otherwise the ghost row lingers.
     name = orig.rsplit("/", 1)[-1]
     if delta_sync.enabled() and not _is_pdf_pair(match):
         try:
             fqn = f"{delta_sync.DELTA_CATALOG}.{delta_sync.DELTA_SCHEMA}.bronze_documents"
             delta_sync._execute(
                 f"DELETE FROM {fqn} WHERE file_name = {delta_sync._esc(name)}",
-                timeout_s=8.0, wait_timeout="5s")
+                timeout_s=60.0, wait_timeout="30s")
         except Exception:
             log.warning("delete_pair: could not purge bronze row for %s", name, exc_info=True)
 

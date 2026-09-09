@@ -27,6 +27,9 @@ export function ReviewView({
   const [uploadOpen, setUploadOpen] = useState(false);
   const [retranslateOpen, setRetranslateOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  // Bumped after an upload to make the processing panel poll immediately (so a
+  // freshly-queued doc appears at once, not after the idle poll interval).
+  const [uploadTick, setUploadTick] = useState(0);
   const [pairs, setPairs] = useState<PairSummary[]>([]);
   const [detail, setDetail] = useState<PairDetail | null>(null);
   const [origHtml, setOrigHtml] = useState("");
@@ -275,7 +278,7 @@ export function ReviewView({
   return (
     <div className="space-y-4">
       {/* In-flight uploads: queued / translating docs, above the toolbar */}
-      <ProcessingPanel onSettled={loadPairs} />
+      <ProcessingPanel onSettled={loadPairs} pokeToken={uploadTick} />
 
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-3">
@@ -521,7 +524,10 @@ export function ReviewView({
         open={uploadOpen}
         onOpenChange={setUploadOpen}
         defaultTarget={defaultTarget}
-        onUploaded={loadPairs}
+        onUploaded={() => {
+          loadPairs();
+          setUploadTick((t) => t + 1); // poke the processing panel to poll now
+        }}
       />
       <DeleteDocumentDialog
         open={deleteOpen}

@@ -91,12 +91,19 @@ function DocumentRow({ doc }: { doc: ProcessingDocument }) {
  * nothing in flight, and calls `onSettled` when a document leaves the active
  * set (finished or failed) so the caller can refresh the pair list.
  */
-export function ProcessingPanel({ onSettled }: { onSettled?: () => void }) {
+export function ProcessingPanel({
+  onSettled,
+  pokeToken,
+}: {
+  onSettled?: () => void;
+  pokeToken?: number; // bump to force an immediate poll (e.g. right after an upload)
+}) {
   const [docs, setDocs] = useState<ProcessingDocument[]>([]);
   // Track the previous active file names so we can detect completions.
   const prevActive = useRef<Set<string>>(new Set());
   const onSettledRef = useRef(onSettled);
   onSettledRef.current = onSettled;
+  const pollNow = useRef<() => void>(() => {});
 
   useEffect(() => {
     let cancelled = false;
@@ -132,12 +139,31 @@ export function ProcessingPanel({ onSettled }: { onSettled?: () => void }) {
       timer = window.setTimeout(tick, hadActive ? ACTIVE_MS : IDLE_MS);
     };
 
+    // Let the parent trigger an immediate poll (clears the pending timer and
+    // re-ticks, which reschedules from now).
+    pollNow.current = () => {
+      if (cancelled) return;
+      if (timer) window.clearTimeout(timer);
+      tick();
+    };
+
     tick(); // immediately, then self-schedule
     return () => {
       cancelled = true;
       if (timer) window.clearTimeout(timer);
     };
   }, []);
+
+  // Poll immediately when the parent bumps pokeToken (right after an upload), so
+  // a freshly-queued document shows up without waiting out the idle interval.
+  const firstPoke = useRef(true);
+  useEffect(() => {
+    if (firstPoke.current) {
+      firstPoke.current = false;
+      return;
+    }
+    pollNow.current();
+  }, [pokeToken]);
 
   if (docs.length === 0) return null;
 
