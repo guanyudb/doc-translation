@@ -540,28 +540,63 @@ def delete_pair(pair_id: str):
                  "Promoted/published documents are protected.")
 
     actor = auth.reviewer()
-    orig = match["original_path"]
-    tran = match["translated_path"]
-    # Raw source + translated output + every sidecar written at upload time.
-    targets = [orig, tran,
-               f"{orig}.user", f"{orig}.lang", f"{orig}.prompt", f"{orig}.error"]
+    # Build the full set of files belonging to this document. Start from the
+    # resolved paths, but ALSO sweep the directories by pair_id — the resolved
+    # original_path can be stale/mismatched, and relying on it alone has left the
+    # real raw file behind (files.delete then 404s on the wrong path, silently).
+    orig = match.get("original_path")
+    tran = match.get("translated_path")
+    targets: set[str] = set()
+    if orig:
+        targets.update([orig, f"{orig}.user", f"{orig}.lang", f"{orig}.prompt", f"{orig}.error"])
+    if tran:
+        targets.add(tran)
+    # Authoritative sweep: the raw file + sidecars actually named after this pair.
+    try:
+        for f in volume.list_ext(config.RAW_DIR,
+                                 (".docx", ".pdf", ".user", ".lang", ".prompt", ".error")):
+            n = f["name"]
+            if n in (f"{pair_id}.docx", f"{pair_id}.pdf") \
+               or n.startswith(f"{pair_id}.docx.") or n.startswith(f"{pair_id}.pdf."):
+                targets.add(f"{config.RAW_DIR}/{n}")
+    except Exception:
+        log.warning("delete_pair: could not sweep raw dir for %s", pair_id, exc_info=True)
+    # Translated outputs for this stem (docx: <stem>_translated_<lang>.docx; pdf: <stem>.pdf.json).
+    try:
+        for f in volume.list_ext(config.TRANSLATED_DIR, (".docx", ".json")):
+            n = f["name"]
+            if n.startswith(f"{pair_id}_translated_") or n == f"{pair_id}.pdf.json":
+                targets.add(f"{config.TRANSLATED_DIR}/{n}")
+    except Exception:
+        log.warning("delete_pair: could not sweep translated dir for %s", pair_id, exc_info=True)
+
     deleted_files: list[str] = []
-    for p in targets:
+    failed_files: list[str] = []
+    for p in sorted(targets):
         try:
             config.w().files.delete(p)
             deleted_files.append(p)
-        except Exception:
-            pass  # missing/already gone — best-effort
+        except Exception as e:
+            msg = str(e)
+            # A genuinely-absent file is fine; anything else is a real failure to
+            # surface (silently swallowing it left orphaned raw files behind).
+            if any(s in msg for s in ("NOT_FOUND", "does not exist", "RESOURCE_DOES_NOT_EXIST", "404")):
+                continue
+            failed_files.append(p)
+            log.warning("delete_pair: could not delete %s: %s", p, e)
 
-    # Purge the bronze status row (DOCX) so the workspace Documents view doesn't
-    # keep a ghost. Best-effort + fail-fast so a cold warehouse can't block delete.
-    name = orig.rsplit("/", 1)[-1]
+    # Purge the bronze status row (DOCX) — it's the record the upload dialog reads
+    # to warn "already exists", so a leftover row makes a re-upload of a deleted
+    # doc wrongly prompt to replace. Unlike the status poll this is a deliberate,
+    # infrequent action, so give the warehouse time to wake and actually delete it
+    # (don't fail-fast) — otherwise the ghost row lingers.
+    name = f"{pair_id}.docx"
     if delta_sync.enabled() and not _is_pdf_pair(match):
         try:
             fqn = f"{delta_sync.DELTA_CATALOG}.{delta_sync.DELTA_SCHEMA}.bronze_documents"
             delta_sync._execute(
                 f"DELETE FROM {fqn} WHERE file_name = {delta_sync._esc(name)}",
-                timeout_s=8.0, wait_timeout="5s")
+                timeout_s=60.0, wait_timeout="30s")
         except Exception:
             log.warning("delete_pair: could not purge bronze row for %s", name, exc_info=True)
 
@@ -590,7 +625,11 @@ def delete_pair(pair_id: str):
     _tb_cache = None
     _pdf_artifact_path.pop(pair_id, None)
 
-    return {"pair_id": pair_id, "files_deleted": deleted_files, "state_rows": counts}
+    if failed_files:
+        log.error("delete_pair: %d file(s) could not be deleted for %s: %s",
+                  len(failed_files), pair_id, failed_files)
+    return {"pair_id": pair_id, "files_deleted": deleted_files,
+            "files_failed": failed_files, "state_rows": counts}
 
 
 def _pipeline_job_id_for_deployment() -> int | None:

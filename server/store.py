@@ -262,7 +262,10 @@ def upsert_feedback(pair_id: str, paragraph_idx: int, status: str | None,
                 VALUES (%s, %s, COALESCE(%s, 'pending'), %s, %s, now())
                 ON CONFLICT (pair_id, paragraph_idx) DO UPDATE SET
                     status     = COALESCE(EXCLUDED.status, {config.PGSCHEMA}.review_feedback.status),
-                    comment    = EXCLUDED.comment,
+                    -- Preserve the existing comment when this call isn't setting one
+                    -- (a status-only change passes comment=NULL). Passing an empty
+                    -- string still clears it, so the comment editor can blank it.
+                    comment    = COALESCE(EXCLUDED.comment, {config.PGSCHEMA}.review_feedback.comment),
                     reviewer   = EXCLUDED.reviewer,
                     updated_at = now()
                 RETURNING paragraph_idx, status, comment, reviewer, updated_at

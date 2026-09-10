@@ -207,13 +207,23 @@ def render(docx_bytes: bytes) -> tuple[str, list[dict]]:
     return stamped, [{"idx": p.idx, "text": p.text, "page": p.page} for p in paragraphs]
 
 
+# Inline formatting tags mammoth emits (bold/italic/etc.). When an edited
+# paragraph is uniformly wrapped in these (e.g. a bold sub-heading), we re-wrap
+# the edited text in the same tags so it keeps its weight/style instead of
+# rendering as unstyled text — which reads as a "font change".
+_INLINE_FMT_TAGS = {"strong", "b", "em", "i", "u", "s", "sup", "sub", "span", "mark", "small"}
+
+
 def apply_edits_overlay(html_str: str, edits: dict[int, str]) -> str:
     """Render-time overlay: replace inner content of `[data-pidx="N"]` hosts with
     the reviewer's edited text, leaving all other paragraphs (and outer formatting)
     untouched. Adds `data-edited="1"` so the frontend can show an "edited" pill.
 
-    Edits are treated as plain text — any intra-paragraph formatting on the
-    original is intentionally dropped for edited paragraphs only."""
+    The edited text preserves the inline-format wrapper the paragraph STARTS with
+    (e.g. a whole-paragraph <strong>) so it keeps the same weight/style — mirroring
+    apply_edits_to_docx, which reuses the first run's properties. A paragraph that
+    begins with plain text has no uniform wrapper, so its edit renders as plain
+    text (mixed intra-paragraph formatting is intentionally dropped)."""
     if not edits or not html_str.strip():
         return html_str
 
@@ -228,9 +238,31 @@ def apply_edits_overlay(html_str: str, edits: dict[int, str]) -> str:
             continue
         if idx not in edits:
             continue
+        # Capture the chain of inline-format tags the paragraph leads with (only
+        # when it starts with formatting, not plain text — that's the uniform case).
+        wrapper: list[tuple[str, dict]] = []
+        node = el
+        while node.text is None or not node.text.strip():
+            child = next((c for c in node if isinstance(c.tag, str)
+                          and c.tag.lower() in _INLINE_FMT_TAGS), None)
+            if child is None:
+                break
+            wrapper.append((child.tag, dict(child.attrib)))
+            node = child
         for child in list(el):
             el.remove(child)
-        el.text = edits[idx]
+        el.text = None
+        if wrapper:
+            host = el
+            for tag, attrib in wrapper:
+                sub = host.makeelement(tag)
+                for k, v in attrib.items():
+                    sub.set(k, v)
+                host.append(sub)
+                host = sub
+            host.text = edits[idx]
+        else:
+            el.text = edits[idx]
         el.set("data-edited", "1")
 
     return "".join(lxml_html.tostring(c, encoding="unicode") for c in fragment)
