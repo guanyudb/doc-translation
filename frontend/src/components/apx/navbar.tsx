@@ -2,7 +2,7 @@ import { Languages } from "lucide-react";
 import { ModeToggle } from "@/components/apx/mode-toggle";
 import { cn } from "@/lib/utils";
 
-export type Tab = "review" | "glossary" | "instructions" | "audit" | "settings";
+export type Tab = "review" | "documents" | "glossary" | "instructions" | "audit" | "settings";
 
 export function Navbar({
   active,
@@ -29,6 +29,7 @@ export function Navbar({
 }) {
   const tabs: { id: Tab; label: string }[] = [
     { id: "review", label: "Review" },
+    { id: "documents", label: "Documents" },
     { id: "glossary", label: "Glossary" },
     { id: "instructions", label: "Instructions" },
     { id: "audit", label: "Audit" },
