@@ -485,7 +485,12 @@ def _build_glossary_automaton():
     try:
         rows = (
             spark.read.table(glossary_delta_table)
-            .where("approved = true AND target_lang = '%s'" % target_lang_code)
+            # target_lang is stored inconsistently across glossary sources — seed
+            # rows use a language code ('en'), mined/customer rows use the language
+            # name ('english', from review_pairs). Match BOTH forms so DOCX and PDF
+            # inject the same glossary subset (otherwise each silently drops half).
+            .where("approved = true AND lower(target_lang) IN (%s)"
+                   % ", ".join("'%s'" % l for l in sorted({target_lang_code.lower(), target_language.lower()})))
             .select("model_phrase", "correction")
             .collect()
         )

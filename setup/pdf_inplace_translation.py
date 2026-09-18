@@ -177,21 +177,48 @@ def detect_lang(texts: list) -> str:
 
 # COMMAND ----------
 
-def load_glossary(target_lang_code: str) -> list:
+# Same map the DOCX notebook uses — glossary target_lang is stored inconsistently
+# (seed rows as a code 'en', mined/customer rows as the name 'english'), so we
+# match BOTH forms below to keep DOCX and PDF injecting the same subset.
+_LANG_NAME_TO_CODE = {
+    "english": "en", "spanish": "es", "french": "fr", "german": "de",
+    "italian": "it", "portuguese": "pt", "dutch": "nl", "russian": "ru",
+    "polish": "pl", "turkish": "tr", "arabic": "ar", "hindi": "hi",
+    "thai": "th", "vietnamese": "vi", "indonesian": "id", "malay": "ms",
+    "japanese": "ja", "korean": "ko", "chinese": "zh-cn",
+    "simplified chinese": "zh-cn", "traditional chinese": "zh-tw",
+}
+
+
+def _lang_match_forms(lang: str) -> list:
+    """Both forms a target language might be stored as: the name AND the code."""
+    l = (lang or "").strip().lower()
+    if not l:
+        return []
+    code = _LANG_NAME_TO_CODE.get(l, l[:2])
+    return sorted({l, code})
+
+
+def load_glossary(target_lang: str) -> list:
     """Approved (model_phrase, correction) pairs for this target language, read
-    from the glossary Delta mirror. Best-effort — glossary injection is optional."""
+    from the glossary Delta mirror. Matches both the language name and its code
+    (see _LANG_NAME_TO_CODE). Best-effort — glossary injection is optional."""
     if not glossary_delta_table:
         return []
+    forms = _lang_match_forms(target_lang)
+    if not forms:
+        return []
+    in_list = ", ".join("'%s'" % f.replace("'", "''") for f in forms)
     try:
         rows = (
             spark.read.table(glossary_delta_table)
             .where("approved = true")
-            .where(f"lower(target_lang) = lower('{(target_lang_code or '').replace(chr(39), '')}')")
+            .where(f"lower(target_lang) IN ({in_list})")
             .select("model_phrase", "correction")
             .collect()
         )
         pairs = [(r["model_phrase"], r["correction"]) for r in rows if (r["model_phrase"] or "").strip()]
-        print(f"[glossary] {len(pairs)} approved terms for target={target_lang_code}")
+        print(f"[glossary] {len(pairs)} approved terms for target={target_lang} (matched {forms})")
         return pairs
     except Exception as ex:
         print(f"[glossary] skipped ({ex})")
