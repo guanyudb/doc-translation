@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ThemeProvider } from "@/components/apx/theme-provider";
 import { Navbar, Tab } from "@/components/apx/navbar";
 import { ReviewView } from "@/components/review/ReviewView";
+import { DocumentsView } from "@/components/documents/DocumentsView";
 import { GlossaryView } from "@/components/glossary/GlossaryView";
 import { InstructionsView } from "@/components/instructions/InstructionsView";
 import { AuditView } from "@/components/audit/AuditView";
@@ -64,6 +65,15 @@ export default function App() {
                   onOpenAudit={(id) => {
                     setActivePair(id);
                     setTab("audit");
+                  }}
+                />
+              )}
+              {tab === "documents" && (
+                <DocumentsView
+                  isAdmin={cfg?.is_admin ?? false}
+                  onOpen={(id) => {
+                    setActivePair(id);
+                    setTab("review");
                   }}
                 />
               )}
