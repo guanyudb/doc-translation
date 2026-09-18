@@ -149,10 +149,50 @@ Per-workspace values live in `.databricks/bundle/<target>/variable-overrides.jso
 
 ## Operations
 
-- **Re-deploy / update:** re-run `./deploy.sh <target> --profile <p>`. Idempotent;
-  schema changes (`server/schema.sql`) apply automatically.
-- **Teardown:** `databricks bundle destroy -t <target> --profile <p>`, then drop
-  the Delta tables and the Postgres schema separately (the bundle doesn't track them).
+### Updating a deployed app (after changes land on `main`)
+
+When new code is merged to `main`, redeploy with the same single command from a
+clean, up-to-date clone:
+
+```bash
+git checkout main && git pull
+./deploy.sh <target> --profile <p>      # e.g. ./deploy.sh prod --profile <profile>
+```
+
+`./deploy.sh` is **idempotent** and safe to re-run. Each run:
+- rebuilds the React SPA into `static/` (only when the frontend changed; `FORCE_BUILD=1` forces it),
+- re-seeds config secrets from your `variable-overrides.json`,
+- `bundle deploy` — updates the app + jobs,
+- re-runs **postdeploy** — applies any additive schema migrations and, importantly,
+  **re-attaches the file-arrival trigger** that a bare `bundle deploy` wipes,
+- pushes the new app source and restarts the app (~30s; no data involved).
+
+Re-deploys require **Databricks CLI v1.15+** (older versions fail the app update
+with `Invalid update mask`).
+
+### Does a redeploy change your data? — No.
+
+A redeploy updates **code and configuration only** — your data is preserved:
+
+| Data | On redeploy |
+|---|---|
+| **Documents** — UC Volume (raw / translated / golden files) | **Untouched.** A deploy never deletes or overwrites Volume contents. |
+| **Review state** — Lakebase Postgres (pairs, certifications, edits, comments, glossary, prompts) | **Preserved.** Schema changes are **additive only** (`CREATE TABLE IF NOT EXISTS`, `ALTER … ADD COLUMN IF NOT EXISTS`) — new columns/tables are added; existing rows are never dropped or reset. |
+| **Audit + publication archive** — Delta (`audit_events`, `golden_publications`, `bronze_documents`) | **Untouched** (append-only). |
+| **Config secrets** | Re-seeded from your overrides — configuration, not data. |
+
+So you can redeploy as often as you like without losing documents, review
+progress, the glossary/prompt libraries, or the audit trail.
+
+The only things that **remove** data are **never** part of a redeploy:
+- **`bundle destroy`** (teardown, below) — removes the app, jobs, and the UC schema/volume.
+- The in-app admin **Delete** action — permanently removes one chosen document (an explicit, audited user action).
+
+### Teardown
+
+`databricks bundle destroy -t <target> --profile <p>`, then drop the Delta tables
+and the Postgres schema separately (the bundle doesn't track them). This is
+destructive — it removes the app **and its data**.
 
 **Common issues:**
 
