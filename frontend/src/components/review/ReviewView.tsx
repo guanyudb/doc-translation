@@ -428,6 +428,11 @@ export function ReviewView({
             </span>
             <span>·</span>
             <span>{progress.total} paragraphs</span>
+            {detail.total_words != null && (
+              <span title="Approximate word count of the translated document">
+                · ~{detail.total_words.toLocaleString()} words
+              </span>
+            )}
             <span className="text-emerald-600">✓ {progress.certified} certified</span>
             <span className="text-rose-600">⚑ {progress.flagged} flagged</span>
             <span>◦ {progress.pending} not yet reviewed</span>

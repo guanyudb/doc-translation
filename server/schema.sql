@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS {schema}.review_pairs (
     source_lang      TEXT,
     target_lang      TEXT,
     total_paragraphs INT,
+    total_words      INT,
     created_at       TIMESTAMPTZ DEFAULT now(),
     finalized_at     TIMESTAMPTZ,
     lifecycle_state  TEXT NOT NULL DEFAULT 'UNDER_REVIEW'
@@ -155,6 +156,7 @@ ALTER TABLE {schema}.review_pairs ADD COLUMN IF NOT EXISTS original_hash TEXT;
 ALTER TABLE {schema}.review_pairs ADD COLUMN IF NOT EXISTS translated_hash TEXT;
 ALTER TABLE {schema}.review_pairs ADD COLUMN IF NOT EXISTS source_lang TEXT;
 ALTER TABLE {schema}.review_pairs ADD COLUMN IF NOT EXISTS locked_at TIMESTAMPTZ;
+ALTER TABLE {schema}.review_pairs ADD COLUMN IF NOT EXISTS total_words INT;
 DO $do$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'review_pairs_lifecycle_chk') THEN
         ALTER TABLE {schema}.review_pairs

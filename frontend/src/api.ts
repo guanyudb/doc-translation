@@ -11,6 +11,7 @@ export interface PairSummary {
   source_lang: string | null;
   target_lang: string | null;
   total_paragraphs: number;
+  total_words: number | null;
   lifecycle_state: Lifecycle;
   locked: boolean;
   certified: number;
@@ -37,6 +38,8 @@ export interface PairDetail {
   translated_path: string;
   source_lang: string | null;
   target_lang: string | null;
+  total_paragraphs: number;
+  total_words: number | null;
   lifecycle_state: Lifecycle;
   locked: boolean;
   paragraphs: Paragraph[];

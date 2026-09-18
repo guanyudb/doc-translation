@@ -132,11 +132,11 @@ def upsert_pair(p: dict) -> None:
             cur.execute(f"""
                 INSERT INTO {config.PGSCHEMA}.review_pairs
                     (pair_id, original_path, translated_path, target_lang,
-                     source_lang, total_paragraphs,
+                     source_lang, total_paragraphs, total_words,
                      original_hash, translated_hash)
                 VALUES (%(pair_id)s, %(original_path)s, %(translated_path)s,
                         %(target_lang)s, %(source_lang)s, %(total_paragraphs)s,
-                        %(original_hash)s, %(translated_hash)s)
+                        %(total_words)s, %(original_hash)s, %(translated_hash)s)
                 ON CONFLICT (pair_id) DO UPDATE SET
                     original_path    = EXCLUDED.original_path,
                     translated_path  = EXCLUDED.translated_path,
@@ -145,6 +145,8 @@ def upsert_pair(p: dict) -> None:
                                                 {config.PGSCHEMA}.review_pairs.source_lang),
                     total_paragraphs = COALESCE(EXCLUDED.total_paragraphs,
                                                 {config.PGSCHEMA}.review_pairs.total_paragraphs),
+                    total_words      = COALESCE(EXCLUDED.total_words,
+                                                {config.PGSCHEMA}.review_pairs.total_words),
                     original_hash    = COALESCE(EXCLUDED.original_hash,
                                                 {config.PGSCHEMA}.review_pairs.original_hash),
                     translated_hash  = COALESCE(EXCLUDED.translated_hash,
@@ -156,6 +158,7 @@ def upsert_pair(p: dict) -> None:
                 "target_lang":      p.get("target_lang"),
                 "source_lang":      p.get("source_lang"),
                 "total_paragraphs": p.get("total_paragraphs"),
+                "total_words":      p.get("total_words"),
                 "original_hash":    p.get("original_hash"),
                 "translated_hash":  p.get("translated_hash"),
             })
@@ -179,7 +182,7 @@ def list_pairs_with_progress() -> list[dict]:
             cur.execute(f"""
                 SELECT
                     p.pair_id, p.original_path, p.translated_path,
-                    p.target_lang, p.source_lang, p.total_paragraphs,
+                    p.target_lang, p.source_lang, p.total_paragraphs, p.total_words,
                     p.created_at, p.finalized_at,
                     p.lifecycle_state, p.locked_at,
                     COALESCE(SUM(CASE WHEN f.status='certified' THEN 1 ELSE 0 END), 0) AS certified,
@@ -200,7 +203,7 @@ def get_pair(pair_id: str) -> dict | None:
         with conn.cursor() as cur:
             cur.execute(f"""
                 SELECT pair_id, original_path, translated_path,
-                       target_lang, source_lang, total_paragraphs,
+                       target_lang, source_lang, total_paragraphs, total_words,
                        created_at, finalized_at, lifecycle_state, locked_at,
                        original_hash, translated_hash
                 FROM {config.PGSCHEMA}.review_pairs

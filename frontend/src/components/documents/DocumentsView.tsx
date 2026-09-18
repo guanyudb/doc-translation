@@ -6,7 +6,7 @@ import { Select } from "@/components/ui/input";
 import { api, PairSummary } from "@/api";
 
 // Sortable columns. `progress` sorts by certified fraction.
-type SortKey = "name" | "langs" | "status" | "progress" | "flagged";
+type SortKey = "name" | "langs" | "status" | "words" | "progress" | "flagged";
 
 const pct = (n: number, total: number) => (total ? Math.round((n / total) * 100) : 0);
 const langOf = (p: PairSummary) => `${p.source_lang ?? "?"} → ${p.target_lang ?? "?"}`;
@@ -61,6 +61,7 @@ export function DocumentsView({
       switch (sort.key) {
         case "langs": return langOf(p);
         case "status": return p.lifecycle_state;
+        case "words": return p.total_words ?? -1;
         case "progress": return p.total_paragraphs ? p.certified / p.total_paragraphs : 0;
         case "flagged": return p.flagged;
         default: return p.pair_id.toLowerCase();
@@ -154,6 +155,7 @@ export function DocumentsView({
                 <SortHeader col="name" label="Document" />
                 <SortHeader col="langs" label="Languages" />
                 <SortHeader col="status" label="Status" />
+                <SortHeader col="words" label="Words" right />
                 <SortHeader col="progress" label="Certified" />
                 <SortHeader col="flagged" label="Flagged" right />
                 {isAdmin && <th className="w-10 px-3 py-2" />}
@@ -170,6 +172,9 @@ export function DocumentsView({
                   <td className="px-3 py-2 text-xs text-muted-foreground">{langOf(p)}</td>
                   <td className="px-3 py-2">
                     <Badge className={`status-${p.lifecycle_state.toLowerCase()}`}>{p.lifecycle_state}</Badge>
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-xs text-muted-foreground" title="Approximate word count of the translated document (available once opened)">
+                    {p.total_words != null ? p.total_words.toLocaleString() : "—"}
                   </td>
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-2">
