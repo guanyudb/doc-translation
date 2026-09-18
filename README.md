@@ -180,10 +180,12 @@ A redeploy updates **code and configuration only** — your data is preserved:
 | **Documents** — UC Volume (raw / translated / golden files) | **Untouched.** A deploy never deletes or overwrites Volume contents. |
 | **Review state** — Lakebase Postgres (pairs, certifications, edits, comments, glossary, prompts) | **Preserved.** Schema changes are **additive only** (`CREATE TABLE IF NOT EXISTS`, `ALTER … ADD COLUMN IF NOT EXISTS`) — new columns/tables are added; existing rows are never dropped or reset. |
 | **Audit + publication archive** — Delta (`audit_events`, `golden_publications`, `bronze_documents`) | **Untouched** (append-only). |
-| **Config secrets** | Re-seeded from your overrides — configuration, not data. |
+| **In-app Settings** — model endpoint, target language, branding (`config/settings.json` on the Volume) | **Preserved.** Stored on the Volume and re-read after the app restarts; your saved values override the deploy-time defaults, so **you never re-enter Settings after a redeploy**. |
+| **Config secrets / bundle variables** | Re-seeded from your `variable-overrides.json` — these are the deploy-time *defaults/fallbacks* (the in-app Settings above take precedence over them). Config, not data. |
 
 So you can redeploy as often as you like without losing documents, review
-progress, the glossary/prompt libraries, or the audit trail.
+progress, the glossary/prompt libraries, the audit trail, or your Settings —
+and reviewers won't be sent back through first-run setup.
 
 The only things that **remove** data are **never** part of a redeploy:
 - **`bundle destroy`** (teardown, below) — removes the app, jobs, and the UC schema/volume.
