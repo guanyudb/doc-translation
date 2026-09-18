@@ -68,6 +68,7 @@ export function GlossaryView({ deltaSyncEnabled }: { deltaSyncEnabled: boolean }
 
   const conflictCount = useMemo(() => entries.filter((e) => e.conflict).length, [entries]);
   const approvedCount = useMemo(() => entries.filter((e) => e.approved).length, [entries]);
+  const pendingCount = useMemo(() => entries.filter((e) => !e.approved).length, [entries]);
   const filtering = Boolean(search || langFilter);
 
   const matches = (e: GlossaryEntry) => {
@@ -149,7 +150,10 @@ export function GlossaryView({ deltaSyncEnabled }: { deltaSyncEnabled: boolean }
         </Button>
         <Button
           variant="outline" size="sm" disabled={busy !== null}
-          onClick={() => run("mine", async () => `Mined ${(await api.mineGlossary()).mined} entries from reviewer edits.`)}
+          onClick={() => run("mine", async () => {
+            const n = (await api.mineGlossary()).mined;
+            return `Mined ${n} candidate term${n === 1 ? "" : "s"} from reviewer edits — review and approve them below to activate.`;
+          })}
         >
           {busy === "mine" ? <Loader2 className="animate-spin" /> : <Pickaxe />} Mine from edits
         </Button>
@@ -168,13 +172,18 @@ export function GlossaryView({ deltaSyncEnabled }: { deltaSyncEnabled: boolean }
       {/* ---- summary chips ---- */}
       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
         <Badge variant="outline">{approvedCount} approved term{approvedCount === 1 ? "" : "s"} active</Badge>
+        {pendingCount > 0 && (
+          <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400" title="Mined/unapproved terms — they do NOT affect translations until you approve them">
+            {pendingCount} awaiting review
+          </Badge>
+        )}
         <Badge variant="outline">{lists.length} list{lists.length === 1 ? "" : "s"}</Badge>
         {conflictCount > 0 && (
           <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400">
             <AlertTriangle className="mr-1 size-3" /> {conflictCount} conflicting term{conflictCount === 1 ? "" : "s"}
           </Badge>
         )}
-        <span>Approved terms are injected into the translation prompt. Remember to <b>Sync to Delta</b> after changes.</span>
+        <span>Only <b>approved</b> terms are injected into the translation prompt — mined terms start unapproved and never affect translations until a reviewer approves them. Remember to <b>Sync to Delta</b> after changes.</span>
       </div>
 
       {msg && <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm">{msg}</div>}
