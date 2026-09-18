@@ -44,8 +44,11 @@ def mine_glossary(
     source_lang: str | None = None,
     target_lang: str | None = None,
 ) -> int:
-    """Scan review_edit_history → upsert into translation_glossary. Returns
-    the number of distinct (model_phrase, correction) pairs touched.
+    """Scan review_edit_history → upsert into translation_glossary. Returns the
+    number of **new** candidate pairs inserted this pass — existing rows that were
+    merely re-mined (their counts refreshed) are NOT counted, so the caller's
+    "N terms to review" reflects what's genuinely new, not re-mines of terms a
+    reviewer already approved.
 
     Mined entries land **unapproved** (`approved = FALSE`): they are candidates
     that a human must explicitly approve in the Glossary tab before they are
@@ -110,11 +113,14 @@ def mine_glossary(
                     occurrences        = EXCLUDED.occurrences,
                     distinct_reviewers = EXCLUDED.distinct_reviewers,
                     last_seen_at       = EXCLUDED.last_seen_at
-                RETURNING entry_id
+                RETURNING (xmax = 0) AS inserted
             """, (MIN_OCCURRENCES, MIN_DISTINCT_REVIEWERS))
             rows = cur.fetchall()
         conn.commit()
-    return len(rows)
+    # In an upsert's RETURNING, `xmax = 0` marks a freshly-INSERTED row; a
+    # conflict-UPDATE (re-mine of an existing entry) has xmax != 0. Count only new
+    # inserts so the count is "new candidates to review", not rows merely touched.
+    return sum(1 for (inserted,) in rows if inserted)
 
 
 def list_glossary(

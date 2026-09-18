@@ -285,12 +285,14 @@ export const api = {
       j<{ lists: GlossaryList[]; conflict_count: number }>
     ),
 
+  // `synced` reflects whether the change was pushed to the Delta mirror the
+  // translation job reads (auto-sync on approval; false if the warehouse was down).
   approveGlossary: (id: number, approved: boolean) =>
     fetch(`/api/glossary/${id}/approve`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ approved }),
-    }).then(j<GlossaryEntry>),
+    }).then(j<GlossaryEntry & { synced?: boolean }>),
 
   // Approve/unapprove many at once — by explicit ids or a whole list.
   approveGlossaryBatch: (opts: { approved: boolean; entry_ids?: number[]; list_name?: string }) =>
@@ -298,7 +300,7 @@ export const api = {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(opts),
-    }).then(j<{ updated: number }>),
+    }).then(j<{ updated: number; synced?: boolean }>),
 
   deleteGlossaryList: (name: string) =>
     fetch(`/api/glossary/lists/${encodeURIComponent(name)}`, { method: "DELETE" }).then(
