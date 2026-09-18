@@ -26,11 +26,13 @@ from __future__ import annotations
 import csv
 import io
 from . import config
+from . import store
 from .db import pool
 
 
-# Mining thresholds — tunable. Defaults err on the side of inclusion since the
-# glossary table has an `approved` flag for manual gating later if needed.
+# Mining thresholds — tunable. Defaults err on the side of inclusion because
+# mined entries land UNAPPROVED (pending human review, see mine_glossary) — the
+# `approved` flag is the gate, so a low bar here just surfaces candidates.
 MIN_OCCURRENCES        = 2     # show up at least twice across history
 MIN_DISTINCT_REVIEWERS = 1     # at least 1 distinct reviewer (can bump to 2 later)
 MAX_PHRASE_LEN         = 200   # ignore long paragraph edits
@@ -44,6 +46,13 @@ def mine_glossary(
 ) -> int:
     """Scan review_edit_history → upsert into translation_glossary. Returns
     the number of distinct (model_phrase, correction) pairs touched.
+
+    Mined entries land **unapproved** (`approved = FALSE`): they are candidates
+    that a human must explicitly approve in the Glossary tab before they are
+    injected into any translation. This is the approval gate — the learning
+    loop proposes, a person decides. Re-mining an entry a human already approved
+    leaves its `approved` state untouched (the ON CONFLICT clause below doesn't
+    write `approved`), so approvals are never silently reverted.
 
     Idempotent: re-running just updates `occurrences`, `distinct_reviewers`,
     and `last_seen_at` for existing rows."""
@@ -95,7 +104,7 @@ def mine_glossary(
                     (source_lang, target_lang, model_phrase, correction,
                      occurrences, distinct_reviewers, last_seen_at, approved, source, list_name)
                 SELECT source_lang, target_lang, model_phrase, correction,
-                       occurrences, distinct_reviewers, last_seen_at, TRUE, 'tenant', 'Mined from reviews'
+                       occurrences, distinct_reviewers, last_seen_at, FALSE, 'tenant', 'Mined from reviews'
                 FROM agg
                 ON CONFLICT (source_lang, target_lang, model_phrase, correction) DO UPDATE SET
                     occurrences        = EXCLUDED.occurrences,
@@ -216,8 +225,9 @@ def ingest_glossary_csv(
     return ingest_glossary_rows(list(reader), source=source, approved=approved, list_name=list_name)
 
 
-def toggle_approval(entry_id: int, approved: bool) -> None:
-    """Manual override for any glossary entry."""
+def toggle_approval(entry_id: int, approved: bool, *, actor: str = "system") -> None:
+    """Manual override for any glossary entry. Approving a term changes what the
+    translation model is told, so the action is audited in the same transaction."""
     s = config.PGSCHEMA
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -225,13 +235,18 @@ def toggle_approval(entry_id: int, approved: bool) -> None:
                 f"UPDATE {s}.translation_glossary SET approved = %s WHERE entry_id = %s",
                 (approved, entry_id),
             )
+            store._emit_audit(cur, pair_id=None,
+                              event_type=store.EventType.GLOSSARY_APPROVAL_CHANGED,
+                              actor=actor, after={"entry_id": entry_id, "approved": approved})
         conn.commit()
 
 
 def set_approval_batch(*, entry_ids: list[int] | None = None,
-                       list_name: str | None = None, approved: bool) -> int:
+                       list_name: str | None = None, approved: bool,
+                       actor: str = "system") -> int:
     """Approve/unapprove many entries at once — by explicit ids or by list.
-    Returns the number of rows updated."""
+    Returns the number of rows updated. Audited in the same transaction, since
+    approval controls what terminology reaches the translation prompt."""
     s = config.PGSCHEMA
     if list_name is not None:
         where, param = "list_name = %s", list_name
@@ -246,6 +261,11 @@ def set_approval_batch(*, entry_ids: list[int] | None = None,
                 (approved, param),
             )
             n = cur.rowcount
+            store._emit_audit(cur, pair_id=None,
+                              event_type=store.EventType.GLOSSARY_APPROVAL_CHANGED,
+                              actor=actor,
+                              after={"approved": approved, "rows": n,
+                                     "list_name": list_name, "entry_ids": entry_ids})
         conn.commit()
     return n
 

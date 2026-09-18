@@ -1453,7 +1453,8 @@ def glossary_approve_batch(
     list_name: str | None = Body(None, embed=True),
 ):
     """Approve/unapprove many entries at once — by explicit ids or a whole list."""
-    n = glossary_mod.set_approval_batch(entry_ids=entry_ids, list_name=list_name, approved=approved)
+    n = glossary_mod.set_approval_batch(entry_ids=entry_ids, list_name=list_name,
+                                        approved=approved, actor=auth.reviewer())
     return {"updated": n}
 
 
@@ -1472,7 +1473,7 @@ def glossary_rename_list(name: str, new_name: str = Body(..., embed=True)):
 
 @app.post("/api/glossary/{entry_id}/approve")
 def glossary_approve(entry_id: int, approved: bool = Body(..., embed=True)):
-    glossary_mod.toggle_approval(entry_id, approved)
+    glossary_mod.toggle_approval(entry_id, approved, actor=auth.reviewer())
     entries = {e["entry_id"]: e for e in glossary_mod.list_glossary(approved_only=False, limit=5000)}
     e = entries.get(entry_id)
     if not e:
