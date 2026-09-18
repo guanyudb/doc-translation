@@ -164,6 +164,15 @@ def _render(path: str) -> tuple[str, list[dict]]:
     return out
 
 
+def _word_count(paras: list[dict]) -> int:
+    """Approximate word count across paragraph texts — whitespace-delimited
+    tokens summed over paragraphs. A document-size indicator for the review
+    header and Documents tab, not an exact linguistic metric (whitespace
+    tokenization undercounts CJK scripts, which is why we count the TARGET side,
+    typically a space-delimited language, at the call site)."""
+    return sum(len((p.get("text") or "").split()) for p in paras)
+
+
 def _list_pairs() -> list[dict]:
     # The Files API can blip; a transient listing failure shouldn't 500 the
     # whole pairs endpoint — degrade to whatever we can list.
@@ -463,6 +472,7 @@ def list_pairs():
             "source_lang": src,
             "target_lang": p.get("target_lang") or d.get("target_lang"),
             "total_paragraphs": total,
+            "total_words": (int(d["total_words"]) if d.get("total_words") is not None else None),
             "lifecycle_state": d.get("lifecycle_state") or "UNDER_REVIEW",
             "locked": (d.get("lifecycle_state") in ("PUBLISHED", "PROMOTING", "ARCHIVED")),
             "certified": cert,
@@ -479,6 +489,9 @@ def get_pair_detail(pair_id: str):
     tran_html, tran_paras = _render(match["translated_path"])
     source_lang = docx_render.detect_lang(orig_paras)
     total = max(len(orig_paras), len(tran_paras))
+    # Count the TARGET side (the reviewed artifact, usually a space-delimited
+    # language); fall back to the source if the translation is somehow empty.
+    total_words = _word_count(tran_paras) or _word_count(orig_paras)
 
     store.upsert_pair({
         "pair_id": pair_id,
@@ -487,6 +500,7 @@ def get_pair_detail(pair_id: str):
         "target_lang": match["target_lang"],
         "source_lang": source_lang,  # persist the detected source so /api/pairs (Documents tab) shows it, not "?"
         "total_paragraphs": total,
+        "total_words": total_words,  # persist so /api/pairs (Documents tab) can show it without re-rendering
     })
 
     fb = {r["paragraph_idx"]: r for r in store.get_feedback(pair_id)}
@@ -518,6 +532,8 @@ def get_pair_detail(pair_id: str):
         "translated_path": match["translated_path"],
         "source_lang": source_lang,
         "target_lang": match["target_lang"],
+        "total_paragraphs": total,
+        "total_words": total_words,
         "lifecycle_state": (store.get_pair(pair_id) or {}).get("lifecycle_state", "UNDER_REVIEW"),
         "locked": locked,
         "paragraphs": paragraphs,
