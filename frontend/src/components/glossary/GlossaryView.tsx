@@ -91,14 +91,16 @@ export function GlossaryView({ deltaSyncEnabled }: { deltaSyncEnabled: boolean }
     const allApproved = es.every((e) => e.approved);
     run(`list-${name}`, async () => {
       const r = await api.approveGlossaryBatch({ list_name: name, approved: !allApproved });
-      return `${!allApproved ? "Approved" : "Unapproved"} ${r.updated} entries in "${name}".`;
+      const tail = r.synced ? "Synced to production." : "⚠ Not synced yet — run Sync to Delta.";
+      return `${!allApproved ? "Approved" : "Unapproved"} ${r.updated} entries in "${name}". ${tail}`;
     });
   };
 
   const toggleEntry = (e: GlossaryEntry) =>
     run(`e-${e.entry_id}`, async () => {
-      await api.approveGlossary(e.entry_id, !e.approved);
-      return e.approved ? "Entry unapproved." : "Entry approved.";
+      const r = await api.approveGlossary(e.entry_id, !e.approved);
+      const tail = r.synced ? "Synced to production." : "⚠ Not synced yet — run Sync to Delta.";
+      return `${e.approved ? "Entry unapproved." : "Entry approved."} ${tail}`;
     });
 
   const doDelete = (name: string) => {
@@ -152,7 +154,9 @@ export function GlossaryView({ deltaSyncEnabled }: { deltaSyncEnabled: boolean }
           variant="outline" size="sm" disabled={busy !== null}
           onClick={() => run("mine", async () => {
             const n = (await api.mineGlossary()).mined;
-            return `Mined ${n} candidate term${n === 1 ? "" : "s"} from reviewer edits — review and approve them below to activate.`;
+            return n === 0
+              ? "No new candidate terms — reviewer edits didn't surface anything new to review."
+              : `Mined ${n} new candidate term${n === 1 ? "" : "s"} — review and approve them below to activate.`;
           })}
         >
           {busy === "mine" ? <Loader2 className="animate-spin" /> : <Pickaxe />} Mine from edits
@@ -183,7 +187,7 @@ export function GlossaryView({ deltaSyncEnabled }: { deltaSyncEnabled: boolean }
             <AlertTriangle className="mr-1 size-3" /> {conflictCount} conflicting term{conflictCount === 1 ? "" : "s"}
           </Badge>
         )}
-        <span>Only <b>approved</b> terms are injected into the translation prompt — mined terms start unapproved and never affect translations until a reviewer approves them. Remember to <b>Sync to Delta</b> after changes.</span>
+        <span>Only <b>approved</b> terms are injected into the translation prompt — mined terms start unapproved and don't affect translations until approved. Approving/unapproving <b>auto-syncs to production</b>; use <b>Sync to Delta</b> after imports or deletions.</span>
       </div>
 
       {msg && <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm">{msg}</div>}

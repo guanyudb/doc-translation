@@ -1333,16 +1333,32 @@ def glossary_lists():
     }
 
 
+def _sync_glossary_best_effort() -> bool:
+    """Push the glossary to its Delta mirror after an approval change, so an
+    approved term reaches the translation job (which reads Delta, not Lakebase)
+    without waiting for a manual 'Sync to Delta'. Best-effort: a cold/absent
+    warehouse must not fail the approval — the manual button stays as a fallback.
+    Returns True if the mirror was actually refreshed."""
+    try:
+        res = delta_sync.sync_glossary_to_delta()
+        return not bool(res.get("skipped"))
+    except Exception:
+        log.warning("glossary: auto-sync to Delta failed; the approval is saved but "
+                    "won't reach translations until a manual Sync to Delta", exc_info=True)
+        return False
+
+
 @app.post("/api/glossary/approve-batch")
 def glossary_approve_batch(
     approved: bool = Body(..., embed=True),
     entry_ids: list[int] | None = Body(None, embed=True),
     list_name: str | None = Body(None, embed=True),
 ):
-    """Approve/unapprove many entries at once — by explicit ids or a whole list."""
+    """Approve/unapprove many entries at once — by explicit ids or a whole list.
+    Auto-syncs the glossary to Delta so the change reaches the translation job."""
     n = glossary_mod.set_approval_batch(entry_ids=entry_ids, list_name=list_name,
                                         approved=approved, actor=auth.reviewer())
-    return {"updated": n}
+    return {"updated": n, "synced": _sync_glossary_best_effort()}
 
 
 @app.delete("/api/glossary/lists/{name}")
@@ -1361,6 +1377,7 @@ def glossary_rename_list(name: str, new_name: str = Body(..., embed=True)):
 @app.post("/api/glossary/{entry_id}/approve")
 def glossary_approve(entry_id: int, approved: bool = Body(..., embed=True)):
     glossary_mod.toggle_approval(entry_id, approved, actor=auth.reviewer())
+    synced = _sync_glossary_best_effort()  # push the change to Delta for the job
     entries = {e["entry_id"]: e for e in glossary_mod.list_glossary(approved_only=False, limit=5000)}
     e = entries.get(entry_id)
     if not e:
@@ -1370,7 +1387,7 @@ def glossary_approve(entry_id: int, approved: bool = Body(..., embed=True)):
         "model_phrase": e["model_phrase"], "correction": e["correction"],
         "occurrences": e["occurrences"], "distinct_reviewers": e["distinct_reviewers"],
         "approved": e["approved"], "source": e.get("source") or "tenant",
-        "last_seen_at": str(e["last_seen_at"]),
+        "last_seen_at": str(e["last_seen_at"]), "synced": synced,
     }
 
 
