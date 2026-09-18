@@ -48,6 +48,10 @@ dbutils.widgets.text("bronze_catalog", "hls_amer_catalog", "Catalog for bronze_d
 dbutils.widgets.text("bronze_schema",  "guanyu_chen",      "Schema for bronze_documents")
 dbutils.widgets.text("glossary_delta_table", "",
     "FQN of the translation_glossary Delta mirror (empty = glossary injection off)")
+dbutils.widgets.text("pdf_translator_notebook_path", "",
+    "Inner PDF translation notebook (empty = PDFs skipped)")
+dbutils.widgets.text("warehouse_id", "",
+    "SQL warehouse id — required for the PDF path (ai_parse_document)")
 
 raw_dir            = dbutils.widgets.get("raw_dir").rstrip("/")
 translated_dir     = dbutils.widgets.get("translated_dir").rstrip("/")
@@ -59,6 +63,8 @@ translator_nb_path = dbutils.widgets.get("translator_notebook_path").strip()
 bronze_catalog     = dbutils.widgets.get("bronze_catalog").strip()
 bronze_schema      = dbutils.widgets.get("bronze_schema").strip()
 glossary_delta_table = dbutils.widgets.get("glossary_delta_table").strip()
+pdf_translator_nb_path = dbutils.widgets.get("pdf_translator_notebook_path").strip()
+warehouse_id       = dbutils.widgets.get("warehouse_id").strip()
 
 lang_slug = re.sub(r"[^a-z0-9]+", "_", target_language.lower()).strip("_") or "translated"
 bronze_fqn = f"{bronze_catalog}.{bronze_schema}.bronze_documents"
@@ -226,13 +232,19 @@ def _submitted_by_for(fs_path: str) -> str | None:
 raw_files = []
 for entry in dbutils.fs.ls(raw_dir):
     name = entry.name.rstrip("/")
-    if not name.lower().endswith(".docx"):
+    low = name.lower()
+    if low.endswith(".docx"):
+        ext = ".docx"
+    elif low.endswith(".pdf"):
+        ext = ".pdf"
+    else:
         continue
     if name.startswith("~$"):  # Word lock files
         continue
     raw_files.append({
         "path":  _to_fs(entry.path),
         "name":  name,
+        "ext":   ext,
         "size":  entry.size,
         "modified_ms": entry.modificationTime,
     })
@@ -240,10 +252,21 @@ for entry in dbutils.fs.ls(raw_dir):
 # Filter out already-translated files
 unpaired = []
 for f in raw_files:
-    stem = f["name"][:-len(".docx")]
+    ext = f["ext"]
+    # PDF requires the inner PDF notebook to be configured; skip PDFs if not
+    # (leaves them untranslated rather than crashing the run).
+    if ext == ".pdf" and not pdf_translator_nb_path:
+        print(f"  (skipping {f['name']}: no PDF translator notebook configured)")
+        continue
+    stem = f["name"][: -len(ext)]
     file_target = _target_for(f["path"])
     file_slug = _slug(file_target)
-    expected_out = f"{translated_dir}/{stem}_translated_{file_slug}.docx"
+    # DOCX → an in-place translated .docx; PDF → a .pdf.json translation artifact
+    # (rendered identically to a DOCX pair by server/pdf_render.py).
+    if ext == ".pdf":
+        expected_out = f"{translated_dir}/{stem}_translated_{file_slug}.pdf.json"
+    else:
+        expected_out = f"{translated_dir}/{stem}_translated_{file_slug}.docx"
     # `dbutils.fs.head` on a Volume from serverless raises an internal
     # error instead of a clean FileNotFoundError, so we can't rely on it.
     # Plain POSIX `os.path.exists` against the FUSE-mounted Volume path
@@ -357,21 +380,40 @@ for f in unpaired:
     # which is reliable on serverless Volume FUSE — unlike random-access
     # zipfile reads against the FUSE mount, which fail with OSError [Errno 5].
     try:
-        inner_result = dbutils.notebook.run(
-            translator_nb_path,
-            timeout_seconds=7200,
-            arguments={
-                "input_path":             fs_path,
-                "output_dir":             translated_dir,
-                "target_language":        file_target,
-                "model_endpoint":         model_endpoint,
-                "max_workers":            max_workers,
-                "max_pages":              max_pages,
-                "skip_if_already_target": "true",
-                "glossary_delta_table":   glossary_delta_table,
-                "custom_system_prompt":   prompt_body,
-            },
-        )
+        if f["ext"] == ".pdf":
+            # PDF path: parse (ai_parse_document on the warehouse) + translate +
+            # write the .pdf.json artifact. Same JSON exit contract (carries
+            # source_language_code) so the status update below is format-agnostic.
+            inner_result = dbutils.notebook.run(
+                pdf_translator_nb_path,
+                timeout_seconds=7200,
+                arguments={
+                    "input_path":           fs_path,
+                    "output_dir":           translated_dir,
+                    "target_language":      file_target,
+                    "model_endpoint":       model_endpoint,
+                    "warehouse_id":         warehouse_id,
+                    "glossary_delta_table": glossary_delta_table,
+                    "custom_system_prompt": prompt_body,
+                    "max_workers":          max_workers,
+                },
+            )
+        else:
+            inner_result = dbutils.notebook.run(
+                translator_nb_path,
+                timeout_seconds=7200,
+                arguments={
+                    "input_path":             fs_path,
+                    "output_dir":             translated_dir,
+                    "target_language":        file_target,
+                    "model_endpoint":         model_endpoint,
+                    "max_workers":            max_workers,
+                    "max_pages":              max_pages,
+                    "skip_if_already_target": "true",
+                    "glossary_delta_table":   glossary_delta_table,
+                    "custom_system_prompt":   prompt_body,
+                },
+            )
         out_path = f["expected_output"]
         # The inner notebook returns a JSON payload with the auto-detected
         # source language. Parse it defensively — older notebook versions or a

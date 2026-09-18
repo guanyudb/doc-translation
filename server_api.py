@@ -26,7 +26,6 @@ import json
 import logging
 import mimetypes
 import os
-import threading
 import time
 from collections import OrderedDict
 
@@ -39,7 +38,7 @@ from server import confidence as conf_mod
 from server import glossary as glossary_mod
 from server import prompts as prompts_mod
 from server import settings as settings_mod
-from server import pdf_render, pdf_translate, pdf_layout
+from server import pdf_render, pdf_layout
 from server.db import pool
 
 log = logging.getLogger("doc_translation")
@@ -656,36 +655,38 @@ def _pipeline_job_id_for_deployment() -> int | None:
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _retranslate_docx(pair_id: str, match: dict, prompt: dict) -> dict:
-    """Rewrite the `.prompt` sidecar with the chosen instruction, drop the old
-    translated output (so the watcher treats the doc as unpaired), and run THIS
-    deployment's pipeline job. The watcher then re-translates the unpaired doc
-    with the new instruction.
+def _retranslate_via_job(pair_id: str, match: dict, prompt: dict, *, ext: str) -> dict:
+    """Rewrite the `.prompt` sidecar with the chosen instruction, run THIS
+    deployment's pipeline job, then drop the old translated output so the watcher
+    treats the doc as unpaired and re-translates it. Works for both formats — the
+    watcher dispatches .docx (in-place) and .pdf (parse + artifact) alike.
 
     We resolve the job by `raw_dir` (not by name, which isn't unique across
     deployments) and run it directly — re-touching the raw file wouldn't work
-    because a same-path overwrite doesn't re-fire the file-arrival trigger."""
+    because a same-path overwrite doesn't re-fire the file-arrival trigger.
+    `ext` is '.docx' or '.pdf' — the sidecar/output naming follows the source."""
     snapshot = json.dumps({
         "prompt_id": prompt["prompt_id"], "name": prompt["name"], "body": prompt["body"],
     })
-    volume.upload_docx(f"{config.RAW_DIR}/{pair_id}.docx.prompt", snapshot.encode("utf-8"))
+    volume.upload_docx(f"{config.RAW_DIR}/{pair_id}{ext}.prompt", snapshot.encode("utf-8"))
     job_id = _pipeline_job_id_for_deployment()
     if job_id is None:
         raise HTTPException(500, "could not resolve this deployment's translation pipeline job")
     # Trigger BEFORE destroying anything — if run_now raises (e.g. the app SP
     # lacks Manage Run on the job), the existing translation + review state stay
-    # intact rather than leaving the pair stranded (404). Only after the run is
-    # accepted do we reset state + drop the old output so the watcher re-translates.
+    # intact rather than leaving the pair stranded (404). run_now is async and the
+    # job takes seconds to start, so the deletes below land before the watcher
+    # scans — it then sees the doc as unpaired and re-translates it.
     config.w().jobs.run_now(job_id=job_id)
     try:
         store.delete_pair_state(pair_id)
     except Exception:
-        log.exception("retranslate(docx): couldn't reset review state for %s", pair_id)
+        log.exception("retranslate: couldn't reset review state for %s", pair_id)
     try:
         config.w().files.delete(match["translated_path"])
     except Exception:
-        log.exception("retranslate(docx): couldn't delete old output %s", match["translated_path"])
-    return {"ok": True, "kind": "docx",
+        log.exception("retranslate: couldn't delete old output %s", match["translated_path"])
+    return {"ok": True, "kind": ext.lstrip("."),
             "message": "Re-translating via the pipeline — the updated translation appears when the job completes (usually 1–3 min)."}
 
 
@@ -702,28 +703,12 @@ def retranslate(pair_id: str, prompt_id: int = Body(..., embed=True)):
     prompt = prompts_mod.get_prompt(prompt_id)
     if prompt is None:
         raise HTTPException(400, f"unknown prompt_id: {prompt_id}")
-    model_endpoint = settings_mod.load().get("model_endpoint") or "databricks-claude-sonnet-4-6"
-    target_language = match.get("target_lang") or "English"
-
-    if _is_pdf_pair(match):
-        # PDF: the artifact is overwritten only on success (kept on failure), so
-        # resetting review state up front is safe.
-        try:
-            store.delete_pair_state(pair_id)
-        except Exception:
-            log.exception("retranslate: couldn't reset review state for %s", pair_id)
-        threading.Thread(
-            target=_run_pdf_retranslate_bg,
-            kwargs=dict(pdf_name=f"{pair_id}.pdf", artifact_path=match["translated_path"],
-                        target_language=target_language, prompt_body=prompt["body"],
-                        model_endpoint=model_endpoint),
-            daemon=True,
-        ).start()
-        return {"ok": True, "kind": "pdf",
-                "message": "Re-translating (in-app) — the updated translation will appear shortly."}
-    # DOCX resets review state + drops the old output itself, only after the job
-    # run is accepted (crash-safe — see _retranslate_docx).
-    return _retranslate_docx(pair_id, match, prompt)
+    # Both formats re-translate via the durable pipeline job: rewrite the prompt
+    # sidecar, run_now, then drop the old output so the watcher re-translates it.
+    # State reset + output deletion happen only after the run is accepted
+    # (crash-safe — see _retranslate_via_job).
+    ext = ".pdf" if _is_pdf_pair(match) else ".docx"
+    return _retranslate_via_job(pair_id, match, prompt, ext=ext)
 
 
 def _para_response(pair_id: str, idx: int) -> dict:
@@ -813,107 +798,12 @@ def certify_page(pair_id: str, page: int = Body(..., embed=True)):
     return {"certified": n, "page": page}
 
 
-# --- PDF workflow: in-app parse + translate (background), separate from the
-# DOCX file-arrival job. Presence of the artifact = done; a `.error` sidecar =
-# failed; neither, with the raw PDF present = still translating.
-_pdf_inflight: set[str] = set()
-_pdf_inflight_lock = threading.Lock()
-
-
-def _run_pdf_translation_bg(*, pdf_path: str, name: str, target_language: str,
-                            prompt_body: str, model_endpoint: str) -> None:
-    err_path = f"{pdf_path}.error"
-    with _pdf_inflight_lock:
-        _pdf_inflight.add(name)
-    try:
-        pdf_translate.run(
-            pdf_path, target_lang=target_language,
-            base_prompt=prompt_body, model_endpoint=model_endpoint,
-        )
-        # Success — clear any stale error sidecar + force a fresh artifact lookup.
-        _pdf_artifact_path.pop(name[: -len(".pdf")], None)
-        try:
-            config.w().files.delete(err_path)
-        except Exception:
-            pass
-    except Exception as e:
-        log.exception("pdf background translation failed: %s", pdf_path)
-        try:
-            volume.upload_docx(err_path, str(e).encode("utf-8"))
-        except Exception:
-            pass
-    finally:
-        with _pdf_inflight_lock:
-            _pdf_inflight.discard(name)
-
-
-def _run_pdf_retranslate_bg(*, pdf_name: str, artifact_path: str, target_language: str,
-                            prompt_body: str, model_endpoint: str) -> None:
-    """Re-translate an existing PDF artifact in place with a new instruction —
-    no re-parse. The old artifact stays visible until the new one is written;
-    `_pdf_inflight` makes the status read TRANSLATING meanwhile."""
-    stem = pdf_name[: -len(".pdf")]
-    err_path = f"{config.RAW_DIR}/{pdf_name}.error"
-    with _pdf_inflight_lock:
-        _pdf_inflight.add(pdf_name)
-    try:
-        old_artifact = _load_artifact(artifact_path)
-        new_artifact = pdf_translate.retranslate_artifact(
-            old_artifact, target_lang=target_language,
-            base_prompt=prompt_body, model_endpoint=model_endpoint,
-        )
-        volume.upload_docx(
-            artifact_path, json.dumps(new_artifact, ensure_ascii=False).encode("utf-8")
-        )
-        _pdf_artifact_path.pop(stem, None)
-        try:
-            config.w().files.delete(err_path)
-        except Exception:
-            pass
-    except Exception as e:
-        log.exception("pdf re-translate failed: %s", artifact_path)
-        try:
-            volume.upload_docx(err_path, str(e).encode("utf-8"))
-        except Exception:
-            pass
-    finally:
-        with _pdf_inflight_lock:
-            _pdf_inflight.discard(pdf_name)
-
-
-def _pdf_status_rows(*, only_user: str | None = None) -> list[dict]:
-    """Processing-view rows for PDFs (no bronze table — status is derived from
-    Volume state): `.error` sidecar → FAILED, artifact present → TRANSLATED,
-    otherwise → TRANSLATING. Shape matches the DOCX rows the endpoints emit."""
-    rows: list[dict] = []
-    try:
-        raw_pdfs = volume.list_pdf(config.RAW_DIR)
-    except Exception:
-        return rows
-    for f in raw_pdfs:
-        name = f["name"]
-        stem = name[: -len(".pdf")]
-        if only_user is not None and volume.read_text(f"{config.RAW_DIR}/{name}.user") != only_user:
-            continue
-        with _pdf_inflight_lock:
-            inflight = name in _pdf_inflight
-        err = volume.read_text(f"{config.RAW_DIR}/{name}.error")
-        if inflight:
-            # covers a re-translate in progress even though the old artifact still exists
-            status = "TRANSLATING"
-        elif err:
-            status = "FAILED_TRANSLATION"
-        elif volume.find_pdf_artifact(stem):
-            status = "TRANSLATED"
-        else:
-            status = "TRANSLATING"
-        rows.append({
-            "file_name": name, "status": status,
-            "target_language": volume.read_text(f"{config.RAW_DIR}/{name}.lang"),
-            "source_language": None, "started_at": None, "ended_at": None,
-            "error": err, "elapsed_seconds": None,
-        })
-    return rows
+# PDF translation now runs on the SAME durable file-arrival job as DOCX (the
+# watcher dispatches .pdf to setup/pdf_inplace_translation, which writes the
+# .pdf.json artifact and a bronze_documents row). So PDFs need no in-app thread
+# or in-memory status here — their QUEUED/TRANSLATING/TRANSLATED status comes
+# from bronze_documents (like DOCX), with the raw→QUEUED fallback below covering
+# the brief window before the watcher writes the first bronze row.
 
 
 @app.post("/api/upload")
@@ -1012,23 +902,13 @@ def upload_document(
         "body": prompt["body"],
     })
     volume.upload_docx(f"{config.RAW_DIR}/{name}.prompt", snapshot.encode("utf-8"))
-    # The document last — for DOCX its arrival triggers the Lakeflow job.
+    # The document last — its arrival in raw_documents/ fires the file-arrival
+    # Lakeflow job, which translates BOTH .docx (in-place) and .pdf (parse +
+    # artifact) as durable, retryable, audited job runs. (PDF previously ran on
+    # an in-app daemon thread that a restart could silently drop — now it's a job.)
     volume.upload_docx(dest, data)
 
-    # PDF: no file-arrival job — parse + translate in-app on a background thread
-    # so the upload returns immediately and the pair appears once the artifact
-    # is written. Uses the runtime model endpoint + the chosen (frozen) prompt.
-    if is_pdf:
-        model_endpoint = settings_mod.load().get("model_endpoint") or "databricks-claude-sonnet-4-6"
-        threading.Thread(
-            target=_run_pdf_translation_bg,
-            kwargs=dict(pdf_path=dest, name=name, target_language=target_language,
-                        prompt_body=prompt["body"], model_endpoint=model_endpoint),
-            daemon=True,
-        ).start()
-
-    how = ("Translation is running now" if is_pdf
-           else "Translation runs on file arrival")
+    how = "Translation runs on file arrival"
     if renamed_from:
         message = (
             f"A document named {renamed_from} already exists, so this was uploaded "
@@ -1101,13 +981,18 @@ def list_documents():
             except Exception:
                 continue
 
-    # Raw files not yet in bronze → QUEUED (uploaded, waiting on the trigger).
-    # Skip any that already have a translated output — those are done, not queued,
-    # even if bronze can't be read (warehouse down) or the row aged out of the
-    # status query's 24h window.
+    # Raw files (DOCX + PDF) not yet in bronze → QUEUED (uploaded, waiting on the
+    # trigger). Skip any that already have a translated output — those are done,
+    # not queued, even if bronze can't be read (warehouse down) or the row aged
+    # out of the status query's 24h window.
     try:
         done = _translated_basenames()
-        for f in volume.list_docx(config.RAW_DIR):
+        raw = volume.list_docx(config.RAW_DIR)
+        try:
+            raw = raw + volume.list_pdf(config.RAW_DIR)
+        except Exception:
+            pass
+        for f in raw:
             if f["name"] not in bronze_names and f["name"] not in done:
                 rows.append({
                     "file_name": f["name"], "status": "QUEUED", "target_language": None,
@@ -1117,7 +1002,6 @@ def list_documents():
     except Exception:
         pass
 
-    rows += _pdf_status_rows()  # in-app PDF workflow (not tracked in bronze)
     return {"documents": rows, "warehouse_configured": delta_sync.enabled()}
 
 
@@ -1232,13 +1116,18 @@ def processing_status():
         except Exception:
             pass
 
-    # Raw files not yet in bronze → QUEUED, but only the ones THIS user uploaded
-    # (attributed via the `.user` sidecar written at upload time). Skip any that
-    # already have a translated output — those are done, not queued, even if
-    # bronze can't be read (warehouse down) or the row aged out of the 24h window.
+    # Raw files (DOCX + PDF) not yet in bronze → QUEUED, but only the ones THIS
+    # user uploaded (attributed via the `.user` sidecar written at upload time).
+    # Skip any that already have a translated output — those are done, not queued,
+    # even if bronze can't be read (warehouse down) or the row aged out of 24h.
     try:
         done = _translated_basenames()
-        for f in volume.list_docx(config.RAW_DIR):
+        raw = volume.list_docx(config.RAW_DIR)
+        try:
+            raw = raw + volume.list_pdf(config.RAW_DIR)
+        except Exception:
+            pass
+        for f in raw:
             if f["name"] in bronze_names or f["name"] in done:
                 continue
             owner = volume.read_text(f"{config.RAW_DIR}/{f['name']}.user")
@@ -1251,8 +1140,6 @@ def processing_status():
             })
     except Exception:
         pass
-
-    rows += _pdf_status_rows(only_user=user)  # this user's in-app PDF jobs
     # `pipeline` is part of the response contract but no client reads it, so we
     # skip the per-poll Jobs API calls _pipeline_status() would make (a needless
     # round-trip on a 5s poll). The workspace-wide /api/documents view is where
@@ -1453,7 +1340,8 @@ def glossary_approve_batch(
     list_name: str | None = Body(None, embed=True),
 ):
     """Approve/unapprove many entries at once — by explicit ids or a whole list."""
-    n = glossary_mod.set_approval_batch(entry_ids=entry_ids, list_name=list_name, approved=approved)
+    n = glossary_mod.set_approval_batch(entry_ids=entry_ids, list_name=list_name,
+                                        approved=approved, actor=auth.reviewer())
     return {"updated": n}
 
 
@@ -1472,7 +1360,7 @@ def glossary_rename_list(name: str, new_name: str = Body(..., embed=True)):
 
 @app.post("/api/glossary/{entry_id}/approve")
 def glossary_approve(entry_id: int, approved: bool = Body(..., embed=True)):
-    glossary_mod.toggle_approval(entry_id, approved)
+    glossary_mod.toggle_approval(entry_id, approved, actor=auth.reviewer())
     entries = {e["entry_id"]: e for e in glossary_mod.list_glossary(approved_only=False, limit=5000)}
     e = entries.get(entry_id)
     if not e:
