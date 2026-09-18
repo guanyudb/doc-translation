@@ -44,8 +44,9 @@ Apps.
 ```
 [Upload .docx / .pdf]
       │
-      ├─ DOCX → file-arrival Lakeflow job → in-place OOXML translation
-      └─ PDF  → in-app parse (ai_parse_document) + element translation
+      ▼  file-arrival Lakeflow job (one durable, retryable run per file)
+      ├─ DOCX → in-place OOXML translation
+      └─ PDF  → parse (ai_parse_document) + element translation → .pdf.json artifact
       │
       ▼
 [ Review app on Databricks Apps ]  ── live state in Lakebase Postgres
@@ -109,8 +110,8 @@ endpoint and default target language. Only the deploying user (or anyone in
 `app_admin_emails`) can change Settings; everyone else reviews.
 
 **Smoke test:** upload a `.docx` and a `.pdf`. Each appears in the review list
-once translated (DOCX ~1–3 min via the job; PDF ~10–60 s in-app). Certify a few
-paragraphs and **Download** the result.
+once translated (~1–3 min — both formats run on the file-arrival job). Certify a
+few paragraphs and **Download** the result.
 
 > The workspace host comes from your CLI profile, not the config file — always
 > pass `--profile <p>` (or set `DATABRICKS_HOST`).
