@@ -14,9 +14,10 @@ resources:
     doc_translation_pipeline:
       name:        doc-translation · auto-translate pipeline
       description: |
-        File-arrival trigger on raw_documents/. Scans for unpaired DOCX
-        files, calls the FMAPI translation notebook once per file, writes
-        the output to translated_inplace/ and a bronze_documents audit row.
+        File-arrival trigger on raw_documents/. Scans for unpaired DOCX and
+        PDF files: DOCX is translated in-place, PDF is parsed
+        (ai_parse_document) + translated into a .pdf.json artifact. One run per
+        file, each writing to translated_inplace/ and a bronze_documents row.
 
       tasks:
         - task_key: watch_and_translate
@@ -30,11 +31,17 @@ resources:
               model_endpoint:           ${var.translation_model_endpoint}
               max_workers:              ${var.translation_max_workers}
               max_pages:                ${var.translation_max_pages}
-              # The inner translator notebook lives in the same bundle.
+              # The inner translator notebooks live in the same bundle.
               # `${workspace.file_path}` resolves to the bundle's files dir
               # in the target workspace at deploy time. The notebook file
               # path (no .py extension at workspace level) is appended.
-              translator_notebook_path: ${workspace.file_path}/setup/docx_inplace_translation
+              translator_notebook_path:     ${workspace.file_path}/setup/docx_inplace_translation
+              # PDF path: the watcher dispatches .pdf files to this notebook,
+              # which runs ai_parse_document on the warehouse + translates +
+              # writes a .pdf.json artifact (durable analogue of the app's old
+              # in-process daemon thread). Needs the warehouse for ai_parse.
+              pdf_translator_notebook_path: ${workspace.file_path}/setup/pdf_inplace_translation
+              warehouse_id:                 ${var.warehouse_id}
               bronze_catalog:           ${var.uc_catalog}
               bronze_schema:            ${var.uc_schema}
               # Delta mirror of the glossary; the inner notebook reads it to
