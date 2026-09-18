@@ -405,13 +405,54 @@ def put_settings(patch: dict = Body(...)):
 # Pairs
 # ---------------------------------------------------------------------------
 
+def _bronze_source_langs() -> dict[str, str]:
+    """{file_name: source_language} from bronze_documents — the source language the
+    pipeline auto-detected per document (both DOCX and PDF). Best-effort + fail-fast
+    so a cold/absent warehouse can't slow the pairs list; used only to backfill a
+    missing review_pairs.source_lang so the Documents tab shows 'ja → english'
+    instead of '? → english'."""
+    if not delta_sync.enabled():
+        return {}
+    try:
+        fqn = f"{delta_sync.DELTA_CATALOG}.{delta_sync.DELTA_SCHEMA}.bronze_documents"
+        out = delta_sync._execute(
+            f"SELECT file_name, source_language FROM {fqn} WHERE source_language IS NOT NULL",
+            timeout_s=8.0, wait_timeout="5s")
+        data = (out.get("result") or {}).get("data_array") or []
+        return {r[0]: r[1] for r in data if r[0] and r[1]}
+    except Exception:
+        log.warning("list_pairs: bronze source-language backfill skipped", exc_info=True)
+        return {}
+
+
 @app.get("/api/pairs")
 def list_pairs():
     pairs = _list_pairs()
     prog = {p["pair_id"]: p for p in store.list_pairs_with_progress()}
+    # Backfill source language for pairs whose review_pairs row hasn't recorded one
+    # yet (e.g. never opened). The pipeline detected it into bronze_documents; fill
+    # it in the response AND persist it, so the Documents tab shows it and we don't
+    # re-query bronze once every pair is filled. Only touches bronze when needed.
+    bronze_src = _bronze_source_langs() if any(
+        not prog.get(p["pair_id"], {}).get("source_lang") for p in pairs) else {}
     out = []
     for p in pairs:
         d = prog.get(p["pair_id"], {})
+        src = d.get("source_lang")
+        if not src and bronze_src:
+            src = bronze_src.get(p["original_path"].rsplit("/", 1)[-1])
+            if src:
+                try:
+                    store.upsert_pair({
+                        "pair_id": p["pair_id"],
+                        "original_path": p["original_path"],
+                        "translated_path": p["translated_path"],
+                        "target_lang": p.get("target_lang") or d.get("target_lang"),
+                        "source_lang": src,
+                        "total_paragraphs": None,
+                    })
+                except Exception:
+                    log.warning("list_pairs: could not persist source_lang for %s", p["pair_id"], exc_info=True)
         total = int(d.get("total_paragraphs") or 0)
         cert = int(d.get("certified") or 0)
         flg = int(d.get("flagged") or 0)
@@ -419,7 +460,7 @@ def list_pairs():
             "pair_id": p["pair_id"],
             "original_path": p["original_path"],
             "translated_path": p["translated_path"],
-            "source_lang": d.get("source_lang"),
+            "source_lang": src,
             "target_lang": p.get("target_lang") or d.get("target_lang"),
             "total_paragraphs": total,
             "lifecycle_state": d.get("lifecycle_state") or "UNDER_REVIEW",
@@ -444,6 +485,7 @@ def get_pair_detail(pair_id: str):
         "original_path": match["original_path"],
         "translated_path": match["translated_path"],
         "target_lang": match["target_lang"],
+        "source_lang": source_lang,  # persist the detected source so /api/pairs (Documents tab) shows it, not "?"
         "total_paragraphs": total,
     })
 
