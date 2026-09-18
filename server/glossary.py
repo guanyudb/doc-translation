@@ -203,8 +203,12 @@ def ingest_glossary_rows(
                      occurrences, distinct_reviewers, approved, source, list_name)
                 VALUES (%s, %s, %s, %s, 1, 1, %s, %s, %s)
                 ON CONFLICT (source_lang, target_lang, model_phrase, correction) DO UPDATE SET
-                    last_seen_at = now(),
-                    approved     = EXCLUDED.approved
+                    last_seen_at = now()
+                    -- Deliberately NOT re-writing `approved` on conflict: importing a
+                    -- CSV that contains a phrase a reviewer already disabled must not
+                    -- silently re-approve it (that would undermine the approval gate).
+                    -- `approved` is only set on INSERT (a brand-new phrase). Same as
+                    -- mine_glossary's ON CONFLICT.
             """, [(sl, tl, mp, co, approved, source, lname) for sl, tl, mp, co in clean])
         conn.commit()
     return len(clean)
