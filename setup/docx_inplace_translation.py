@@ -380,13 +380,29 @@ def _model_complete(system: str, user: str) -> tuple[str, dict | None]:
             for it in ((resp or {}).get("output") or [])
             if it.get("type") == "message"
         ), usage
-    resp = _oai.chat.completions.create(
+    kwargs = dict(
         model=model_endpoint,
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": user}],
         temperature=0.0,
         max_tokens=8192,
     )
+    try:
+        resp = _oai.chat.completions.create(**kwargs)
+    except Exception as ex:
+        # Reasoning models (e.g. GPT-5) reject temperature != default and want
+        # max_completion_tokens; drop/rename the offending param and retry once so any
+        # chat endpoint the user configures works.
+        msg = str(ex).lower()
+        changed = False
+        if "temperature" in msg and "temperature" in kwargs:
+            kwargs.pop("temperature"); changed = True
+        if ("max_completion_tokens" in msg or "max_tokens" in msg) and "max_tokens" in kwargs:
+            kwargs["max_completion_tokens"] = kwargs.pop("max_tokens"); changed = True
+        if not changed:
+            raise
+        print(f"  [model] endpoint rejected a param ({msg[:120]}); retrying without it")
+        resp = _oai.chat.completions.create(**kwargs)
     return _content_to_text(resp.choices[0].message.content), _usage_dict(getattr(resp, "usage", None))
 
 # XML 1.0 character validity. Strip anything not in the legal ranges so we

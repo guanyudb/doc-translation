@@ -338,12 +338,30 @@ def _is_uc_gateway_endpoint(endpoint: str) -> bool:
     return (endpoint or "").count(".") >= 2
 
 
+def _serving_invoke(body: dict) -> dict:
+    """POST to the serving endpoint, retrying once without the offending param for reasoning
+    models (e.g. GPT-5) that reject temperature != default or want max_completion_tokens."""
+    path = f"/serving-endpoints/{model_endpoint}/invocations"
+    try:
+        return _w.api_client.do("POST", path, body=body)
+    except Exception as ex:
+        msg = str(ex).lower()
+        retried = dict(body)
+        changed = False
+        if "temperature" in msg and "temperature" in retried:
+            retried.pop("temperature"); changed = True
+        if ("max_completion_tokens" in msg or "max_tokens" in msg) and "max_tokens" in retried:
+            retried["max_completion_tokens"] = retried.pop("max_tokens"); changed = True
+        if not changed:
+            raise
+        print(f"  [model] endpoint rejected a param ({msg[:120]}); retrying without it")
+        return _w.api_client.do("POST", path, body=retried)
+
+
 def _serving_chat(system: str, user: str) -> tuple[str, dict | None]:
-    resp = _w.api_client.do(
-        "POST", f"/serving-endpoints/{model_endpoint}/invocations",
-        body={"messages": [{"role": "system", "content": system},
-                           {"role": "user", "content": user}],
-              "temperature": 0.0, "max_tokens": MAX_TOKENS})
+    resp = _serving_invoke({"messages": [{"role": "system", "content": system},
+                                         {"role": "user", "content": user}],
+                            "temperature": 0.0, "max_tokens": MAX_TOKENS})
     choices = (resp or {}).get("choices") or []
     if not choices:
         raise RuntimeError(f"serving endpoint returned no choices: {str(resp)[:200]}")

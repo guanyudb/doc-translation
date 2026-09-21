@@ -84,19 +84,38 @@ def _norm_usage(usage) -> dict | None:
     return {"prompt_tokens": p, "completion_tokens": c}
 
 
+def _serving_invoke(model_endpoint: str, body: dict) -> dict:
+    """POST to a serving endpoint, with a defensive retry for models that reject our default
+    params. Reasoning models (e.g. GPT-5) only accept the default temperature and want
+    max_completion_tokens instead of max_tokens; on a 400 naming such a param we drop/rename
+    it and retry once, so any chat endpoint the user selects works."""
+    path = f"/serving-endpoints/{model_endpoint}/invocations"
+    try:
+        return config.w().api_client.do("POST", path, body=body)
+    except Exception as ex:
+        msg = str(ex).lower()
+        retried = dict(body)
+        changed = False
+        if "temperature" in msg and "temperature" in retried:
+            retried.pop("temperature"); changed = True
+        if ("max_completion_tokens" in msg or "max_tokens" in msg) and "max_tokens" in retried:
+            retried["max_completion_tokens"] = retried.pop("max_tokens"); changed = True
+        if not changed:
+            raise
+        log.warning("serving endpoint %s rejected a param (%s); retrying without it",
+                    model_endpoint, msg[:160])
+        return config.w().api_client.do("POST", path, body=retried)
+
+
 def _serving_chat(model_endpoint: str, system: str, user: str, max_tokens: int) -> tuple[str, dict | None]:
-    resp = config.w().api_client.do(
-        "POST",
-        f"/serving-endpoints/{model_endpoint}/invocations",
-        body={
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.0,
-            "max_tokens": max_tokens,
-        },
-    )
+    resp = _serving_invoke(model_endpoint, {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+    })
     choices = (resp or {}).get("choices") or []
     if not choices:
         raise RuntimeError(f"serving endpoint '{model_endpoint}' returned no choices: {str(resp)[:200]}")
