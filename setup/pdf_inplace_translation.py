@@ -351,7 +351,9 @@ def _serving_invoke(body: dict) -> dict:
         if "temperature" in msg and "temperature" in retried:
             retried.pop("temperature"); changed = True
         if ("max_completion_tokens" in msg or "max_tokens" in msg) and "max_tokens" in retried:
-            retried["max_completion_tokens"] = retried.pop("max_tokens"); changed = True
+            # Reasoning models spend max_completion_tokens on hidden reasoning + visible
+            # output; give the renamed cap 2x headroom so a long translation isn't truncated.
+            retried["max_completion_tokens"] = retried.pop("max_tokens") * 2; changed = True
         if not changed:
             raise
         print(f"  [model] endpoint rejected a param ({msg[:120]}); retrying without it")
