@@ -91,6 +91,17 @@ variables:
       Headers, footers, footnotes, charts are always translated in full.
     default: "0"
 
+  translation_enable_batching:
+    description: |
+      Group several SMALL segments into one model request to amortize the (long)
+      system prompt and cut token cost. Strict per-segment validation with a
+      per-segment fallback preserves correctness. "true"/"false".
+    default: "true"
+
+  translation_batch_size:
+    description: Max small segments grouped into one batched model request.
+    default: "8"
+
   # ---- App naming ----
   app_name:
     description: Databricks App name. Becomes the public URL prefix.

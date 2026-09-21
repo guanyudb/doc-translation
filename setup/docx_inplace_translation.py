@@ -59,6 +59,9 @@ dbutils.widgets.text("glossary_delta_table", "",
                      "FQN of translation_glossary Delta mirror (empty = disabled)")
 dbutils.widgets.text("custom_system_prompt", "",
                      "Custom system prompt (empty = built-in default)")
+dbutils.widgets.dropdown("enable_batching", "true", ["true", "false"],
+                        "Group small segments into one model request (cost)")
+dbutils.widgets.text("batch_size", "8", "Max small segments per batched request")
 
 input_path = dbutils.widgets.get("input_path").strip()
 output_dir = dbutils.widgets.get("output_dir").strip().rstrip("/")
@@ -68,6 +71,11 @@ max_workers = int(dbutils.widgets.get("max_workers"))
 max_pages = int(dbutils.widgets.get("max_pages"))
 skip_if_already_target = dbutils.widgets.get("skip_if_already_target").lower() == "true"
 glossary_delta_table = dbutils.widgets.get("glossary_delta_table").strip()
+enable_batching = dbutils.widgets.get("enable_batching").lower() == "true"
+try:
+    batch_size = max(1, int(dbutils.widgets.get("batch_size")))
+except ValueError:
+    batch_size = 8
 # Not .strip() — a custom prompt's leading/trailing whitespace could be
 # intentional; only treat it as "unset" when it's blank.
 custom_system_prompt = dbutils.widgets.get("custom_system_prompt")
@@ -85,8 +93,10 @@ print(f"Glossary table: {glossary_delta_table or '(disabled)'}")
 
 import os
 import re
+import math
 import zipfile
 import hashlib
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -335,23 +345,41 @@ def _content_to_text(content) -> str:
     return content or ""
 
 
-def _model_complete(system: str, user: str) -> str:
+def _usage_dict(u) -> dict | None:
+    """Normalize a response's usage to {prompt_tokens, completion_tokens}. The gateway
+    Responses API uses input_tokens/output_tokens (dict); the OpenAI SDK chat client
+    exposes prompt_tokens/completion_tokens (object attrs)."""
+    if u is None:
+        return None
+    def g(name):
+        return u.get(name) if isinstance(u, dict) else getattr(u, name, None)
+    p = g("prompt_tokens")
+    p = p if p is not None else g("input_tokens")
+    c = g("completion_tokens")
+    c = c if c is not None else g("output_tokens")
+    if p is None and c is None:
+        return None
+    return {"prompt_tokens": p, "completion_tokens": c}
+
+
+def _model_complete(system: str, user: str) -> tuple[str, dict | None]:
     """Call the configured LLM, routing UC AI Gateway endpoints to the Responses
-    API and serving endpoints to chat/completions. Returns the assistant text."""
+    API and serving endpoints to chat/completions. Returns (assistant_text, usage|None)."""
     if _IS_UC_GATEWAY:
         resp = _w.api_client.do(
             "POST", "/ai-gateway/mlflow/v1/responses",
             body={"model": model_endpoint, "instructions": system,
                   "input": user, "max_output_tokens": 8192},
         )
+        usage = _usage_dict((resp or {}).get("usage"))
         txt = (resp or {}).get("output_text")
         if txt:
-            return txt
+            return txt, usage
         return "".join(
             _content_to_text(it.get("content"))
             for it in ((resp or {}).get("output") or [])
             if it.get("type") == "message"
-        )
+        ), usage
     resp = _oai.chat.completions.create(
         model=model_endpoint,
         messages=[{"role": "system", "content": system},
@@ -359,7 +387,7 @@ def _model_complete(system: str, user: str) -> str:
         temperature=0.0,
         max_tokens=8192,
     )
-    return _content_to_text(resp.choices[0].message.content)
+    return _content_to_text(resp.choices[0].message.content), _usage_dict(getattr(resp, "usage", None))
 
 # XML 1.0 character validity. Strip anything not in the legal ranges so we
 # never crash lxml on a stray control byte from the LLM. Allowed: \t \n \r,
@@ -569,6 +597,71 @@ else:
 
 _translation_cache: dict[str, str] = {}
 
+# ---- Request batching (cost) ------------------------------------------------
+# Amortize the (long) system prompt across several SMALL segments per request.
+# Only genuinely small segments are eligible; large ones, anything containing a
+# literal <seg> tag, cache hits, and skip-if-already-target take the single path.
+# Strict <seg id> parsing with a per-segment fallback keeps correctness even if a
+# batch response is malformed.
+SEG_OPEN = '<seg id="'
+SEG_CLOSE = "</seg>"
+_SEG_COLLISION_RE = re.compile(r"</?seg\b", re.I)       # source with seg tags → never batched
+_SEG_PARSE_RE = re.compile(r'<seg id="(\d+)">\s*(.*?)\s*</seg>', re.DOTALL)
+_FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9]*\s*|\s*```\s*$")  # strip leading/trailing code fences
+BATCH_MAX_SEG_CHARS = 600      # a segment longer than this is NEVER batched (single path)
+BATCH_GLOSSARY_CAP = 40        # per-batch glossary UNION cap (per-segment single path stays 20)
+BATCH_MAX_CHARS = 10_000       # total source chars per batch
+BATCH_MAX_OUT_TOKENS = 7_000   # est. output tokens per batch (under the 8192 max_tokens)
+
+BATCH_ADDENDUM = (
+    "\n\nBATCH MODE — the user message contains {n} segments, each wrapped as "
+    '<seg id="i">…</seg>. These rules OVERRIDE any output-format rule above:\n'
+    "- Translate each segment INDEPENDENTLY into {lang}.\n"
+    "- Return EXACTLY {n} segments using the SAME wrapper and the SAME ids, in the SAME "
+    'order: <seg id="1">translation</seg><seg id="2">…</seg>.\n'
+    "- Each segment contains ONLY that segment's translation — no commentary, quotes, "
+    "labels, or code fences.\n"
+    "- Never merge, split, reorder, drop, or renumber segments; never translate the <seg> "
+    "tags or their ids.\n"
+    "- Glossary rules apply per segment wherever a listed term appears.\n"
+    "- An empty, whitespace, or punctuation/number-only segment is returned unchanged."
+)
+
+_stats_lock = threading.Lock()
+_run_stats = {
+    "batch_requests": 0, "single_requests": 0, "fallback_batches": 0,
+    "segments": 0, "prompt_tokens": 0, "completion_tokens": 0, "oversized_solo": 0,
+}
+
+
+def _add_stats(**kw):
+    with _stats_lock:
+        for k, v in kw.items():
+            _run_stats[k] = _run_stats.get(k, 0) + v
+
+
+def _finalize_output(raw_out: str, text_for_llm: str) -> str:
+    """Post-process one model output: audit illegal chars, sanitize, and re-attach the
+    source's leading/trailing whitespace. Shared by the single (llm_translate) and batch
+    paths so both behave identically."""
+    _record_llm_bad(raw_out)
+    out = sanitize_for_xml(raw_out)
+    if text_for_llm != text_for_llm.strip():
+        leading = text_for_llm[: len(text_for_llm) - len(text_for_llm.lstrip())]
+        trailing = text_for_llm[len(text_for_llm.rstrip()):]
+        out = f"{leading}{out}{trailing}"
+    return out
+
+
+def _cache_key_for(text_for_llm: str) -> tuple[str, list]:
+    """The exact cache key llm_translate uses (target | glossary-matches | sanitized text),
+    plus the matches — so the batch path caches under the SAME key and later single lookups
+    hit."""
+    matches = glossary_matches(text_for_llm)
+    gloss_key = "|".join(f"{s}>{t}" for s, t in matches)
+    key = hashlib.md5(f"{target_language}|{gloss_key}|{text_for_llm}".encode("utf-8")).hexdigest()
+    return key, matches
+
 
 def llm_translate(text: str) -> str:
     """Translate a single string. Cached by (lang, glossary, text).
@@ -587,11 +680,7 @@ def llm_translate(text: str) -> str:
     # Glossary matches are deterministic for a given text, so folding them into
     # the cache key keeps caching correct while letting identical boilerplate
     # (which matches the same terms) still share one API call.
-    matches = glossary_matches(text_for_llm)
-    gloss_key = "|".join(f"{s}>{t}" for s, t in matches)
-    cache_key = hashlib.md5(
-        f"{target_language}|{gloss_key}|{text_for_llm}".encode("utf-8")
-    ).hexdigest()
+    cache_key, _matches = _cache_key_for(text_for_llm)
     if cache_key in _translation_cache:
         return _translation_cache[cache_key]
 
@@ -601,22 +690,171 @@ def llm_translate(text: str) -> str:
         return text_for_llm
 
     try:
-        raw_out = (_model_complete(_system_prompt_for(text_for_llm), text_for_llm)
-                   or text_for_llm).strip()
-        # Audit: did the LLM emit any XML-illegal characters?
-        _record_llm_bad(raw_out)
-        out = sanitize_for_xml(raw_out)
-        # Preserve original leading/trailing whitespace pattern (using the
-        # sanitized source text so we don't reintroduce illegal chars).
-        if text_for_llm != text_for_llm.strip():
-            leading = text_for_llm[: len(text_for_llm) - len(text_for_llm.lstrip())]
-            trailing = text_for_llm[len(text_for_llm.rstrip()) :]
-            out = f"{leading}{out}{trailing}"
+        raw, usage = _model_complete(_system_prompt_for(text_for_llm), text_for_llm)
+        raw_out = (raw or text_for_llm).strip()
+        out = _finalize_output(raw_out, text_for_llm)
         _translation_cache[cache_key] = out
+        _add_stats(single_requests=1, segments=1,
+                   prompt_tokens=(usage or {}).get("prompt_tokens") or 0,
+                   completion_tokens=(usage or {}).get("completion_tokens") or 0)
         return out
     except Exception as ex:
         print(f"[warn] translation failed ({len(text)} chars): {ex}")
         return text_for_llm
+
+
+def _est_out_tokens(chars: int, n: int) -> int:
+    """Rough output-token estimate for a batch (~0.75 tok/char + per-segment wrapper), used
+    only to keep a batch's expected output comfortably under max_tokens."""
+    return math.ceil(0.75 * chars) + 40 * n
+
+
+def _translate_batch(texts: list[str]) -> list[str]:
+    """Translate several small segments in ONE request via <seg id="k">…</seg>. STRICT parse:
+    the response must contain exactly ids 1..n; ANY deviation (parse failure, missing / extra
+    / renumbered ids) → per-segment fallback via llm_translate (correctness over cost).
+    Results are cached under the SAME key llm_translate uses. Aligned to `texts`."""
+    if len(texts) == 1:
+        return [llm_translate(texts[0])]
+
+    for t in texts:
+        _record_source_bad(t)
+    prepped = [sanitize_for_xml(t) for t in texts]   # same normalization llm_translate keys on
+
+    # Glossary UNION across the batch (the block wording is conditional — "when the source
+    # contains …" — so a union stays correct for every segment). Longest-wins, capped.
+    union: dict[str, str] = {}
+    for p in prepped:
+        for s, tg in glossary_matches(p):
+            union.setdefault(s, tg)
+    ordered = sorted(union.items(), key=lambda kv: -len(kv[0]))
+    kept: list[tuple[str, str]] = []
+    for s, tg in ordered:
+        if any(s in longer for longer, _ in kept):
+            continue
+        kept.append((s, tg))
+    kept = kept[:BATCH_GLOSSARY_CAP]
+
+    system = TRANSLATE_SYSTEM.replace("{lang}", target_language)
+    if kept:
+        lines = "\n".join(f'- "{s}" → "{t}"' for s, t in kept)
+        system += (
+            "\n\nGLOSSARY — when the source contains the following terms, use the "
+            "specified translation verbatim (these are approved, required "
+            "terminology; they override your default word choice):\n" + lines
+        )
+    system += BATCH_ADDENDUM.format(n=len(prepped), lang=target_language)
+    user = "".join(f'{SEG_OPEN}{i}">{p}{SEG_CLOSE}\n' for i, p in enumerate(prepped, start=1))
+
+    def _fallback(reason: str) -> list[str]:
+        _add_stats(fallback_batches=1)
+        print(f"[batch] {reason} → per-segment fallback ({len(texts)} segments)")
+        return [llm_translate(t) for t in texts]
+
+    try:
+        raw, usage = _model_complete(system, user)
+    except Exception as ex:
+        return _fallback(f"model error: {ex}")
+
+    raw = _FENCE_RE.sub("", raw or "").strip()
+    found = {int(m.group(1)): m.group(2) for m in _SEG_PARSE_RE.finditer(raw)}
+    if sorted(found.keys()) != list(range(1, len(prepped) + 1)):
+        return _fallback(f"segment id mismatch (got {sorted(found.keys())[:12]})")
+
+    outs: list[str] = []
+    for i, prep in enumerate(prepped, start=1):
+        out = _finalize_output(found[i], prep)
+        key, _ = _cache_key_for(prep)
+        _translation_cache[key] = out
+        outs.append(out)
+    _add_stats(batch_requests=1, segments=len(prepped),
+               prompt_tokens=(usage or {}).get("prompt_tokens") or 0,
+               completion_tokens=(usage or {}).get("completion_tokens") or 0)
+    return outs
+
+
+def _pack_batches(texts: list[str]) -> list[list[str]]:
+    """Greedily bin-pack eligible small segments into batches under the count / char /
+    output-token caps (whichever hits first closes the batch)."""
+    batches: list[list[str]] = []
+    cur: list[str] = []
+    cur_chars = 0
+    for t in texts:
+        c = len(t)
+        if cur and (len(cur) >= batch_size
+                    or cur_chars + c > BATCH_MAX_CHARS
+                    or _est_out_tokens(cur_chars + c, len(cur) + 1) > BATCH_MAX_OUT_TOKENS):
+            batches.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(t)
+        cur_chars += c
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def translate_all(texts: list[str], ex: ThreadPoolExecutor) -> list[str]:
+    """Translate a list of segment texts, preserving input order. Groups eligible SMALL,
+    uncached segments into batched requests (amortizing the long system prompt); everything
+    else (empty, cache hit, skip-if-target, <seg> collision, oversized) takes the single
+    path. All work is submitted to the passed-in executor. `enable_batching=false` → all
+    singles (today's behavior)."""
+    n = len(texts)
+    result: list[str] = [""] * n
+    # De-dupe identical texts within this call (translate once, fan out to all positions).
+    positions: dict[str, list[int]] = {}
+    order: list[str] = []
+    for i, t in enumerate(texts):
+        if t not in positions:
+            positions[t] = []
+            order.append(t)
+        positions[t].append(i)
+
+    if not enable_batching:
+        futs = {ex.submit(llm_translate, t): t for t in order}
+        for fut in as_completed(futs):
+            r = fut.result()
+            for i in positions[futs[fut]]:
+                result[i] = r
+        return result
+
+    batchable: list[str] = []
+    singles: list[str] = []
+    for t in order:
+        if not t or not t.strip():
+            singles.append(t); continue
+        tl = sanitize_for_xml(t)
+        key, _ = _cache_key_for(tl)
+        if key in _translation_cache:
+            singles.append(t); continue
+        if skip_if_already_target and is_already_target_language(tl):
+            singles.append(t); continue
+        if _SEG_COLLISION_RE.search(tl):
+            singles.append(t); continue
+        if len(tl) > BATCH_MAX_SEG_CHARS:
+            _add_stats(oversized_solo=1)
+            singles.append(t); continue
+        batchable.append(t)
+
+    trans: dict[str, str] = {}
+    futs = {}
+    for t in singles:
+        futs[ex.submit(llm_translate, t)] = ("single", t)
+    for group in _pack_batches(batchable):
+        futs[ex.submit(_translate_batch, group)] = ("batch", group)
+    for fut in as_completed(futs):
+        kind, payload = futs[fut]
+        if kind == "single":
+            trans[payload] = fut.result()
+        else:
+            for gt, go in zip(payload, fut.result()):
+                trans[gt] = go
+
+    for t in order:
+        r = trans.get(t, t)
+        for i in positions[t]:
+            result[i] = r
+    return result
 
 
 # COMMAND ----------
@@ -813,16 +1051,13 @@ def translate_word_xml(
             if is_translatable(text):
                 pending.append((p_idx, s_idx, text))
 
-    # Translate concurrently.
+    # Translate concurrently (batched where segments are small — see translate_all).
     results: dict[tuple[int, int], str] = {}
     if pending:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            fut_map = {
-                ex.submit(llm_translate, t): (p_idx, s_idx)
-                for p_idx, s_idx, t in pending
-            }
-            for fut in as_completed(fut_map):
-                results[fut_map[fut]] = fut.result()
+            outs = translate_all([t for _, _, t in pending], ex)
+        for (p_idx, s_idx, _), out in zip(pending, outs):
+            results[(p_idx, s_idx)] = out
 
     # Apply: write translated text back to each segment's first <w:t>.
     pairs: list[tuple[str, str, int | None]] = []
@@ -861,14 +1096,12 @@ def translate_drawing_xml(xml_bytes: bytes) -> tuple[bytes, list[tuple[str, str,
     pairs: list[tuple[str, str, int | None]] = []
     if candidates:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            fut_map = {ex.submit(llm_translate, e.text): e for e in candidates}
-            for fut in as_completed(fut_map):
-                el = fut_map[fut]
-                original = el.text or ""
-                translated = fut.result()
-                if translated != original:
-                    el.text = sanitize_for_xml(translated)
-                    pairs.append((original, translated, None))
+            outs = translate_all([e.text or "" for e in candidates], ex)
+        for el, translated in zip(candidates, outs):
+            original = el.text or ""
+            if translated != original:
+                el.text = sanitize_for_xml(translated)
+                pairs.append((original, translated, None))
 
     return (
         etree.tostring(tree, xml_declaration=True, encoding="UTF-8", standalone=True),
@@ -1010,6 +1243,14 @@ summary_df = pd.DataFrame(summary_rows)
 print("\n=== Summary ===")
 display(summary_df)
 
+print("\n=== Batching stats ===")
+print(f"  batching: {'on' if enable_batching else 'off'} (batch_size={batch_size})")
+print(f"  requests: {_run_stats['batch_requests']} batched + {_run_stats['single_requests']} single"
+      f"  |  segments translated: {_run_stats['segments']}"
+      f"  |  fallback batches: {_run_stats['fallback_batches']}"
+      f"  |  oversized→solo: {_run_stats['oversized_solo']}")
+print(f"  tokens: {_run_stats['prompt_tokens']} prompt + {_run_stats['completion_tokens']} completion")
+
 # Expose the detected source language(s) for the caller (watcher records it in
 # bronze_documents). When a batch is single-file (the file-arrival path), this
 # is exactly one language.
@@ -1150,5 +1391,8 @@ _exit_payload = {
     "target_language": target_language,
     "target_language_code": target_lang_code,
     "glossary_entries_loaded": _glossary_entry_count,
+    "enable_batching": enable_batching,
+    "batch_size": batch_size,
+    **_run_stats,
 }
 dbutils.notebook.exit(_json.dumps(_exit_payload))

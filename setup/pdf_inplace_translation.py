@@ -21,8 +21,10 @@
 
 import json
 import re
+import math
 import time
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 
 from databricks.sdk import WorkspaceClient
@@ -43,6 +45,9 @@ dbutils.widgets.text("warehouse_id", "", "SQL warehouse id (for ai_parse_documen
 dbutils.widgets.text("glossary_delta_table", "", "Glossary Delta mirror FQN (empty = injection off)")
 dbutils.widgets.text("custom_system_prompt", "", "System prompt frozen at upload (empty → built-in default)")
 dbutils.widgets.text("max_workers", "8", "Concurrent translate workers")
+dbutils.widgets.dropdown("enable_batching", "true", ["true", "false"],
+                        "Group small elements into one model request (cost)")
+dbutils.widgets.text("batch_size", "8", "Max small elements per batched request")
 
 input_path           = dbutils.widgets.get("input_path").strip()
 output_dir           = dbutils.widgets.get("output_dir").strip().rstrip("/")
@@ -52,6 +57,11 @@ warehouse_id         = dbutils.widgets.get("warehouse_id").strip()
 glossary_delta_table = dbutils.widgets.get("glossary_delta_table").strip()
 base_prompt          = dbutils.widgets.get("custom_system_prompt")
 MAX_WORKERS          = int(dbutils.widgets.get("max_workers").strip() or "8")
+enable_batching      = dbutils.widgets.get("enable_batching").lower() == "true"
+try:
+    batch_size = max(1, int(dbutils.widgets.get("batch_size")))
+except ValueError:
+    batch_size = 8
 
 assert input_path and output_dir and warehouse_id, \
     "input_path, output_dir and warehouse_id are required"
@@ -243,6 +253,62 @@ _TABLE_ADDENDUM = (
 )
 _cache: dict = {}
 
+# ---- Request batching (cost) ------------------------------------------------
+# Amortize the (long) system prompt across several SMALL elements per request.
+# Only genuinely small, non-table elements are eligible; large ones, anything
+# with a literal <seg> tag, and cache hits take the single path. Strict <seg id>
+# parsing with a per-segment fallback keeps correctness if a batch is malformed.
+SEG_OPEN = '<seg id="'
+SEG_CLOSE = "</seg>"
+_SEG_COLLISION_RE = re.compile(r"</?seg\b", re.I)
+_SEG_PARSE_RE = re.compile(r'<seg id="(\d+)">\s*(.*?)\s*</seg>', re.DOTALL)
+BATCH_MAX_SEG_CHARS = 600      # an element longer than this is NEVER batched (single path)
+BATCH_GLOSSARY_CAP = 40        # per-batch glossary UNION cap (single path stays 20)
+BATCH_MAX_CHARS = 10_000       # total source chars per batch
+BATCH_MAX_OUT_TOKENS = 7_000   # est. output tokens per batch (under the 8192 max)
+
+BATCH_ADDENDUM = (
+    "\n\nBATCH MODE — the user message contains {n} segments, each wrapped as "
+    '<seg id="i">…</seg>. These rules OVERRIDE any output-format rule above:\n'
+    "- Translate each segment INDEPENDENTLY into {lang}.\n"
+    "- Return EXACTLY {n} segments using the SAME wrapper and the SAME ids, in the SAME "
+    'order: <seg id="1">translation</seg><seg id="2">…</seg>.\n'
+    "- Each segment contains ONLY that segment's translation — no commentary, quotes, "
+    "labels, or code fences.\n"
+    "- Never merge, split, reorder, drop, or renumber segments; never translate the <seg> "
+    "tags or their ids.\n"
+    "- Glossary rules apply per segment wherever a listed term appears.\n"
+    "- An empty, whitespace, or punctuation/number-only segment is returned unchanged."
+)
+
+_stats_lock = threading.Lock()
+_run_stats = {
+    "batch_requests": 0, "single_requests": 0, "fallback_batches": 0,
+    "segments": 0, "prompt_tokens": 0, "completion_tokens": 0, "oversized_solo": 0,
+}
+
+
+def _add_stats(**kw):
+    with _stats_lock:
+        for k, v in kw.items():
+            _run_stats[k] = _run_stats.get(k, 0) + v
+
+
+def _usage_dict(u) -> dict | None:
+    """Normalize usage to {prompt_tokens, completion_tokens} across serving (prompt/
+    completion) and the gateway Responses API (input/output)."""
+    if u is None:
+        return None
+    def g(name):
+        return u.get(name) if isinstance(u, dict) else getattr(u, name, None)
+    p = g("prompt_tokens")
+    p = p if p is not None else g("input_tokens")
+    c = g("completion_tokens")
+    c = c if c is not None else g("output_tokens")
+    if p is None and c is None:
+        return None
+    return {"prompt_tokens": p, "completion_tokens": c}
+
 
 def _is_translatable(text: str) -> bool:
     return bool(text) and any(c.isalpha() for c in text)
@@ -272,7 +338,7 @@ def _is_uc_gateway_endpoint(endpoint: str) -> bool:
     return (endpoint or "").count(".") >= 2
 
 
-def _serving_chat(system: str, user: str) -> str:
+def _serving_chat(system: str, user: str) -> tuple[str, dict | None]:
     resp = _w.api_client.do(
         "POST", f"/serving-endpoints/{model_endpoint}/invocations",
         body={"messages": [{"role": "system", "content": system},
@@ -281,26 +347,28 @@ def _serving_chat(system: str, user: str) -> str:
     choices = (resp or {}).get("choices") or []
     if not choices:
         raise RuntimeError(f"serving endpoint returned no choices: {str(resp)[:200]}")
-    return _content_to_text(choices[0].get("message", {}).get("content")).strip()
+    return _content_to_text(choices[0].get("message", {}).get("content")).strip(), \
+        _usage_dict((resp or {}).get("usage"))
 
 
-def _uc_gateway_responses(system: str, user: str) -> str:
+def _uc_gateway_responses(system: str, user: str) -> tuple[str, dict | None]:
     resp = _w.api_client.do(
         "POST", "/ai-gateway/mlflow/v1/responses",
         body={"model": model_endpoint, "instructions": system, "input": user,
               "max_output_tokens": MAX_TOKENS})
+    usage = _usage_dict((resp or {}).get("usage"))
     txt = (resp or {}).get("output_text")
     if txt:
-        return txt.strip()
+        return txt.strip(), usage
     parts = [_content_to_text(it.get("content")) for it in ((resp or {}).get("output") or [])
              if it.get("type") == "message"]
     out = "".join(parts).strip()
     if not out:
         raise RuntimeError(f"UC gateway returned no text: {str(resp)[:200]}")
-    return out
+    return out, usage
 
 
-def _model_chat(system: str, user: str) -> str:
+def _model_chat(system: str, user: str) -> tuple[str, dict | None]:
     if _is_uc_gateway_endpoint(model_endpoint):
         return _uc_gateway_responses(system, user)
     return _serving_chat(system, user)
@@ -323,7 +391,11 @@ def _translate_text(text: str, target_lang: str, glossary_pairs: list) -> str:
     if key in _cache:
         return _cache[key]
     try:
-        out = _clean_translation(_model_chat(_system_prompt(target_lang, glossary_pairs, text), text), text) or text
+        raw, usage = _model_chat(_system_prompt(target_lang, glossary_pairs, text), text)
+        out = _clean_translation(raw, text) or text
+        _add_stats(single_requests=1, segments=1,
+                   prompt_tokens=(usage or {}).get("prompt_tokens") or 0,
+                   completion_tokens=(usage or {}).get("completion_tokens") or 0)
     except Exception as e:
         print(f"  ! segment failed, keeping source: {e}")
         out = text
@@ -349,14 +421,142 @@ def _translate_table(html: str, target_lang: str, glossary_pairs: list) -> str:
         return _cache[key]
     system = _system_prompt(target_lang, glossary_pairs, html) + _TABLE_ADDENDUM.replace("{lang}", target_lang)
     try:
-        out = _FENCE_RE.sub("", _model_chat(system, html).strip()).strip()
+        raw, usage = _model_chat(system, html)
+        out = _FENCE_RE.sub("", (raw or "").strip()).strip()
         if "<table" not in out.lower():
             raise ValueError("model did not return an HTML table")
+        _add_stats(single_requests=1, segments=1,
+                   prompt_tokens=(usage or {}).get("prompt_tokens") or 0,
+                   completion_tokens=(usage or {}).get("completion_tokens") or 0)
     except Exception as e:
         print(f"  ! whole-table translate failed, per-cell fallback: {e}")
         out = _translate_table_cellwise(html, target_lang, glossary_pairs)
     _cache[key] = out
     return out
+
+
+def _est_out_tokens(chars: int, n: int) -> int:
+    return math.ceil(0.75 * chars) + 40 * n
+
+
+def _translate_batch(texts: list, target_lang: str, glossary_pairs: list) -> list:
+    """Translate several small text elements in ONE request via <seg id="k">…</seg>. STRICT
+    parse (ids must be exactly 1..n) or per-segment fallback via _translate_text. Cached under
+    the same f"{target_lang}|{text}" key _translate_text uses. Tables never come here."""
+    if len(texts) == 1:
+        return [_translate_text(texts[0], target_lang, glossary_pairs)]
+
+    # Glossary UNION across the batch (substring match), longest-wins, capped.
+    union = {}
+    for t in texts:
+        for mp, corr in glossary_pairs:
+            if mp and mp in t:
+                union.setdefault(mp, corr)
+    ordered = sorted(union.items(), key=lambda kv: -len(kv[0]))
+    kept = []
+    for mp, corr in ordered:
+        if any(mp in longer for longer, _ in kept):
+            continue
+        kept.append((mp, corr))
+    kept = kept[:BATCH_GLOSSARY_CAP]
+
+    system = base_prompt.replace("{lang}", target_lang)
+    if kept:
+        lines = "\n".join(f'- "{mp}" -> "{corr}"' for mp, corr in kept)
+        system += ("\n\nGLOSSARY — when the source contains the following terms, use the "
+                   "specified translation verbatim:\n" + lines)
+    system += BATCH_ADDENDUM.format(n=len(texts), lang=target_lang)
+    user = "".join(f'{SEG_OPEN}{i}">{t}{SEG_CLOSE}\n' for i, t in enumerate(texts, start=1))
+
+    def _fallback(reason):
+        _add_stats(fallback_batches=1)
+        print(f"  [batch] {reason} → per-segment fallback ({len(texts)} segments)")
+        return [_translate_text(t, target_lang, glossary_pairs) for t in texts]
+
+    try:
+        raw, usage = _model_chat(system, user)
+    except Exception as e:
+        return _fallback(f"model error: {e}")
+
+    raw = _FENCE_RE.sub("", (raw or "").strip()).strip()
+    found = {int(m.group(1)): m.group(2) for m in _SEG_PARSE_RE.finditer(raw)}
+    if sorted(found.keys()) != list(range(1, len(texts) + 1)):
+        return _fallback(f"segment id mismatch (got {sorted(found.keys())[:12]})")
+
+    outs = []
+    for i, t in enumerate(texts, start=1):
+        out = _clean_translation(found[i], t) or t
+        _cache[f"{target_lang}|{t}"] = out
+        outs.append(out)
+    _add_stats(batch_requests=1, segments=len(texts),
+               prompt_tokens=(usage or {}).get("prompt_tokens") or 0,
+               completion_tokens=(usage or {}).get("completion_tokens") or 0)
+    return outs
+
+
+def _pack_batches(texts: list) -> list:
+    """Greedily bin-pack eligible small elements under the count / char / output-token caps."""
+    batches, cur, cur_chars = [], [], 0
+    for t in texts:
+        c = len(t)
+        if cur and (len(cur) >= batch_size or cur_chars + c > BATCH_MAX_CHARS
+                    or _est_out_tokens(cur_chars + c, len(cur) + 1) > BATCH_MAX_OUT_TOKENS):
+            batches.append(cur); cur, cur_chars = [], 0
+        cur.append(t); cur_chars += c
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def translate_all(texts: list, ex: ThreadPoolExecutor, target_lang: str, glossary_pairs: list) -> list:
+    """Translate element sources preserving order; batch eligible small, uncached ones,
+    everything else (empty, cache hit, <seg> collision, oversized) single. All work goes to
+    the passed-in executor. enable_batching=false → all singles (today's behavior)."""
+    n = len(texts)
+    result = [""] * n
+    positions, order = {}, []
+    for i, t in enumerate(texts):
+        if t not in positions:
+            positions[t] = []; order.append(t)
+        positions[t].append(i)
+
+    if not enable_batching:
+        futs = {ex.submit(_translate_text, t, target_lang, glossary_pairs): t for t in order}
+        for fut in as_completed(futs):
+            r = fut.result()
+            for i in positions[futs[fut]]:
+                result[i] = r
+        return result
+
+    batchable, singles = [], []
+    for t in order:
+        if not t or not t.strip():
+            singles.append(t); continue
+        if f"{target_lang}|{t}" in _cache:
+            singles.append(t); continue
+        if _SEG_COLLISION_RE.search(t):
+            singles.append(t); continue
+        if len(t) > BATCH_MAX_SEG_CHARS:
+            _add_stats(oversized_solo=1); singles.append(t); continue
+        batchable.append(t)
+
+    trans, futs = {}, {}
+    for t in singles:
+        futs[ex.submit(_translate_text, t, target_lang, glossary_pairs)] = ("single", t)
+    for group in _pack_batches(batchable):
+        futs[ex.submit(_translate_batch, group, target_lang, glossary_pairs)] = ("batch", group)
+    for fut in as_completed(futs):
+        kind, payload = futs[fut]
+        if kind == "single":
+            trans[payload] = fut.result()
+        else:
+            for gt, go in zip(payload, fut.result()):
+                trans[gt] = go
+    for t in order:
+        r = trans.get(t, t)
+        for i in positions[t]:
+            result[i] = r
+    return result
 
 # COMMAND ----------
 
@@ -380,20 +580,28 @@ print(f"parsed {len(raw_elements)} elements")
 src_lang = detect_lang([_el_source(e) for e in raw_elements])
 glossary_pairs = load_glossary(target_language)  # approved terms for this target language
 
-def _translate_one(el: dict) -> dict:
-    etype = el.get("type", "text")
-    src = _el_source(el)
-    if etype == "table":
-        tgt = _translate_table(src, target_language, glossary_pairs)
-    elif _is_translatable(src):
-        tgt = _translate_text(src, target_language, glossary_pairs)
-    else:
-        tgt = src
-    return {"id": int(el["id"]), "type": etype, "page": _el_page(el),
-            "bbox": _el_coord(el), "source": src, "target": tgt}
+# Partition elements: tables stay unbatched (whole-table + cellwise fallback), plain text
+# elements are batched (translate_all), and non-translatable elements keep their source.
+table_els = [e for e in raw_elements if e.get("type") == "table"]
+text_els  = [e for e in raw_elements if e.get("type") != "table" and _is_translatable(_el_source(e))]
 
+tgt_by_id: dict[int, str] = {
+    int(e["id"]): _el_source(e)
+    for e in raw_elements
+    if e.get("type") != "table" and not _is_translatable(_el_source(e))
+}
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-    elements = list(ex.map(_translate_one, raw_elements))
+    tfuts = {ex.submit(_translate_table, _el_source(e), target_language, glossary_pairs): int(e["id"])
+             for e in table_els}
+    text_outs = translate_all([_el_source(e) for e in text_els], ex, target_language, glossary_pairs)
+    for e, out in zip(text_els, text_outs):
+        tgt_by_id[int(e["id"])] = out
+    for fut in as_completed(tfuts):
+        tgt_by_id[tfuts[fut]] = fut.result()
+
+elements = [{"id": int(e["id"]), "type": e.get("type", "text"), "page": _el_page(e),
+             "bbox": _el_coord(e), "source": _el_source(e), "target": tgt_by_id[int(e["id"])]}
+            for e in raw_elements]
 elements.sort(key=lambda e: e["id"])
 
 artifact = {
@@ -410,7 +618,18 @@ with open(artifact_path, "wb") as fh:
     fh.write(json.dumps(artifact, ensure_ascii=False).encode("utf-8"))
 print(f"wrote {artifact_path} ({len(elements)} elements, source={src_lang})")
 
+print("=== Batching stats ===")
+print(f"  batching: {'on' if enable_batching else 'off'} (batch_size={batch_size})")
+print(f"  requests: {_run_stats['batch_requests']} batched + {_run_stats['single_requests']} single"
+      f"  |  segments: {_run_stats['segments']}"
+      f"  |  fallback batches: {_run_stats['fallback_batches']}"
+      f"  |  oversized→solo: {_run_stats['oversized_solo']}")
+print(f"  tokens: {_run_stats['prompt_tokens']} prompt + {_run_stats['completion_tokens']} completion")
+
 # The watcher parses this to record bronze_documents.source_language.
 dbutils.notebook.exit(json.dumps({"source_language_code": src_lang,
                                   "artifact_path": artifact_path,
-                                  "elements": len(elements)}))
+                                  "elements": len(elements),
+                                  "enable_batching": enable_batching,
+                                  "batch_size": batch_size,
+                                  **_run_stats}))

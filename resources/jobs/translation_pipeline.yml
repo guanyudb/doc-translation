@@ -31,6 +31,9 @@ resources:
               model_endpoint:           ${var.translation_model_endpoint}
               max_workers:              ${var.translation_max_workers}
               max_pages:                ${var.translation_max_pages}
+              # Request batching (cost): group small segments into one model call.
+              enable_batching:          ${var.translation_enable_batching}
+              batch_size:               ${var.translation_batch_size}
               # The inner translator notebooks live in the same bundle.
               # `${workspace.file_path}` resolves to the bundle's files dir
               # in the target workspace at deploy time. The notebook file
