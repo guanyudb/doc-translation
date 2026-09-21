@@ -11,19 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/input";
 import { api, Prompt } from "@/api";
-
-// A curated set of target languages the demo commonly needs. The value is the
-// full English name (the pipeline slugifies it for filenames).
-const LANGUAGES = [
-  "English",
-  "Japanese",
-  "Chinese",
-  "Korean",
-  "Spanish",
-  "French",
-  "German",
-  "Portuguese",
-];
+import { LANGUAGES } from "@/lib/languages";
 
 export function UploadDialog({
   open,

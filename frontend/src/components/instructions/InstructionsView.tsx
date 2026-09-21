@@ -11,6 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input, Textarea } from "@/components/ui/input";
 import { api, Prompt } from "@/api";
+import { PlaygroundPanel } from "@/components/instructions/PlaygroundPanel";
 
 const MAX_BODY_LEN = 8000;
 const MAX_NAME_LEN = 200;
@@ -116,6 +117,8 @@ export function InstructionsView() {
 
   return (
     <div className="space-y-4">
+      <PlaygroundPanel prompts={prompts} />
+
       <div className="flex flex-wrap items-center gap-3">
         <div>
           <h2 className="text-sm font-semibold">Translation prompts</h2>

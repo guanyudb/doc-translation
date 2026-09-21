@@ -38,6 +38,7 @@ from server import confidence as conf_mod
 from server import glossary as glossary_mod
 from server import prompts as prompts_mod
 from server import settings as settings_mod
+from server import playground as playground_mod
 from server import pdf_render, pdf_layout
 from server.db import pool
 
@@ -1563,6 +1564,71 @@ def prompts_clone(prompt_id: int, name: str | None = Body(None, embed=True)):
     if p is None:
         raise HTTPException(404, "prompt not found")
     return _prompt_out(p)
+
+
+# ---------------------------------------------------------------------------
+# Prompt playground — translate one paragraph to iterate on a prompt (all reviewers)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/playground")
+def playground_run(
+    source_text: str = Body(..., embed=True),
+    target_lang: str | None = Body(None, embed=True),
+    source_lang: str | None = Body(None, embed=True),
+    prompt_id: int | None = Body(None, embed=True),
+    prompt_body: str | None = Body(None, embed=True),
+):
+    """Translate a single pasted paragraph with a chosen or ad-hoc prompt, returning the
+    translation AND the exact effective system prompt (so authors can see how language +
+    glossary were injected). No document, no state — ephemeral."""
+    text = (source_text or "").strip()
+    if not text:
+        raise HTTPException(400, "source_text is required")
+    if len(text) > playground_mod.MAX_SOURCE_CHARS:
+        raise HTTPException(400, f"source_text too long (max {playground_mod.MAX_SOURCE_CHARS} chars)")
+
+    # prompt_body (ad-hoc/edited) wins over a saved prompt_id.
+    body = (prompt_body or "").strip()
+    if not body:
+        if prompt_id is None:
+            raise HTTPException(400, "provide prompt_body or prompt_id")
+        p = prompts_mod.get_prompt(prompt_id)
+        if p is None:
+            raise HTTPException(404, "prompt not found")
+        body = p["body"]
+
+    s = settings_mod.load()
+    model_endpoint = (s.get("model_endpoint") or "").strip()
+    if not model_endpoint:
+        raise HTTPException(400, "no model endpoint configured — set one in Settings first")
+    target = (target_lang or s.get("target_language") or "").strip()
+    if not target:
+        raise HTTPException(400, "target_lang is required")
+    src = (source_lang or "").strip() or None
+
+    try:
+        result = playground_mod.run_translation(
+            prompt_body=body, source_text=text, source_lang=src,
+            target_lang=target, model_endpoint=model_endpoint)
+    except Exception as ex:
+        log.exception("playground: model call failed")
+        raise HTTPException(502, f"translation failed: {ex}")
+
+    # Best-effort audit (never block the response on it) — see settings.save pattern.
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                store._emit_audit(
+                    cur, pair_id=None, event_type=store.EventType.PLAYGROUND_RUN,
+                    actor=auth.reviewer(),
+                    after={"prompt_id": prompt_id, "source_lang": src, "target_lang": target,
+                           "chars": len(text), "route": result.get("route"),
+                           "elapsed_ms": result.get("elapsed_ms")})
+            conn.commit()
+    except Exception:
+        pass
+
+    return result
 
 
 # ---------------------------------------------------------------------------

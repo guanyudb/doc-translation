@@ -52,6 +52,9 @@ dbutils.widgets.text("pdf_translator_notebook_path", "",
     "Inner PDF translation notebook (empty = PDFs skipped)")
 dbutils.widgets.text("warehouse_id", "",
     "SQL warehouse id — required for the PDF path (ai_parse_document)")
+dbutils.widgets.text("enable_batching", "true",
+    "Group small segments into one model request (cost) — passed to the inner notebooks")
+dbutils.widgets.text("batch_size", "8", "Max small segments per batched request")
 
 raw_dir            = dbutils.widgets.get("raw_dir").rstrip("/")
 translated_dir     = dbutils.widgets.get("translated_dir").rstrip("/")
@@ -65,6 +68,8 @@ bronze_schema      = dbutils.widgets.get("bronze_schema").strip()
 glossary_delta_table = dbutils.widgets.get("glossary_delta_table").strip()
 pdf_translator_nb_path = dbutils.widgets.get("pdf_translator_notebook_path").strip()
 warehouse_id       = dbutils.widgets.get("warehouse_id").strip()
+enable_batching    = dbutils.widgets.get("enable_batching").strip() or "true"
+batch_size         = dbutils.widgets.get("batch_size").strip() or "8"
 
 lang_slug = re.sub(r"[^a-z0-9]+", "_", target_language.lower()).strip("_") or "translated"
 bronze_fqn = f"{bronze_catalog}.{bronze_schema}.bronze_documents"
@@ -396,6 +401,8 @@ for f in unpaired:
                     "glossary_delta_table": glossary_delta_table,
                     "custom_system_prompt": prompt_body,
                     "max_workers":          max_workers,
+                    "enable_batching":      enable_batching,
+                    "batch_size":           batch_size,
                 },
             )
         else:
@@ -412,6 +419,8 @@ for f in unpaired:
                     "skip_if_already_target": "true",
                     "glossary_delta_table":   glossary_delta_table,
                     "custom_system_prompt":   prompt_body,
+                    "enable_batching":        enable_batching,
+                    "batch_size":             batch_size,
                 },
             )
         out_path = f["expected_output"]
