@@ -119,6 +119,19 @@ export interface Prompt {
   updated_at: string | null;
 }
 
+export interface PlaygroundResult {
+  translation: string;
+  effective_prompt: string;
+  used_lang_token: boolean;
+  used_source_lang_token: boolean;
+  directive_appended: boolean;
+  glossary_terms: { source: string; target: string }[];
+  route: "serving" | "uc_gateway";
+  model_endpoint: string;
+  elapsed_ms: number;
+  usage: { prompt_tokens: number | null; completion_tokens: number | null } | null;
+}
+
 export interface DocumentStatus {
   file_name: string;
   status: string; // QUEUED | TRANSLATING | TRANSLATED | FAILED_TRANSLATION
@@ -362,4 +375,19 @@ export const api = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: name ?? null }),
     }).then(j<Prompt>),
+
+  // Prompt playground: translate one pasted paragraph with a chosen/edited prompt.
+  // `prompt_body` (ad-hoc/edited) wins over `prompt_id` server-side.
+  playground: (data: {
+    source_text: string;
+    target_lang: string;
+    source_lang?: string | null;
+    prompt_id?: number | null;
+    prompt_body?: string | null;
+  }) =>
+    fetch("/api/playground", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(data),
+    }).then(j<PlaygroundResult>),
 };

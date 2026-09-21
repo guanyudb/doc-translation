@@ -3,17 +3,7 @@ import { Loader2, Save, CheckCircle2, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input, Select } from "@/components/ui/input";
 import { api, AppSettings } from "@/api";
-
-const LANGUAGES = [
-  "English",
-  "Japanese",
-  "Chinese",
-  "Korean",
-  "Spanish",
-  "French",
-  "German",
-  "Portuguese",
-];
+import { LANGUAGES } from "@/lib/languages";
 
 // Settings / first-run setup. Rendered as the Settings tab normally, and as a
 // gate before the app unlocks when it hasn't been configured yet (firstRun).

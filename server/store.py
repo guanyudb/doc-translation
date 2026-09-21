@@ -80,6 +80,7 @@ class EventType:
     PROMPT_DELETED               = "PROMPT_DELETED"
     PROMPT_CLONED                = "PROMPT_CLONED"
     GLOSSARY_APPROVAL_CHANGED    = "GLOSSARY_APPROVAL_CHANGED"
+    PLAYGROUND_RUN               = "PLAYGROUND_RUN"
 
 
 def _emit_audit(cur, *, pair_id: str | None, event_type: str, actor: str,
