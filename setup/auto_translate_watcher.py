@@ -68,7 +68,11 @@ bronze_schema      = dbutils.widgets.get("bronze_schema").strip()
 glossary_delta_table = dbutils.widgets.get("glossary_delta_table").strip()
 pdf_translator_nb_path = dbutils.widgets.get("pdf_translator_notebook_path").strip()
 warehouse_id       = dbutils.widgets.get("warehouse_id").strip()
-enable_batching    = dbutils.widgets.get("enable_batching").strip() or "true"
+# Normalize to exactly "true"/"false" (default on) so the inner notebooks' dropdown widgets
+# — whose allowed values are ["true","false"] — never reject a capitalized/odd value like
+# "True" or "1" at param binding.
+enable_batching    = ("false" if dbutils.widgets.get("enable_batching").strip().lower()
+                       in ("false", "0", "no", "off") else "true")
 batch_size         = dbutils.widgets.get("batch_size").strip() or "8"
 
 lang_slug = re.sub(r"[^a-z0-9]+", "_", target_language.lower()).strip("_") or "translated"

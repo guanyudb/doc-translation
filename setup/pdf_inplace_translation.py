@@ -523,8 +523,13 @@ def translate_all(texts: list, ex: ThreadPoolExecutor, target_lang: str, glossar
     if not enable_batching:
         futs = {ex.submit(_translate_text, t, target_lang, glossary_pairs): t for t in order}
         for fut in as_completed(futs):
-            r = fut.result()
-            for i in positions[futs[fut]]:
+            t = futs[fut]
+            try:
+                r = fut.result()
+            except Exception as e:  # _translate_text shouldn't raise; keep the phase crash-proof
+                print(f"  ! translate future failed, keeping source: {e}")
+                r = t
+            for i in positions[t]:
                 result[i] = r
         return result
 
@@ -547,10 +552,15 @@ def translate_all(texts: list, ex: ThreadPoolExecutor, target_lang: str, glossar
         futs[ex.submit(_translate_batch, group, target_lang, glossary_pairs)] = ("batch", group)
     for fut in as_completed(futs):
         kind, payload = futs[fut]
+        try:
+            res = fut.result()
+        except Exception as e:  # _translate_batch/_translate_text shouldn't raise; be defensive
+            print(f"  ! {kind} translate future failed, keeping source: {e}")
+            res = payload if kind == "single" else list(payload)  # identity fallback
         if kind == "single":
-            trans[payload] = fut.result()
+            trans[payload] = res
         else:
-            for gt, go in zip(payload, fut.result()):
+            for gt, go in zip(payload, res):
                 trans[gt] = go
     for t in order:
         r = trans.get(t, t)

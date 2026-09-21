@@ -83,7 +83,10 @@ def _approved_pairs_for_target(target_name: str) -> list[tuple[str, str]]:
     code = LANG_NAME_TO_CODE.get(target, target[:2])
     forms = {target, code}
     out: list[tuple[str, str]] = []
-    for e in glossary_mod.list_glossary(approved_only=True, limit=200):
+    # Preview cap: the pipeline loads the FULL Delta mirror, so a high ceiling keeps the
+    # playground's injected set aligned with production (per-text injection is still capped
+    # at MAX_GLOSSARY_INJECT below). Bump if a language ever exceeds this many approved terms.
+    for e in glossary_mod.list_glossary(approved_only=True, limit=5000):
         if (e.get("target_lang") or "").strip().lower() in forms:
             mp = (e.get("model_phrase") or "").strip()
             corr = (e.get("correction") or "").strip()
